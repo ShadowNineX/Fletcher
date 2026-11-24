@@ -1,0 +1,148 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Renderer light table initialization from linuxdoom-1.10/r_main.c.
+
+package main
+
+// R_InitLightTables and R_ExecuteSetViewSize both select
+// clamp(60 - 4 * lightBand - attenuation, 0, 31). Each hardware lane
+// subtracts n = 4 * lightBand + attenuation from 60. Bits 2..5 of the
+// difference are ~(n XOR carry), where carry propagates through n's set
+// bits after bit 1. The unsigned borrow and bit 5 control the two clamps.
+macro LightSubtractBit(x int, y int) {
+    place lSplitter at (x, y) facing right
+    place arrow at (x + 1, y - 1) facing down
+    place and at (x + 1, y) facing right
+    place arrow at (x - 1, y + 1) facing right
+    place xor at (x, y + 1) facing down
+    place not at (x, y + 2) facing down
+}
+
+macro LightClampBit(x int, y int) {
+    place arrow at (x - 1, y) facing right
+    place arrow at (x, y - 1) facing down
+    place arrow at (x, y) facing down
+    place arrow at (x - 1, y + 1) facing right
+    place and at (x, y + 1) facing down
+}
+
+macro LightRampLane(x int, y int) {
+    // n0 | n1 starts the carry. The two low difference bits are n0 and n0 ^ n1.
+    place arrow at (x - 1, y) facing right
+    place arrow at (x, y - 1) facing down
+    place arrow at (x, y) facing right
+    place arrow at (x - 3, y + 3) facing right
+    place arrow at (x - 2, y + 2) facing down
+    place xor at (x - 2, y + 3) facing down
+    expand LightSubtractBit(x + 1, y)
+    expand LightSubtractBit(x + 3, y)
+    expand LightSubtractBit(x + 5, y)
+    expand LightSubtractBit(x + 7, y)
+
+    // No carry out and neither upper input bit set means a nonnegative result.
+    place arrow at (x + 9, y - 1) facing down
+    place arrow at (x + 10, y) facing left
+    place not at (x + 9, y) facing down
+    expand LightClampBit(x - 2, y + 6)
+    expand LightClampBit(x + 1, y + 6)
+    expand LightClampBit(x + 4, y + 6)
+    expand LightClampBit(x + 7, y + 6)
+    expand LightClampBit(x + 10, y + 6)
+}
+
+macro DoomLightBoard(x int, y int) {
+    place scriptBlock at (x, y) with { code = "const widthOdd = " + widthRemainders[Width & 1] + ";\n" + lightTableBridge }
+    expand LightRampLane(x + 5, y)
+    expand LightRampLane(x + 21, y)
+    expand LightRampLane(x + 37, y)
+    expand LightRampLane(x + 53, y)
+    expand LightRampLane(x + 69, y)
+    expand LightRampLane(x + 85, y)
+    expand LightRampLane(x + 101, y)
+    expand LightRampLane(x + 117, y)
+}
+
+// Address and capture eight pipelined subtractors. Inputs for each bit
+// arrive alongside its native carry. The bridge aligns and packs the
+// physical results and also fans the two physical saturation flags back
+// into the final OR/AND gates. Each ramp entry serves multiple table cells.
+// After 30 consecutive host callbacks the finished table is published once.
+// A rewind before publication restarts the pipeline and flushes old samples.
+const widthRemainders = [2]string{"0", "1"}
+const lightTableBridge = "const {x, y} = getPosition();\n" +
+    "const width = -2 * x + widthOdd, lanes = 8, last = 140;\n" +
+    "const partial = [], nonnegative = [], ramps = [];\n" +
+    "let phase = 0, previous = -1, published = false;\n" +
+    "always(() => {\n" +
+    "    if (published) return;\n" +
+    "    const tick = world.getTick();\n" +
+    "    if (tick !== previous + 1) phase = 0;\n" +
+    "    previous = tick;\n" +
+    "    for (let lane = 0; lane < lanes; lane++) {\n" +
+    "        const origin = x + 5 + 16 * lane;\n" +
+    "        const put = (dx, dy, value) => world.setSignal(origin + dx, y + dy, value & 1);\n" +
+    "        const get = (dx, dy) => world.getSignal(origin + dx, y + dy) > 0 ? 1 : 0;\n" +
+    "        const address = delay => (phase - delay) * lanes + lane;\n" +
+    "        let n = address(0);\n" +
+    "        if (n >= 0 && n <= last) {\n" +
+    "            put(-1, 0, n); put(0, -1, n >> 1);\n" +
+    "            put(-3, 3, n); put(-2, 2, n >> 1);\n" +
+    "        }\n" +
+    "        n = address(1);\n" +
+    "        if (n >= 0 && n <= last) partial[n] = (n & 1) | (get(-2, 3) << 1);\n" +
+    "        for (let bit = 2; bit <= 5; bit++) {\n" +
+    "            const splitter = 2 * bit - 3;\n" +
+    "            n = address(2 * bit - 2);\n" +
+    "            if (n >= 0 && n <= last) {\n" +
+    "                put(splitter + 1, -1, n >> bit);\n" +
+    "                put(splitter - 1, 1, n >> bit);\n" +
+    "            }\n" +
+    "            n = address(2 * bit);\n" +
+    "            if (n >= 0 && n <= last) partial[n] |= get(splitter, 2) << bit;\n" +
+    "        }\n" +
+    "        n = address(9);\n" +
+    "        if (n >= 0 && n <= last) { put(9, -1, n >> 6); put(10, 0, n >> 7); }\n" +
+    "        n = address(10);\n" +
+    "        if (n >= 0 && n <= last) {\n" +
+    "            nonnegative[n] = get(9, 0);\n" +
+    "            for (let bit = 0; bit < 5; bit++) {\n" +
+    "                const port = -2 + 3 * bit;\n" +
+    "                put(port - 1, 6, partial[n] >> bit);\n" +
+    "                put(port, 5, partial[n] >> 5);\n" +
+    "            }\n" +
+    "        }\n" +
+    "        n = address(11);\n" +
+    "        if (n >= 0 && n <= last) {\n" +
+    "            for (let bit = 0; bit < 5; bit++) put(-3 + 3 * bit, 7, nonnegative[n]);\n" +
+    "        }\n" +
+    "        n = address(12);\n" +
+    "        if (n >= 0 && n <= last) {\n" +
+    "            let row = 0;\n" +
+    "            for (let bit = 0; bit < 5; bit++) row |= get(-2 + 3 * bit, 7) << bit;\n" +
+    "            ramps[n] = row;\n" +
+    "        }\n" +
+    "    }\n" +
+    "    if (phase++ !== Math.floor(last / lanes) + 12) return;\n" +
+    "    const appendWallRows = (rows, viewWidth) => {\n" +
+    "        for (let band = 0; band < 16; band++) {\n" +
+    "            for (let scale = 0; scale < 48; scale++)\n" +
+    "                rows.push(ramps[Math.min(last, 4 * band + Math.floor(160 * scale / viewWidth))]);\n" +
+    "        }\n" +
+    "    };\n" +
+    "    const rows = [], windowRows = [], pairedRows = [];\n" +
+    "    appendWallRows(rows, width);\n" +
+    "    for (let band = 0; band < 16; band++) {\n" +
+    "        for (let z = 0; z < 128; z++) rows.push(ramps[4 * band + Math.floor(80 / (z + 1))]);\n" +
+    "    }\n" +
+    "    for (let blocks = 3; blocks < 10; blocks++) {\n" +
+    "        const first = Math.ceil((10 - blocks) * width / 20);\n" +
+    "        const end = Math.ceil((10 + blocks) * width / 20);\n" +
+    "        const windowWidth = end - first;\n" +
+    "        appendWallRows(windowRows, Math.max(1, windowWidth));\n" +
+    "        appendWallRows(pairedRows, Math.max(4, windowWidth & ~1));\n" +
+    "    }\n" +
+    "    appendWallRows(pairedRows, Math.max(4, width & ~1));\n" +
+    "    globalState.doomPairedWindowWallRows = pairedRows;\n" +
+    "    globalState.doomWindowWallRows = windowRows;\n" +
+    "    globalState.doomLightRows = rows;\n" +
+    "    published = true;\n" +
+    "});"

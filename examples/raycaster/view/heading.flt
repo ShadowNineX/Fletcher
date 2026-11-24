@@ -1,0 +1,27 @@
+package view
+
+type Vector struct {
+    X int
+    Y int
+}
+
+func quarterSine(step int) int {
+    sine := [17]int{0, 100, 200, 297, 392, 483, 569, 650, 724, 792, 851, 903, 946, 980, 1004, 1019, 1024}
+    index := step / 4
+    fraction := step % 4
+    low := sine[index]
+    if fraction == 0 { return low }
+    return low + (sine[index + 1] - low) * fraction / 4
+}
+
+// Interpolate one quarter of a fixed-point sine table for 256 headings.
+func Direction(angle int) Vector {
+    turn := angle & 255
+    offset := turn % 64
+    x := quarterSine(64 - offset)
+    y := quarterSine(offset)
+    if turn < 64 { return Vector{X: x, Y: y} }
+    if turn < 128 { return Vector{X: -y, Y: x} }
+    if turn < 192 { return Vector{X: -x, Y: -y} }
+    return Vector{X: y, Y: -x}
+}

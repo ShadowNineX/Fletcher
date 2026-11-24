@@ -1,0 +1,185 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted from linuxdoom-1.10/p_sight.c.
+
+package wad
+
+import "engine"
+import "numeric"
+
+const sightLineWords = 65536 / 32
+const sightOnLine = 2
+
+type SightEndpoint struct {
+    X int
+    Y int
+    Z int
+    Height int
+    Sector int
+}
+
+type SightResult struct {
+    Valid bit
+    Visible bit
+    Rejected bit
+    Leaves int
+    Lines int
+    EyeZ int
+    BottomSlope int
+    TopSlope int
+}
+
+type SightTrace struct {
+    ray DivLine
+    target SightEndpoint
+    visited [sightLineWords]bits<32>
+    result SightResult
+}
+
+// P_DivlineSide uses integer map units for non-axis cross products. Its
+// horizontal equality check compares point x with the line's y in Doom 1.10.
+func sightSide(line DivLine, x int, y int) int {
+    if line.DeltaX == 0 {
+        if x == line.X { return sightOnLine }
+        if (x < line.X && line.DeltaY > 0) || (x > line.X && line.DeltaY < 0) { return 1 }
+        return 0
+    }
+    if line.DeltaY == 0 {
+        if x == line.Y { return sightOnLine }
+        if (y <= line.Y && line.DeltaX < 0) || (y > line.Y && line.DeltaX > 0) { return 1 }
+        return 0
+    }
+    left := (line.DeltaY >> 16) * ((x - line.X) >> 16)
+    right := ((y - line.Y) >> 16) * (line.DeltaX >> 16)
+    if right < left { return 0 }
+    if right == left { return sightOnLine }
+    return 1
+}
+
+func clipSight(level BspLevel, ray DivLine, target SightEndpoint, result SightResult, refs segmentReferences) SightResult {
+    // Sight crosses the original linedef, including when the BSP split its seg.
+    firstId, lastId := U16(level.File, refs.LineOffset), U16(level.File, refs.LineOffset + 2)
+    if firstId >= level.Vertices.Count || lastId >= level.Vertices.Count {
+        result.Valid, result.Visible = false, false
+        return result
+    }
+    first, last := VertexAt(level.File, level.Vertices, firstId), VertexAt(level.File, level.Vertices, lastId)
+    if sightSide(ray, first.X, first.Y) == sightSide(ray, last.X, last.Y) { return result }
+    wall := DivLine{Valid: true, X: first.X, Y: first.Y, DeltaX: last.X - first.X, DeltaY: last.Y - first.Y}
+    if sightSide(wall, ray.X, ray.Y) == sightSide(wall, target.X, target.Y) { return result }
+    if refs.BackSector < 0 { result.Visible = false; return result }
+
+    front := level.sectorHeightsAtOffset(refs.FrontSector)
+    back := level.sectorHeightsAtOffset(refs.BackSector)
+    floorChanged, ceilingChanged := front.Floor != back.Floor, front.Ceiling != back.Ceiling
+    if !floorChanged && !ceilingChanged { return result }
+    bottom, top := front.Floor, front.Ceiling
+    if back.Floor > bottom { bottom = back.Floor }
+    if back.Ceiling < top { top = back.Ceiling }
+    if bottom >= top { result.Visible = false; return result }
+
+    fraction := InterceptVector(ray, wall)
+    if floorChanged {
+        slope := cport.C_FixedDiv(bottom - result.EyeZ, fraction)
+        if slope > result.BottomSlope { result.BottomSlope = slope }
+    }
+    if ceilingChanged {
+        slope := cport.C_FixedDiv(top - result.EyeZ, fraction)
+        if slope < result.TopSlope { result.TopSlope = slope }
+    }
+    result.Visible = result.TopSlope > result.BottomSlope
+    return result
+}
+
+func crossSightLeaf(level BspLevel, trace SightTrace, leaf int) SightTrace {
+    trace.result.Leaves = trace.result.Leaves + 1
+    if leaf < 0 || leaf >= level.Subsectors.Count {
+        trace.result.Valid, trace.result.Visible = false, false
+        return trace
+    }
+    subsector := level.SubsectorAt(leaf)
+    if subsector.SegmentCount < 0 || subsector.FirstSegment < 0 || subsector.FirstSegment > level.Segs.Count - subsector.SegmentCount {
+        trace.result.Valid, trace.result.Visible = false, false
+        return trace
+    }
+    for offset := range subsector.SegmentCount {
+        index := subsector.FirstSegment + offset
+        lineId := U16(level.File, level.Segs.Offset + index * SegSize + 6)
+        word := lineId >> 5
+        mask := bits<32>(1) << (lineId & 31)
+        if trace.visited[word] & mask == 0 {
+            refs := level.segmentReferences(index)
+            if !refs.Valid {
+                trace.result.Valid, trace.result.Visible = false, false
+                return trace
+            }
+            trace.visited[word] = trace.visited[word] | mask
+            trace.result.Lines = trace.result.Lines + 1
+            trace.result = clipSight(level, trace.ray, trace.target, trace.result, refs)
+            if !trace.result.Visible { return trace }
+        }
+    }
+    return trace
+}
+
+func sightGeometryValid(level BspLevel) bit {
+    return recordLumpInFile(level.File, level.Nodes, NodeSize) &&
+        recordLumpInFile(level.File, level.Subsectors, SubsectorSize) &&
+        recordLumpInFile(level.File, level.Segs, SegSize) &&
+        recordLumpInFile(level.File, level.Lines, LineSize) &&
+        recordLumpInFile(level.File, level.Sides, SideSize) &&
+        recordLumpInFile(level.File, level.Vertices, VertexSize) &&
+        level.Nodes.Count <= engine.SubsectorFlag &&
+        level.Subsectors.Count > 0 && level.Subsectors.Count <= engine.SubsectorFlag
+}
+
+// REJECT uses the actors' existing sector links. Geometry uses current sector
+// heights, so live doors and movers occlude the same sight trace as static walls.
+func CheckSight(level BspLevel, viewer SightEndpoint, target SightEndpoint) SightResult {
+    if !recordLumpInFile(level.File, level.Sectors, SectorSize) ||
+        viewer.Sector < 0 || viewer.Sector >= level.Sectors.Count ||
+        target.Sector < 0 || target.Sector >= level.Sectors.Count { return SightResult{} }
+    if RejectsSight(level, viewer.Sector, target.Sector) { return SightResult{Valid: true, Rejected: true} }
+    if !sightGeometryValid(level) { return SightResult{} }
+
+    eye := viewer.Z + viewer.Height - (viewer.Height >> 2)
+    trace := SightTrace{target: target, ray: DivLine{Valid: true, X: viewer.X, Y: viewer.Y,
+        DeltaX: target.X - viewer.X, DeltaY: target.Y - viewer.Y},
+        result: SightResult{Valid: true, Visible: true, EyeZ: eye, TopSlope: target.Z + target.Height - eye,
+            BottomSlope: target.Z - eye}}
+    var pending [engine.BspStackPageSize]int
+    var older [engine.BspStackSavedPages]engine.BspStackPageRef
+    count := 0
+    child := level.Nodes.Count - 1
+    if level.Nodes.Count == 0 { child = engine.SubsectorFlag }
+    // Each loop visits one node or leaf, including when the far side resumes.
+    for range level.Nodes.Count + level.Subsectors.Count {
+        if child >= engine.SubsectorFlag {
+            trace = crossSightLeaf(level, trace, child - engine.SubsectorFlag)
+            if !trace.result.Visible || count == 0 { return trace.result }
+            count = count - 1
+            slot := count % engine.BspStackPageSize
+            child = pending[slot]
+            if slot == 0 && count != 0 { pending = older[count / engine.BspStackPageSize - 1].ReadEntries() }
+        } else {
+            if child < 0 || child >= level.Nodes.Count { return SightResult{} }
+            node := level.PartitionAt(child)
+            partition := DivLine{Valid: true, X: node.X, Y: node.Y, DeltaX: node.DeltaX, DeltaY: node.DeltaY}
+            side := sightSide(partition, viewer.X, viewer.Y)
+            if side == sightOnLine { side = 0 }
+            front, back := node.Front, node.Back
+            if side == 1 { front, back = back, front }
+            if side != sightSide(partition, target.X, target.Y) {
+                if count == level.Nodes.Count { return SightResult{} }
+                slot := count % engine.BspStackPageSize
+                if slot == 0 && count != 0 {
+                    older[count / engine.BspStackPageSize - 1] = engine.BspStackPage{Entries: pending}
+                }
+                pending[slot] = back
+                count = count + 1
+            }
+            child = front
+        }
+    }
+    return SightResult{}
+}

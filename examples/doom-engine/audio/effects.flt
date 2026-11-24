@@ -1,0 +1,101 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Sound identifiers, lump names, and priorities follow linuxdoom-1.10/sounds.c.
+
+package audio
+
+import "wad"
+
+const SoundEffectCount = 109
+const SoundPistol = 1
+const SoundSawUp = 10
+const SoundSawHit = 13
+const SoundStoneMove = 22
+const SoundItemUp = 32
+const SoundChaingun = 86
+const SoundTink = 87
+const NormalPitch = 128
+const CenterSeparation = 128
+
+const soundLow = [SoundEffectCount]int{
+    0x4f4e5344, 0x49505344, 0x48535344, 0x47535344, 0x53445344, 0x42445344, 0x42445344, 0x42445344,
+    0x4c505344, 0x46425344, 0x41535344, 0x41535344, 0x41535344, 0x41535344, 0x4c525344, 0x58525344,
+    0x49465344, 0x49465344, 0x53505344, 0x53505344, 0x4f445344, 0x4f445344, 0x54535344, 0x57535344,
+    0x57535344, 0x4c505344, 0x4d445344, 0x4f505344, 0x49565344, 0x4e4d5344, 0x45505344, 0x4c535344,
+    0x54495344, 0x50575344, 0x4f4f5344, 0x45545344, 0x4f505344, 0x4f505344, 0x4f505344, 0x47425344,
+    0x47425344, 0x47535344, 0x41435344, 0x52425344, 0x59435344, 0x50535344, 0x53425344, 0x4e4b5344,
+    0x49565344, 0x414d5344, 0x45505344, 0x4b535344, 0x47535344, 0x4b535344, 0x49565344, 0x4c435344,
+    0x4b535344, 0x4c505344, 0x44505344, 0x4f505344, 0x4f505344, 0x4f505344, 0x47425344, 0x47425344,
+    0x47535344, 0x41435344, 0x4b535344, 0x52425344, 0x59435344, 0x50535344, 0x53425344, 0x49565344,
+    0x4e4b5344, 0x45505344, 0x4b535344, 0x4f505344, 0x47425344, 0x4d445344, 0x53425344, 0x53425344,
+    0x49565344, 0x4f4e5344, 0x41425344, 0x55505344, 0x4f485344, 0x454d5344, 0x48435344, 0x49545344,
+    0x44425344, 0x44425344, 0x54495344, 0x4c465344, 0x4c465344, 0x45475344, 0x4f425344, 0x4f425344,
+    0x4f425344, 0x4f425344, 0x4f425344, 0x414d5344, 0x414d5344, 0x53535344, 0x53535344, 0x454b5344,
+    0x454b5344, 0x4b535344, 0x4b535344, 0x4b535344, 0x41525344,
+}
+
+const soundHigh = [SoundEffectCount]int{
+    0x0000454e, 0x4c4f5453, 0x4e47544f, 0x4b434f43, 0x4e475448, 0x004e504f, 0x00534c43, 0x44414f4c,
+    0x414d5341, 0x00000047, 0x00505557, 0x4c444957, 0x4c554657, 0x54494857, 0x434e5541, 0x444f4c50,
+    0x54485352, 0x4c505852, 0x54524154, 0x00504f54, 0x4e504f52, 0x534c4352, 0x564f4d4e, 0x4e484354,
+    0x58484354, 0x4e494150, 0x4e494150, 0x4e494150, 0x4e494150, 0x4e494150, 0x4e494150, 0x0000504f,
+    0x50554d45, 0x0050554e, 0x00000046, 0x5450454c, 0x31544953, 0x32544953, 0x33544953, 0x31544953,
+    0x32544953, 0x54495354, 0x54495343, 0x54495353, 0x54495342, 0x54495349, 0x54495350, 0x54495354,
+    0x5449534c, 0x5449534e, 0x00544953, 0x4b54414c, 0x4b544154, 0x48435045, 0x4b54414c, 0x00005741,
+    0x47575345, 0x48544544, 0x49484549, 0x31485444, 0x32485444, 0x33485444, 0x31485444, 0x32485444,
+    0x48544454, 0x48544443, 0x4854444c, 0x48544453, 0x48544442, 0x48544449, 0x48544450, 0x4854444c,
+    0x48544454, 0x00485444, 0x48544445, 0x54434153, 0x00544341, 0x00544341, 0x54434150, 0x4b4c5750,
+    0x5443414c, 0x00594157, 0x50584552, 0x0048434e, 0x0000464f, 0x004c4154, 0x004e5547, 0x00004b4e,
+    0x004e504f, 0x00534c43, 0x004b424d, 0x00454d41, 0x54534d41, 0x574f5054, 0x54495053, 0x42554353,
+    0x54495353, 0x004e5053, 0x48544453, 0x4b54414e, 0x4854444e, 0x00544953, 0x00485444, 0x4e504e45,
+    0x54444e45, 0x54434145, 0x54495345, 0x4b544145, 0x004f4944,
+}
+
+const soundPriority = [SoundEffectCount]int{
+    0, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 118, 64, 64, 64, 70,
+    70, 70, 100, 100, 100, 100, 119, 78, 78, 96, 96, 96, 96, 96, 96, 78,
+    78, 78, 96, 32, 98, 98, 98, 98, 98, 98, 98, 94, 92, 90, 90, 90,
+    90, 90, 90, 70, 70, 70, 70, 70, 70, 32, 32, 70, 70, 70, 70, 70,
+    70, 70, 70, 32, 32, 32, 32, 32, 32, 32, 32, 120, 120, 120, 100, 100,
+    100, 78, 60, 64, 70, 70, 64, 60, 100, 100, 100, 32, 32, 60, 70, 70,
+    70, 70, 70, 70, 70, 70, 70, 70, 70, 70, 70, 70, 60,
+}
+
+const soundSingularity = [SoundEffectCount]bit{
+    false, false, false, false, false, false, false, false, false, false, false, false,
+    false, false, false, false, false, false, false, false, false, false, false, false,
+    false, false, false, false, false, false, false, false, true, true, false, false,
+    true, true, true, true, true, true, true, true, true, true, true, true,
+    true, true, true, false, false, false, false, false, false, false, false, false,
+    false, false, false, false, false, false, false, false, false, false, false, false,
+    false, false, false, true, true, true, true, true, true, false, false, false,
+    false, false, false, false, false, false, false, false, false, false, false, false,
+    false, false, false, false, false, false, false, false, false, false, false, false,
+    false,
+}
+
+type SoundEffect struct {
+    Valid bit
+    LumpName wad.LumpName
+    Priority int
+    Pitch int
+    VolumeAdjustment int
+    Singular bit
+    ExclusiveVoice bit
+}
+
+func SoundEffectAt(id int) SoundEffect {
+    if id <= 0 || id >= SoundEffectCount { return SoundEffect{} }
+    sample, pitch := id, NormalPitch
+    if id == SoundChaingun { sample, pitch = SoundPistol, 150 }
+    return SoundEffect{Valid: true, LumpName: wad.LumpName{Low: soundLow[sample], High: soundHigh[sample]},
+        Priority: soundPriority[id], Pitch: pitch, Singular: soundSingularity[id],
+        ExclusiveVoice: id == SoundPistol || id == SoundStoneMove || (id >= SoundSawUp && id <= SoundSawHit)}
+}
+
+func LoadSoundEffect(mounts wad.Archives, effect SoundEffect) SoundSample {
+    if !effect.Valid { return SoundSample{} }
+    lump := mounts.Find(effect.LumpName)
+    if !lump.Valid { lump = mounts.Find(wad.LumpName{Low: soundLow[SoundPistol], High: soundHigh[SoundPistol]}) }
+    return LoadSoundSample(lump)
+}

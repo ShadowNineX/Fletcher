@@ -1,0 +1,48 @@
+package main
+
+import "engine"
+
+func flat(low bits<32>, high bits<32>, height int, light int, sky bit) engine.PlaneKey {
+    return engine.PlaneKey{TextureLow: low, TextureHigh: high, Height: height, Light: light, Sky: sky}
+}
+
+map "Doom visplane allocator normal budget" {
+    tick {
+        var planes engine.Visplanes
+        first := engine.FindPlane(planes, flat(0x41414141, 0x41414141, 100, 160, false))
+        planes = first.State
+        second := engine.FindPlane(planes, flat(0x42424242, 0x42424242, 100, 160, false))
+        planes = second.State
+        repeat := engine.FindPlane(planes, flat(0x41414141, 0x41414141, 100, 160, false))
+        planes = repeat.State
+        skyA := engine.FindPlane(planes, flat(0x59534b53, 0x00000031, 120, 32, true))
+        planes = skyA.State
+        skyB := engine.FindPlane(planes, flat(0x59534b53, 0x00000031, -64, 255, true))
+        planes = skyB.State
+        skyOther := engine.FindPlane(planes, flat(0x59534b53, 0x00000032, -64, 255, true))
+        planes = skyOther.State
+        checked := engine.CheckPlane(planes, first.Index, 8, 16)
+        planes = engine.MarkPlaneColumns(checked.State, checked.Index, 9, 12)
+        split := engine.CheckPlane(planes, checked.Index, 0, 16)
+        planes = split.State
+        extended := engine.CheckPlane(planes, checked.Index, 16, 24)
+        planes = extended.State
+        later := engine.CheckPlane(planes, checked.Index, 11, 20)
+        planes = later.State
+        firstPlane, splitPlane := planes.PlaneAt(checked.Index), planes.PlaneAt(split.Index)
+        log(first.Index, second.Index, repeat.Index, skyA.Index, skyB.Index, skyOther.Index, planes.Count)
+        log(checked.Index, checked.Split, firstPlane.Min, firstPlane.Max,
+            engine.PlaneColumnUsed(planes, checked.Index, 8), engine.PlaneColumnUsed(planes, checked.Index, 9),
+            engine.PlaneColumnUsed(planes, checked.Index, 12))
+        log(split.Index, split.Split, splitPlane.Min, splitPlane.Max,
+            extended.Index, extended.Split, later.Index, later.Split)
+        boundary := engine.CheckPlane(planes, second.Index, 29, 35)
+        marked := engine.MarkPlaneColumns(boundary.State, boundary.Index, 31, 34)
+        log(engine.PlaneColumnUsed(boundary.State, boundary.Index, 32),
+            engine.PlaneColumnUsed(marked, boundary.Index, 30), engine.PlaneColumnUsed(marked, boundary.Index, 31),
+            engine.PlaneColumnUsed(marked, boundary.Index, 32), engine.PlaneColumnUsed(marked, boundary.Index, 33),
+            engine.PlaneColumnUsed(marked, boundary.Index, 34), engine.PlaneColumnUsed(marked, first.Index, 32))
+        boundarySplit := engine.CheckPlane(marked, boundary.Index, 32, 40)
+        log(boundarySplit.Split, engine.PlaneColumnUsed(boundarySplit.State, boundarySplit.Index, 32))
+    }
+}

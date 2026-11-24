@@ -1,0 +1,77 @@
+package main
+
+import (
+    "maze"
+    "view"
+)
+
+map "Fletcher Raycaster" {
+    screen at (-96, -54) size (view.Width, view.ScreenHeight) with { style = "solid", hold = true }
+    place scriptBlock at (-101, 67) with { code = "onStart(() => game.focusCamera(-105, -62, 154, 82));" }
+
+    input mouseLook bit at (-80, 67)
+    input manual bit at (-54, 67)
+    input left bit at (-18, 67)
+    input forward bit at (18, 67)
+    input right bit at (54, 67)
+    input keyLeft bit at (-18, 72) with { key = "A" }
+    input keyForward bit at (18, 72) with { key = "W" }
+    input keyBack bit at (36, 72) with { key = "S" }
+    input keyRight bit at (54, 72) with { key = "D" }
+
+    register playerX int = maze.Scale * 5 / 2
+    register playerY int = maze.Scale * 9 / 2
+    register heading int = 0
+    register drewFrame bit = false
+    register previousMouse int = -1
+    register mouseRemainder int = 0
+
+    tick {
+        angle := heading
+        if left { angle = angle - 1 }
+        if right { angle = angle + 1 }
+        if keyLeft { angle = angle - 4 }
+        if keyRight { angle = angle + 4 }
+        if !manual && !mouseLook && !left && !right && !forward &&
+            !keyLeft && !keyRight && !keyForward && !keyBack && currentTick() % 2 == 1 {
+            angle = angle + 1
+        }
+        if mouseLook {
+            pointerX, pointerY := mouseX(), mouseY()
+            // Ignore movements over the control strip or the editor palette.
+            if pointerX < 32 || pointerX > 800 || pointerY < 66 || pointerY > 840 { pointerX = -1 }
+            if previousMouse >= 0 && pointerX >= 0 {
+                travel := pointerX - previousMouse + mouseRemainder
+                angle = angle + travel / 8
+                next mouseRemainder = travel % 8
+            } else {
+                next mouseRemainder = 0
+            }
+            next previousMouse = pointerX
+        } else {
+            next previousMouse = -1
+            next mouseRemainder = 0
+        }
+        angle = angle & 255
+
+        x, y := playerX, playerY
+        var stride int
+        if forward { stride = 64 }
+        if keyForward { stride = 192 }
+        if keyBack { stride = stride - 192 }
+        if stride != 0 {
+            direction := view.Direction(angle)
+            stepX := direction.X * stride / maze.Scale
+            stepY := direction.Y * stride / maze.Scale
+            if maze.Walkable(x + stepX, y) { x = x + stepX }
+            if maze.Walkable(x, y + stepY) { y = y + stepY }
+        }
+        next heading = angle
+        next playerX = x
+        next playerY = y
+        if !drewFrame || x != playerX || y != playerY || angle != heading {
+            view.Render(x, y, view.Direction(angle))
+            next drewFrame = true
+        }
+    }
+}

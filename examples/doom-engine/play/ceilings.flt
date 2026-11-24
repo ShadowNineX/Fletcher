@@ -1,0 +1,95 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted on 2026-11-21 from T_MoveCeiling and EV_DoCeiling in
+// linuxdoom-1.10/p_ceilng.c.
+
+package play
+
+import "engine"
+
+const CeilingLowerToFloor = 1
+const CeilingRaiseHighest = 2
+const CeilingLowerAndCrush = 3
+const CeilingCrushAndRaise = 4
+const CeilingFastCrushAndRaise = 5
+const CeilingSilentCrushAndRaise = 6
+
+const CeilingSpeed = engine.FracUnit
+
+// CeilingState is the pure ceiling thinker. Direction is -1 down, 1 up, or
+// 0 stasis; OldDirection is retained for the level layer's stasis support.
+type CeilingState struct {
+    Active bit
+    Height int
+    Top int
+    Bottom int
+    Speed int
+    Direction int
+    OldDirection int
+    Mode int
+    Crush bit
+}
+
+// StartCeiling resolves EV_DoCeiling after the caller has selected a sector
+// and found its highest neighboring ceiling. lowerAndCrush deliberately does
+// not set Crush in the original engine.
+func StartCeiling(mode int, height int, floor int, highest int) CeilingState {
+    ceiling := CeilingState{Active: true, Height: height, Mode: mode}
+    switch mode {
+    case CeilingLowerToFloor:
+        ceiling.Bottom, ceiling.Speed, ceiling.Direction = floor, CeilingSpeed, -1
+    case CeilingRaiseHighest:
+        ceiling.Top, ceiling.Speed, ceiling.Direction = highest, CeilingSpeed, 1
+    case CeilingLowerAndCrush:
+        ceiling.Bottom, ceiling.Speed, ceiling.Direction = floor + 8 * engine.FracUnit, CeilingSpeed, -1
+    case CeilingCrushAndRaise, CeilingSilentCrushAndRaise:
+        ceiling.Crush, ceiling.Top = true, height
+        ceiling.Bottom, ceiling.Speed, ceiling.Direction = floor + 8 * engine.FracUnit, CeilingSpeed, -1
+    case CeilingFastCrushAndRaise:
+        ceiling.Crush, ceiling.Top = true, height
+        ceiling.Bottom, ceiling.Speed, ceiling.Direction = floor + 8 * engine.FracUnit, CeilingSpeed * 2, -1
+    default:
+        return CeilingState{Height: height}
+    }
+    return ceiling
+}
+
+// TickCeiling is T_MoveCeiling without its sound and active-list plumbing.
+// MoveSectorPlane preserves the source's strict endpoint and rollback rules.
+func TickCeiling(state CeilingState, blocked bit) CeilingState {
+    if !state.Active || state.Direction == 0 { return state }
+    if state.Direction == 1 {
+        // Upward ceilings pass crush=false, even for crusher modes.
+        moved := MoveSectorPlane(state.Height, state.Speed, state.Top, 1, true, false, blocked)
+        state.Height = moved.Height
+        if moved.Result == PlanePastDestination {
+            switch state.Mode {
+            case CeilingRaiseHighest:
+                state.Active = false
+            case CeilingSilentCrushAndRaise, CeilingFastCrushAndRaise, CeilingCrushAndRaise:
+                state.Direction = -1
+            }
+        }
+        return state
+    }
+    if state.Direction == -1 {
+        moved := MoveSectorPlane(state.Height, state.Speed, state.Bottom, -1, true, state.Crush, blocked)
+        state.Height = moved.Height
+        if moved.Result == PlanePastDestination {
+            switch state.Mode {
+            case CeilingSilentCrushAndRaise, CeilingCrushAndRaise:
+                state.Speed, state.Direction = CeilingSpeed, 1
+            case CeilingFastCrushAndRaise:
+                state.Direction = 1
+            case CeilingLowerAndCrush, CeilingLowerToFloor:
+                state.Active = false
+            }
+        } else if moved.Result == PlaneCrushed {
+            switch state.Mode {
+            case CeilingSilentCrushAndRaise, CeilingCrushAndRaise, CeilingLowerAndCrush:
+                state.Speed = CeilingSpeed / 8
+            }
+        }
+    }
+    return state
+}

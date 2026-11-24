@@ -1,0 +1,74 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// P_NightmareRespawn from linuxdoom-1.10/p_mobj.c.
+
+package play
+
+import "actorinfo"
+import "wad"
+
+type NightmareRespawn struct {
+    World CombatWorld
+    Respawned bit
+    OldFog int
+    NewFog int
+    Failed bit
+}
+
+// P_CheckPosition's thing pass, deliberately without consuming pickups or
+// applying impact actions. The corpse is the moving handle and therefore does
+// not block its own original spawnpoint.
+func nightmarePositionCheck(level wad.BspLevel, blocks wad.BlockMapInfo, world CombatWorld,
+    corpse LevelActor, handle int, x int, y int) MapPositionCheck {
+    body := corpse.Physics.Body
+    position := BeginMapPositionCheck(level, blocks, body, x, y)
+    if !position.Clear { return position }
+    scan := BeginThingScan(blocks, body, x, y)
+    scan.CanPickup = false
+    contact := ScanThingContacts(scan, world.Actors, world.Links, corpse, handle, world.Random)
+    position.Clear = contact.Scan.Done && !contact.Scan.Blocked
+    return FinishMapPositionCheck(level, blocks, body, x, y, position)
+}
+
+// RespawnNightmareActor fulfills the already-randomized request from
+// TickMobjState. A blocked destination intentionally consumes no extra RNG.
+func RespawnNightmareActor(level wad.BspLevel, blocks wad.BlockMapInfo, world CombatWorld,
+    handle int, rules CombatRules) NightmareRespawn {
+    corpse := world.Actors.ActorAt(handle - 1)
+    result := NightmareRespawn{World: world}
+    if !corpse.Valid || handle <= 0 {
+        result.Failed = true
+        return result
+    }
+    x, y := corpse.SpawnPoint.X << 16, corpse.SpawnPoint.Y << 16
+    position := nightmarePositionCheck(level, blocks, world, corpse, handle, x, y)
+    world = world.WithPositionCheck(handle, x, y, position)
+    result.World = world
+    if !position.Clear { return result }
+
+    oldFog := spawnTeleportFog(level, world, corpse.Physics.Body.X, corpse.Physics.Body.Y, ActorOnFloor, rules)
+    if oldFog.Failed { result.Failed = true; return result }
+    newFog := spawnTeleportFog(level, oldFog.World, x, y, ActorOnFloor, rules)
+    if newFog.Failed { result.Failed = true; return result }
+    info := actorinfo.KindAt(corpse.Kind)
+    z := ActorOnFloor
+    if info.Flags & ActorSpawnCeiling != 0 { z = ActorOnCeiling }
+    spawned := SpawnMobjWithFast(level, corpse.Kind, x, y, z, rules.Skill, rules.Fast, newFog.World.Random)
+    if !spawned.Actor.Valid { result.Failed = true; return result }
+    actor := spawned.Actor
+    actor.SpawnPoint, actor.Physics.Angle, actor.ReactionTime = corpse.SpawnPoint, mapThingHeading(corpse.SpawnPoint), 18
+    if corpse.SpawnPoint.Options & 8 != 0 { actor.Physics.Body.Flags = actor.Physics.Body.Flags | ActorAmbush }
+    renewedHandle := newFog.World.Actors.NextTransientHandle()
+    if renewedHandle == 0 { result.Failed = true; return result }
+    linked := newFog.World.Links.SetActorPosition(level, renewedHandle, actor)
+    if !linked.Valid { result.Failed = true; return result }
+    result.World = newFog.World
+    // P_SpawnMobj appends the new thinker after both fog effects. Retire the
+    // corpse slot but leave its eventual transient-list release to the normal
+    // thinker pass, preserving same-tic traversal order.
+    result.World.Actors = result.World.Actors.WithActor(handle, LevelActor{Transient: corpse.Transient}).AppendTransient(linked.Actor)
+    result.World.Links, result.World.Random = linked.Links.UnlinkActor(handle), spawned.Random
+    result.Respawned = true
+    result.OldFog, result.NewFog = oldFog.ActorHandle, newFog.ActorHandle
+    return result
+}

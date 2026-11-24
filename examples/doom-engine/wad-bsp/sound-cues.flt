@@ -1,0 +1,156 @@
+package main
+
+import "actorinfo"
+import "audio"
+import "engine"
+import "play"
+import "wad"
+
+const cueWeapon bits<8> = 1
+const cuePickup bits<8> = 2
+const cueDamage bits<8> = 4
+const cueMonster bits<8> = 8
+const cueMechanism bits<8> = 16
+const cueImpact bits<8> = 32
+const cueStage bits<8> = 64
+const cueDenied bits<8> = 128
+const previewSoundVolume = 15
+
+func packMusicArrowTone(instrument int, octave int, note int) bits<12> {
+    return bits<12>(instrument * 128 + octave * 16 + note)
+}
+
+// Synthesized presets for the weapon sounds the state machine requests.
+// Instrument, octave and note use the same packet layout as the MUS voices.
+func weaponCueTone(sound int) bits<12> {
+    switch sound {
+    case actorinfo.SoundShotgun: return packMusicArrowTone(3, 3, 7)
+    case actorinfo.SoundSuperShotgun: return packMusicArrowTone(3, 2, 11)
+    case 3: return packMusicArrowTone(18, 5, 1) // Shotgun cock.
+    case actorinfo.SoundShotgunOpen: return packMusicArrowTone(18, 4, 9)
+    case actorinfo.SoundShotgunLoad: return packMusicArrowTone(18, 4, 11)
+    case actorinfo.SoundShotgunClose: return packMusicArrowTone(18, 5, 0)
+    case 8: return packMusicArrowTone(19, 5, 7) // Plasma.
+    case actorinfo.SoundBfg: return packMusicArrowTone(21, 3, 4)
+    case actorinfo.SoundSawUp: return packMusicArrowTone(21, 3, 9)
+    case actorinfo.SoundSawIdle: return packMusicArrowTone(21, 2, 7)
+    case actorinfo.SoundSawMiss: return packMusicArrowTone(21, 3, 7)
+    case actorinfo.SoundSawHit: return packMusicArrowTone(21, 2, 11)
+    case 14: return packMusicArrowTone(18, 2, 7) // Rocket launch.
+    case actorinfo.SoundPunch: return packMusicArrowTone(3, 3, 0)
+    case audio.SoundChaingun: return packMusicArrowTone(3, 4, 1)
+    default: return packMusicArrowTone(3, 4, 0) // Pistol.
+    }
+}
+
+// Convert vanilla sound IDs into short notes the native Music Arrows can
+// synthesize. Several effects share a note, and categories can overlap.
+func previewSoundCue(id int) bits<8> {
+    if id <= 0 || id >= audio.SoundEffectCount { return 0 }
+    switch id {
+    case 15, 17, 35, 82: return cueImpact // Explosions and teleports.
+    case 18, 19, 20, 21, 22, 23, 24, 88, 89: return cueMechanism
+    case 25, actorinfo.SoundSlop, actorinfo.SoundPlayerDeath, actorinfo.SoundPlayerHighDeath: return cueDamage
+    case 32, 33, 90, 93: return cuePickup
+    case actorinfo.SoundOof, actorinfo.SoundNoWay: return cueDenied
+    case 83, 86: return cueWeapon
+    }
+    if id <= 14 { return cueWeapon }
+    return cueMonster
+}
+
+// Music Arrows play synthesized notes. Use the original audibility rules
+// before asking a lane to play a positional actor sound.
+func previewActorCue(level wad.BspLevel, actors play.MapActors, sound int, origin int) bits<8> {
+    cue := previewSoundCue(sound)
+    if cue == 0 || origin == 0 || origin == actors.PlayerActors[0] { return cue }
+    listener := actors.ActorAt(actors.PlayerActors[0] - 1)
+    source := actors.ActorAt(origin - 1)
+    if !listener.Valid || !source.Valid { return 0 }
+    if !previewSoundAudible(level, listener.Physics, source.Physics.Body.X, source.Physics.Body.Y) { return 0 }
+    return cue
+}
+
+func previewSoundAudible(level wad.BspLevel, listener play.ActorPhysics, x int, y int) bit {
+    return audio.AdjustSound(audio.SoundPoint{X: listener.Body.X, Y: listener.Body.Y, Angle: listener.Angle},
+        audio.SoundPoint{X: x, Y: y}, play.BossMapNumber(level.MapName), previewSoundVolume).Audible
+}
+
+type sectorSoundBounds struct {
+    Box engine.Box
+    Valid bit
+}
+
+func (bounds sectorSoundBounds) withLine(line wad.CollisionLine) sectorSoundBounds {
+    if !bounds.Valid { bounds.Box = engine.ClearBox() }
+    bounds.Box = engine.AddToBox(bounds.Box, line.First.X, line.First.Y)
+    bounds.Box = engine.AddToBox(bounds.Box, line.Last.X, line.Last.Y)
+    bounds.Valid = true
+    return bounds
+}
+
+// P_GroupLines centers sector sound origins on the linedef endpoints. Both
+// sides contribute. Cache the bounds in one pass over the immutable geometry.
+func loadSectorSoundBounds(level wad.BspLevel) play.PagedSlots<sectorSoundBounds> {
+    var sectors play.PagedSlots<sectorSoundBounds>
+    for index := range level.Lines.Count {
+        line := level.LineAt(index)
+        if line.Valid {
+            sectors = sectors.With(line.FrontSector, sectors.At(line.FrontSector).withLine(line))
+            if line.BackSector >= 0 && line.BackSector != line.FrontSector {
+                sectors = sectors.With(line.BackSector, sectors.At(line.BackSector).withLine(line))
+            }
+        }
+    }
+    return sectors
+}
+
+func previewMoverCues(level wad.BspLevel, listener play.ActorPhysics, bounds play.PagedSlots<sectorSoundBounds>, sounds play.MoverSounds) bits<8> {
+    var cues bits<8>
+    for index := range sounds.Count {
+        sound := sounds.At(index)
+        cue := previewSoundCue(sound.Id)
+        if cue & ~cues != 0 {
+            if sound.Sector == play.GlobalMoverSoundSector {
+                cues = cues | cue
+            } else if sound.Sector >= 0 && sound.Sector < level.Sectors.Count {
+                sector := bounds.At(sound.Sector)
+                // In P_GroupLines the untouched min/max sentinels average to zero.
+                if previewSoundAudible(level, listener,
+                    (sector.Box.Right + sector.Box.Left) / 2, (sector.Box.Top + sector.Box.Bottom) / 2) {
+                    cues = cues | cue
+                }
+            }
+        }
+    }
+    return cues
+}
+
+// Each Source taps the lamp two rows above it. A change in the bus bit
+// represents one committed cue. Give the Music Arrow an off tick between
+// consecutive pulses so it receives two distinct onsets.
+const musicCueSource = "const { x, y } = getPosition();\n" +
+    "always(() => {\n" +
+    "    const phase = world.getSignal(x, y - 2) > 0;\n" +
+    "    if (phase !== !!state.previousPhase) {\n" +
+    "        state.pending = true;\n" +
+    "        if (x === -56) {\n" +
+    "            let packet = 0;\n" +
+    "            for (let bit = 0; bit < 12; bit++) {\n" +
+    "                if (world.getSignal(x + 8 * bit, y + 6) > 0) packet |= 1 << bit;\n" +
+    "            }\n" +
+    "            state.pendingExtra = ((packet >> 7) << 8) | (packet & 127);\n" +
+    "        }\n" +
+    "    }\n" +
+    "    state.previousPhase = phase;\n" +
+    "    const pulse = !!state.pending && !state.lastPulse;\n" +
+    "    if (pulse) {\n" +
+    "        state.pending = false;\n" +
+    "        if (x === -56 && state.pendingExtra !== state.extra) {\n" +
+    "            world.setArrow(x + 1, y, 29, 1, false, state.pendingExtra);\n" +
+    "            state.extra = state.pendingExtra;\n" +
+    "        }\n" +
+    "    }\n" +
+    "    state.lastPulse = pulse;\n" +
+    "    world.setSignal(x, y, pulse ? 1 : 0);\n" +
+    "});"

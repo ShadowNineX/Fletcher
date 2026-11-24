@@ -1,0 +1,334 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted from linuxdoom-1.10/am_map.c for the Logic Arrows framebuffer.
+
+package main
+
+import "automap"
+import "engine"
+import "numeric"
+import "play"
+import "wad"
+import "walls"
+
+const automapNeverSee = 128
+const automapMapped = 256
+const automapSecret = 32
+const automapGridStep = 128 * engine.FracUnit
+const automapMarkCount = 10
+const automapArrowRadius = 8 * 16 * engine.FracUnit / 7
+const automapArrowRear = -automapArrowRadius + automapArrowRadius / 8
+const automapThingTip = 16 * engine.FracUnit
+const automapThingRear = -8 * engine.FracUnit
+// AM_drawLineCharacter scales after converting the unit triangle to fixed point.
+const automapThingHalfWidth = 16 * (7 * engine.FracUnit / 10)
+const automapTitleY = 167
+const automapTitleCharacters = 80
+const automapArrowX = [14]int{
+    automapArrowRear, automapArrowRadius,
+    automapArrowRadius, automapArrowRadius - automapArrowRadius / 2,
+    automapArrowRadius, automapArrowRadius - automapArrowRadius / 2,
+    automapArrowRear, -automapArrowRadius - automapArrowRadius / 8,
+    automapArrowRear, -automapArrowRadius - automapArrowRadius / 8,
+    -automapArrowRadius + (3 * automapArrowRadius) / 8, automapArrowRear,
+    -automapArrowRadius + (3 * automapArrowRadius) / 8, automapArrowRear,
+}
+const automapArrowY = [14]int{
+    0, 0, 0, automapArrowRadius / 4, 0, -(automapArrowRadius / 4),
+    0, automapArrowRadius / 4, 0, -(automapArrowRadius / 4),
+    0, automapArrowRadius / 4, 0, -(automapArrowRadius / 4),
+}
+
+type MappedLines struct {
+    Words [LineReferenceWords]bits<32>
+}
+
+type AutomapMarks struct {
+    Points [automapMarkCount]engine.Vertex
+    Count int
+    Next int
+}
+
+func (marks AutomapMarks) WithMark(window automap.Window) AutomapMarks {
+    marks.Points[marks.Next] = engine.Vertex{X: window.X + window.MapWidth / 2, Y: window.Y + window.MapHeight / 2}
+    marks.Next = (marks.Next + 1) % automapMarkCount
+    if marks.Count < automapMarkCount { marks.Count = marks.Count + 1 }
+    return marks
+}
+
+func automapBounds(level wad.BspLevel) automap.Bounds {
+    first := wad.VertexAt(level.File, level.Vertices, 0)
+    result := automap.Bounds{MinX: first.X, MaxX: first.X, MinY: first.Y, MaxY: first.Y}
+    for i := range level.Vertices.Count {
+        point := wad.VertexAt(level.File, level.Vertices, i)
+        if point.X < result.MinX { result.MinX = point.X }
+        if point.X > result.MaxX { result.MaxX = point.X }
+        if point.Y < result.MinY { result.MinY = point.Y }
+        if point.Y > result.MaxY { result.MaxY = point.Y }
+    }
+    return result
+}
+
+func automapColor(shade walls.WadShading, index int) color {
+    if shade.Valid { return shade.Palette[index] }
+    switch index {
+        case 0: return color.Black
+        case 64: return color.Orange
+        case 104: return color.Purple
+        case 112: return color.Green
+        case 176, 184: return color.Red
+        case 231: return color.Yellow
+        default: return color.White
+    }
+}
+
+func automapGridStart(start int, origin int) int {
+    remainder := (start - origin) % automapGridStep
+    if remainder != 0 { start = start + automapGridStep - remainder }
+    return start
+}
+
+func drawAutomapGrid(window automap.Window, blocks wad.BlockMapInfo, shade color) {
+    right, top := window.X + window.MapWidth, window.Y + window.MapHeight
+    start := automapGridStart(window.X, blocks.OriginX)
+    for i := range window.MapWidth / automapGridStep + 1 {
+        x := start + i * automapGridStep
+        if x < right { automap.DrawLine(window, x, window.Y, x, top, shade) }
+    }
+    start = automapGridStart(window.Y, blocks.OriginY)
+    for i := range window.MapHeight / automapGridStep + 1 {
+        y := start + i * automapGridStep
+        if y < top { automap.DrawLine(window, window.X, y, right, y, shade) }
+    }
+}
+
+func automapWallColor(level wad.BspLevel, line wad.CollisionLine, seen bit, allMap bit, reveal bit) int {
+    if !line.Valid || (!reveal && line.Flags & automapNeverSee != 0) { return -1 }
+    if !reveal && !seen && line.Flags & automapMapped == 0 {
+        if allMap { return 99 }
+        return -1
+    }
+    if line.BackSector < 0 { return 176 }
+    if line.Action == 39 { return 184 }
+    if line.Flags & automapSecret != 0 { return 176 }
+    front, back := level.SectorHeightsAt(line.FrontSector), level.SectorHeightsAt(line.BackSector)
+    if front.Floor != back.Floor { return 64 }
+    if front.Ceiling != back.Ceiling { return 231 }
+    if reveal { return 96 }
+    return -1
+}
+
+func drawAutomapWalls(window automap.Window, level wad.BspLevel, mapped MappedLines, allMap bit, shade walls.WadShading, reveal bit) {
+    for i := range level.Lines.Count {
+        var seen bit
+        if i < LineReferenceWords * 32 { seen = mapped.Words[i / 32][i % 32] }
+        if reveal || seen || allMap || wad.U16(level.File, level.Lines.Offset + i * wad.LineSize + 4) & automapMapped != 0 {
+            line := level.LineAt(i)
+            index := automapWallColor(level, line, seen, allMap, reveal)
+            if index >= 0 {
+                automap.DrawLine(window, line.First.X, line.First.Y, line.Last.X, line.Last.Y, automapColor(shade, index))
+            }
+        }
+    }
+}
+
+func automapSymbolPoint(x int, y int, actor play.ActorPhysics, cosine int, sine int) engine.Vertex {
+    return engine.Vertex{X: actor.Body.X + cport.C_FixedMul(x, cosine) - cport.C_FixedMul(y, sine),
+        Y: actor.Body.Y + cport.C_FixedMul(x, sine) + cport.C_FixedMul(y, cosine)}
+}
+
+func drawAutomapPlayer(window automap.Window, actor play.ActorPhysics, shade color) {
+    cosine, sine := engine.FracUnit, 0
+    if actor.Angle != 0 { cosine, sine = engine.AngleCosine(actor.Angle), engine.AngleSine(actor.Angle) }
+    for i := range 7 {
+        first := automapSymbolPoint(automapArrowX[i * 2], automapArrowY[i * 2], actor, cosine, sine)
+        last := automapSymbolPoint(automapArrowX[i * 2 + 1], automapArrowY[i * 2 + 1], actor, cosine, sine)
+        automap.DrawLine(window, first.X, first.Y, last.X, last.Y, shade)
+    }
+}
+
+func automapThingOutside(center int, lower int, upper int) bit {
+    // Let DrawLine clip coordinates near the signed 16.16 wrap boundary.
+    if upper < lower || center < -2147483647 + automapThingTip || center > 2147483647 - automapThingTip { return false }
+    return center + automapThingTip < lower || center - automapThingTip > upper
+}
+
+func drawAutomapThing(window automap.Window, actor play.ActorPhysics, shade color) {
+    if automapThingOutside(actor.Body.X, window.X, window.X + window.MapWidth) ||
+        automapThingOutside(actor.Body.Y, window.Y, window.Y + window.MapHeight) { return }
+    cosine, sine := engine.FracUnit, 0
+    if actor.Angle != 0 { cosine, sine = engine.AngleCosine(actor.Angle), engine.AngleSine(actor.Angle) }
+    lower := automapSymbolPoint(automapThingRear, -automapThingHalfWidth, actor, cosine, sine)
+    tip := automapSymbolPoint(automapThingTip, 0, actor, cosine, sine)
+    upper := automapSymbolPoint(automapThingRear, automapThingHalfWidth, actor, cosine, sine)
+    automap.DrawLine(window, lower.X, lower.Y, tip.X, tip.Y, shade)
+    automap.DrawLine(window, tip.X, tip.Y, upper.X, upper.Y, shade)
+    automap.DrawLine(window, upper.X, upper.Y, lower.X, lower.Y, shade)
+}
+
+func drawAutomapSectorThings(window automap.Window, actors play.MapActors, links play.ActorLinks, handle int, shade color) {
+    for range actors.Count {
+        if handle == 0 { return }
+        actor := actors.ActorAt(handle - 1)
+        if actor.Valid { drawAutomapThing(window, actor.Physics, shade) }
+        handle = links.SectorNext(handle)
+    }
+}
+
+func drawAutomapMarks(window automap.Window, marks AutomapMarks, mounts wad.Archives, shade walls.WadShading) {
+    if !shade.Valid { return }
+    for i := range marks.Count {
+        point := marks.Points[i]
+        x := automap.ScreenX(window, point.X) * intermissionWidth / Width
+        y := automap.ScreenY(window, point.Y) * intermissionHeight / Height
+        name := wad.LumpName{Low: 0x4e4d4d41, High: 0x4d55 | ((48 + i) << 16)} // AMMNUMn
+        patch := readIntermissionPatch(mounts, name)
+        top := y - patch.Top
+        if x >= 0 && x <= intermissionWidth - 5 && y >= 0 &&
+            top + patch.Height <= window.Height * intermissionHeight / Height - 6 {
+            drawIntermissionPatch(patch, shade, x, y)
+        }
+    }
+}
+
+// A mounted PWAD can supply an AMTITLE lump containing the localized title for
+// the selected map. It is deliberately optional. Classic IWAD title strings
+// are engine metadata, rather than WAD data, so an asset-independent build
+// presents the map marker when a caller has not supplied a title.
+func automapTitleLumpName() wad.LumpName { return wad.LumpName{Low: 0x49544d41, High: 0x454c54} } // AMTITLE
+
+func automapTitlePatchName(marker wad.LumpName) wad.LumpName {
+    // E1M1 through E4M9 use WILVem. The digits are converted to the
+    // zero-based episode/map indices used by the WAD patch names.
+    if marker.Low & 255 == 69 && (marker.Low >> 16) & 255 == 77 {
+        episode := ((marker.Low >> 8) & 255) - 49
+        mapIndex := ((marker.Low >> 24) & 255) - 49
+        if episode >= 0 && episode < 4 && mapIndex >= 0 && mapIndex < 9 {
+            return wad.LumpName{Low: 0x564c4957, High: (48 + episode) | ((48 + mapIndex) << 8)} // WILVem
+        }
+    }
+
+    // MAP01 through MAP32 use CWILVnn. The final digit resides in the high
+    // word of the eight-byte map marker.
+    if marker.Low & 0xffffff == 0x50414d {
+        mapIndex := ((marker.Low >> 24) & 255) * 10 + (marker.High & 255) - 529
+        if mapIndex >= 0 && mapIndex < 32 {
+            return wad.LumpName{Low: 0x4c495743,
+                High: 86 | ((48 + mapIndex / 10) << 8) | ((48 + mapIndex % 10) << 16)} // CWILVnn
+        }
+    }
+    return wad.LumpName{}
+}
+
+func automapTitlePatch(mounts wad.Archives, marker wad.LumpName) IntermissionPatch {
+    title := mounts.Find(automapTitleLumpName())
+    if title.Valid { return IntermissionPatch{} }
+    return readIntermissionPatch(mounts, automapTitlePatchName(marker))
+}
+
+func automapMarkerByte(name wad.LumpName, index int) int {
+    if index < 4 { return int((name.Low >> (index * 8)) & 255) }
+    return int((name.High >> ((index - 4) * 8)) & 255)
+}
+
+func automapTitleLength(mounts wad.Archives, marker wad.LumpName) int {
+    title := mounts.Find(automapTitleLumpName())
+    limit := automapTitleCharacters
+    if title.Valid && title.Size < limit { limit = title.Size }
+    if !title.Valid { limit = 8 }
+    count := 0
+    var ended bit
+    for index := range limit {
+        character := automapMarkerByte(marker, index)
+        if title.Valid { character = int(title.File[title.Offset + index]) }
+        if character == 0 { ended = true }
+        if character != 0 && !ended { count = count + 1 }
+    }
+    return count
+}
+
+func automapTitleCharacter(mounts wad.Archives, marker wad.LumpName, index int) int {
+    title := mounts.Find(automapTitleLumpName())
+    if title.Valid && index < title.Size { return int(title.File[title.Offset + index]) }
+    return automapMarkerByte(marker, index)
+}
+
+// HU_Drawer draws the title in the original HUD font immediately above the
+// status bar. The glyphs come from the mounted WAD and are clipped to the
+// original 320-pixel virtual screen just like HUlib_drawTextLine.
+func drawAutomapTitle(mounts wad.Archives, marker wad.LumpName, shade walls.WadShading) {
+    if !shade.Valid { return }
+    patch := automapTitlePatch(mounts, marker)
+    if patch.Width > 0 {
+        drawIntermissionPatch(patch, shade, 0, automapTitleY - patch.Height)
+        return
+    }
+    glyphHeight := finaleGlyph(mounts, 33).Height
+    if glyphHeight <= 0 { return }
+    x, y := 0, automapTitleY - glyphHeight
+    count := automapTitleLength(mounts, marker)
+    for index := range count {
+        character := automapTitleCharacter(mounts, marker, index)
+        glyph := finaleGlyph(mounts, character)
+        advance := 4
+        if glyph.Width > 0 { advance = glyph.Width }
+        if x + advance > intermissionWidth { return }
+        if glyph.Width > 0 { drawIntermissionPatch(glyph, shade, x, y) }
+        x = x + advance
+    }
+}
+
+func drawAutomap(view automap.View, level wad.BspLevel, blocks wad.BlockMapInfo, mapped MappedLines,
+    actor play.ActorPhysics, marks AutomapMarks, mounts wad.Archives, shade walls.WadShading, allMap bit,
+    revealMode int, actors play.MapActors, links play.ActorLinks) {
+    window := view.Window
+    background := automapColor(shade, 0)
+    for y := range window.Height {
+        for x := range window.Width { pixel(x, y, true, background) }
+    }
+    if view.Grid { drawAutomapGrid(window, blocks, automapColor(shade, 104)) }
+    drawAutomapWalls(window, level, mapped, allMap, shade, revealMode != 0)
+    drawAutomapPlayer(window, actor, automapColor(shade, 209))
+    if revealMode == 2 && actors.Count > 0 {
+        thingsColor := automapColor(shade, 112)
+        for sector := range level.Sectors.Count {
+            handle := links.SectorFirst(sector)
+            if handle > 0 { drawAutomapSectorThings(window, actors, links, handle, thingsColor) }
+        }
+    }
+    center := window.Width * (window.Height + 1) / 2
+    pixel(center % window.Width, center / window.Width, true, automapColor(shade, 96))
+    drawAutomapMarks(window, marks, mounts, shade)
+    drawAutomapTitle(mounts, level.MapName, shade)
+}
+
+func updatePreviewAutomap(level wad.BspLevel, view automap.View, bounds automap.Bounds, marks AutomapMarks,
+    actor play.ActorPhysics, wasOpen bit, showStatus bit, pressed bits<8>, command automap.ViewCommand) (automap.View, automap.Bounds, AutomapMarks) {
+    x, y := actor.Body.X, actor.Body.Y
+    if view.Window.Width == 0 {
+        bounds = automapBounds(level)
+        mapHeight := Height
+        if showStatus { mapHeight = StatusViewHeight }
+        view = automap.NewView(bounds, x, y, Width, mapHeight)
+    } else if !wasOpen { view = automap.RecenterView(view, bounds, x, y) }
+    if pressed[4] { marks = marks.WithMark(view.Window) }
+    if pressed[5] { marks = AutomapMarks{} }
+    return automap.TickView(view, bounds, x, y, command), bounds, marks
+}
+
+func queuePreviewAutomapMessages(messages play.HudMessages, view automap.View, marks AutomapMarks,
+    following bit, pressed bits<8>) play.HudMessages {
+    if pressed[2] {
+        label := "PLAYER TRACKING OFF"
+        if following { label = "PLAYER TRACKING ON" }
+        messages = play.QueueHudMessage(messages, label, false)
+    }
+    if pressed[1] {
+        label := "GRID ENABLED"
+        if view.Grid { label = "GRID DISABLED" }
+        messages = play.QueueHudMessage(messages, label, false)
+    }
+    if pressed[4] { messages = play.QueueHudMessage(messages, markHudMessage(marks.Next), false) }
+    if pressed[5] { messages = play.QueueHudMessage(messages, "MAP MARKS CLEARED", false) }
+    return messages
+}

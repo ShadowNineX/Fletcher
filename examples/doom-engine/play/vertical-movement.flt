@@ -1,0 +1,103 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted from P_ZMovement in linuxdoom-1.10/p_mobj.c.
+
+package play
+
+import "engine"
+import "wad"
+
+const MoveNoGravity = 0x200
+const MoveInFloat = 0x200000
+const MoveSkullFly = 0x1000000
+
+const NormalViewHeight = 41 * engine.FracUnit
+const gravity = engine.FracUnit
+const floatSpeed = 4 * engine.FracUnit
+
+const MotionNone = 0
+const MotionExplodeMissile = 1
+const MotionRemoveMissile = 2
+const MotionResetSkull = 3
+
+type ActorPhysics struct {
+    Body MapActor
+    MomentumX int
+    MomentumY int
+    MomentumZ int
+    Angle bits<32>
+    ViewHeight int
+    ViewHeightDelta int
+}
+
+type FloatTarget struct {
+    Valid bit
+    X int
+    Y int
+    Z int
+}
+
+type VerticalMove struct {
+    Actor ActorPhysics
+    Event int
+    HardLanding bit
+}
+
+// The state and sound effects of P_ExplodeMissile are dispatched by the caller.
+func stopMissile(actor ActorPhysics) ActorPhysics {
+    actor.MomentumX, actor.MomentumY, actor.MomentumZ = 0, 0, 0
+    actor.Body.Flags = actor.Body.Flags & ~bits<32>(MoveMissile)
+    return actor
+}
+
+func MoveVertically(actor ActorPhysics, target FloatTarget) VerticalMove {
+    z, floor, ceiling := actor.Body.Z, actor.Body.Floor, actor.Body.Ceiling
+    flags := actor.Body.Flags
+    hardLanding := false
+    if actor.Body.Player && z < floor {
+        actor.ViewHeight = actor.ViewHeight - (floor - z)
+        actor.ViewHeightDelta = (NormalViewHeight - actor.ViewHeight) >> 3
+    }
+
+    z = z + actor.MomentumZ
+    if flags & MoveFloat != 0 && flags & (MoveSkullFly | MoveInFloat) == 0 && target.Valid {
+        distance := wad.ApproxDistance(actor.Body.X - target.X, actor.Body.Y - target.Y)
+        delta := target.Z + (actor.Body.Height >> 1) - z
+        if delta < 0 && distance < -(delta * 3) { z = z - floatSpeed }
+        if delta > 0 && distance < delta * 3 { z = z + floatSpeed }
+    }
+
+    if z <= floor {
+        if flags & MoveSkullFly != 0 { actor.MomentumZ = -actor.MomentumZ }
+        if actor.MomentumZ < 0 {
+            if actor.Body.Player && actor.MomentumZ < -8 * gravity {
+                actor.ViewHeightDelta = actor.MomentumZ >> 3
+                hardLanding = true
+            }
+            actor.MomentumZ = 0
+        }
+        z = floor
+        if flags & MoveMissile != 0 && flags & MoveNoClip == 0 {
+            actor.Body.Z = z
+            return VerticalMove{Actor: stopMissile(actor), Event: MotionExplodeMissile, HardLanding: hardLanding}
+        }
+    } else if flags & MoveNoGravity == 0 {
+        if actor.MomentumZ == 0 {
+            actor.MomentumZ = -2 * gravity
+        } else {
+            actor.MomentumZ = actor.MomentumZ - gravity
+        }
+    }
+
+    if z + actor.Body.Height > ceiling {
+        if actor.MomentumZ > 0 { actor.MomentumZ = 0 }
+        z = ceiling - actor.Body.Height
+        if flags & MoveSkullFly != 0 { actor.MomentumZ = -actor.MomentumZ }
+        if flags & MoveMissile != 0 && flags & MoveNoClip == 0 {
+            actor.Body.Z = z
+            return VerticalMove{Actor: stopMissile(actor), Event: MotionExplodeMissile, HardLanding: hardLanding}
+        }
+    }
+    actor.Body.Z = z
+    return VerticalMove{Actor: actor, HardLanding: hardLanding}
+}

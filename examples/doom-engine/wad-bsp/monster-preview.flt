@@ -1,0 +1,89 @@
+package main
+
+import "actorinfo"
+import "enemy"
+import "play"
+import "wad"
+
+type PreviewMonsterWalk struct {
+    Handle int
+    Intent enemy.MonsterChase
+    Search bit
+    Step enemy.MonsterWalkStep
+}
+
+func previewMonsterState(scene PreviewCombat, handle int, state int, missile bit, fast bit) PreviewActionStep {
+    if scene.Failed || state == enemy.KeepMonsterState { return PreviewActionStep{Scene: scene} }
+    actor := scene.World.Actors.ActorAt(handle - 1)
+    return pendingActorState(scene, PreviewStateAction{Handle: handle, Missile: missile,
+        Step: play.SetMobjStateWithFast(actor, state, fast)})
+}
+
+func previewMonsterWalkProgress(scene PreviewCombat, blocks wad.BlockMapInfo, walk PreviewMonsterWalk,
+    rules play.CombatRules) PreviewActionStep {
+    if walk.Step.Done && !walk.Step.Move.Failed && !walk.Search && !walk.Step.Move.Moved {
+        walk.Search = true
+        walk.Step = enemy.BeginMonsterWalk(scene.Base, blocks, walk.Step.Move, walk.Handle, true, rules)
+    }
+    movement := walk.Step.Move
+    scene.Level, scene.Specials, scene.World, scene.Failed = movement.Level, movement.Specials, movement.World, movement.Failed
+    if scene.Failed { return PreviewActionStep{Scene: scene} }
+    if walk.Step.Pending {
+        // Resume the accepted move with the world left by the inner action.
+        event := walk.Step.Event
+        event.World = scene.World
+        progress := previewActionEvent(scene, event)
+        progress.Pending.Kind, progress.Pending.Walk = resumeMonsterWalk, PreviewActionBox<PreviewMonsterWalk>{Value: walk}
+        return progress
+    }
+    if !walk.Step.Done { scene.Failed = true; return PreviewActionStep{Scene: scene} }
+
+    resolved := enemy.FinishChaseMovement(walk.Intent, scene.World, walk.Handle)
+    scene.World.Random = resolved.Random
+    scene = cuePreviewActorSound(scene, resolved.Sound, walk.Handle)
+    if movement.Teleported { scene = afterPreviewTeleport(scene) }
+    return previewMonsterState(scene, walk.Handle, resolved.State, resolved.Missile, rules.Fast)
+}
+
+func beginPreviewMonsterAction(scene PreviewCombat, blocks wad.BlockMapInfo, handle int, action int,
+    rules play.CombatRules) PreviewActionStep {
+    actor := scene.World.Actors.ActorAt(handle - 1)
+    switch action {
+    case actorinfo.ActionLook:
+        heard := scene.Hearing.Targets.At(actor.Sector)
+        look := enemy.Look(scene.Level, scene.World, actor, handle, heard.Target)
+        scene.World.Actors, scene.World.Random = scene.World.Actors.WithActor(handle, look.Actor), look.Random
+        scene = cuePreviewActorSound(scene, look.Sound, look.SoundOrigin)
+        return previewMonsterState(scene, handle, look.State, false, rules.Fast)
+    case actorinfo.ActionChase, actorinfo.ActionVileChase, actorinfo.ActionHoof, actorinfo.ActionMetal, actorinfo.ActionBabyMetal:
+        if action == actorinfo.ActionHoof || action == actorinfo.ActionMetal || action == actorinfo.ActionBabyMetal {
+            sound, origin, _ := play.ActorActionSound(actor, handle, action, false, scene.World.Random)
+            scene = cuePreviewActorSound(scene, sound, origin)
+        }
+        if action == actorinfo.ActionVileChase {
+            raised := enemy.TryVileResurrection(scene.Level, blocks, scene.World, handle)
+            scene = observePreviewCombat(scene, play.CombatStep{World: raised.World, ActorHandle: raised.Corpse,
+                Failed: raised.Failed, Feedback: raised.Feedback})
+            if scene.Failed || raised.Raised { return PreviewActionStep{Scene: scene} }
+            actor = scene.World.Actors.ActorAt(handle - 1)
+        }
+        intent := enemy.Chase(scene.Level, scene.World, actor, rules.Skill, rules.Fast)
+        scene.World.Actors, scene.World.Random = scene.World.Actors.WithActor(handle, intent.Actor), intent.Random
+        scene = cuePreviewActorSound(scene, intent.Sound, handle)
+        if intent.Course != 0 {
+            search := intent.Course == enemy.ChaseNewDirection
+            movement := enemy.MonsterMove{Level: scene.Level, Specials: scene.Specials, World: scene.World}
+            walk := enemy.BeginMonsterWalk(scene.Base, blocks, movement, handle, search, rules)
+            return previewMonsterWalkProgress(scene, blocks, PreviewMonsterWalk{Handle: handle, Intent: intent,
+                Search: search, Step: walk}, rules)
+        }
+        return previewMonsterState(scene, handle, intent.State, intent.Missile, rules.Fast)
+    case actorinfo.ActionCPosRefire, actorinfo.ActionSpidRefire:
+        chance := 40
+        if action == actorinfo.ActionSpidRefire { chance = 10 }
+        refire := enemy.Refire(scene.Level, scene.World, handle, chance)
+        scene.World = refire.World
+        return previewMonsterState(scene, handle, refire.State, false, rules.Fast)
+    }
+    return PreviewActionStep{Scene: scene}
+}

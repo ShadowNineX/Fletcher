@@ -1,0 +1,174 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// P_LookForPlayers, A_Look, A_Chase and A_FaceTarget from p_enemy.c.
+
+package enemy
+
+import "actorinfo"
+import "engine"
+import "play"
+import "wad"
+
+const KeepMonsterState = -1
+const ChaseMove = 1
+const ChaseNewDirection = 2
+
+func HasMonsterThinker(actor play.LevelActor) bit {
+    return actor.Valid && (actor.Physics.Body.Flags & play.ActorCountKill != 0 || actor.Kind == actorinfo.ActorSkull || actor.Kind == actorinfo.ActorBossEye) &&
+        actorinfo.KindAt(actor.Kind).SeeState != play.ActorNullState
+}
+
+type PlayerLook struct {
+    Actor play.LevelActor
+    Found bit
+}
+
+func monsterCanSee(level wad.BspLevel, actor play.LevelActor, target play.LevelActor) bit {
+    return target.Valid && wad.CheckSight(level, sightEndpoint(actor), sightEndpoint(target)).Visible
+}
+
+func LookForPlayers(level wad.BspLevel, world play.CombatWorld, actor play.LevelActor, allAround bit) PlayerLook {
+    stop := (actor.LastLook - 1) & 3
+    inspected := 0
+    // Up to two occupied slots are inspected before a third or the stop mark
+    // ends the search. The cursor also advances across empty player slots.
+    for range 3 * wad.VanillaPlayers {
+        slot := actor.LastLook & 3
+        handle := world.Actors.PlayerActors[slot]
+        if handle > 0 {
+            if inspected == 2 || slot == stop { return PlayerLook{Actor: actor} }
+            inspected = inspected + 1
+            target := world.Actors.ActorAt(handle - 1)
+            if world.Players[slot].Health > 0 && monsterCanSee(level, actor, target) {
+                a, b := actor.Physics.Body, target.Physics.Body
+                angle := engine.PointToAngle(a.X, a.Y, b.X, b.Y) - actor.Physics.Angle
+                if allAround || angle <= 0x40000000 || angle >= 0xc0000000 ||
+                    wad.ApproxDistance(b.X - a.X, b.Y - a.Y) <= meleeRange {
+                    actor.Target = handle
+                    return PlayerLook{Actor: actor, Found: true}
+                }
+            }
+        }
+        actor.LastLook = (actor.LastLook + 1) & 3
+    }
+    return PlayerLook{Actor: actor}
+}
+
+type MonsterLook struct {
+    Actor play.LevelActor
+    Random play.RandomState
+    State int
+    Sound int
+    SoundOrigin int
+}
+
+func Look(level wad.BspLevel, world play.CombatWorld, actor play.LevelActor, handle int, soundTarget int) MonsterLook {
+    actor.Threshold = 0
+    target := world.Actors.ActorAt(soundTarget - 1)
+    awake := false
+    if target.Valid && target.Physics.Body.Flags & play.ActorShootable != 0 {
+        actor.Target = soundTarget
+        awake = actor.Physics.Body.Flags & play.ActorAmbush == 0 || monsterCanSee(level, actor, target)
+    }
+    if !awake {
+        looked := LookForPlayers(level, world, actor, false)
+        actor, awake = looked.Actor, looked.Found
+    }
+    result := MonsterLook{Actor: actor, Random: world.Random, State: KeepMonsterState}
+    if !awake { return result }
+    info := actorinfo.KindAt(actor.Kind)
+    result.State, result.Sound = info.SeeState, info.SeeSound
+    if info.SeeSound != 0 {
+        if actor.Kind != actorinfo.ActorSpider && actor.Kind != actorinfo.ActorCyborg { result.SoundOrigin = handle }
+        if info.SeeSound >= actorinfo.SoundSeeHuman && info.SeeSound < actorinfo.SoundSeeHuman + 3 {
+            roll := play.PRandom(result.Random)
+            result.Sound, result.Random = actorinfo.SoundSeeHuman + int(roll.Value) % 3, roll.State
+        } else if info.SeeSound >= actorinfo.SoundSeeDemon && info.SeeSound < actorinfo.SoundSeeDemon + 2 {
+            roll := play.PRandom(result.Random)
+            result.Sound, result.Random = actorinfo.SoundSeeDemon + int(roll.Value) % 2, roll.State
+        }
+    }
+    return result
+}
+
+type MonsterChase struct {
+    Actor play.LevelActor
+    Random play.RandomState
+    State int
+    Course int
+    Sound int
+    Missile bit
+    activeSound bit
+}
+
+func Chase(level wad.BspLevel, world play.CombatWorld, actor play.LevelActor, skill int, fast bit) MonsterChase {
+    target := world.Actors.ActorAt(actor.Target - 1)
+    if actor.ReactionTime != 0 { actor.ReactionTime = actor.ReactionTime - 1 }
+    if actor.Threshold != 0 {
+        if !target.Valid || target.Health <= 0 { actor.Threshold = 0 } else { actor.Threshold = actor.Threshold - 1 }
+    }
+    direction := actor.MoveDirection
+    if direction >= 0 && direction < 8 {
+        actor.Physics.Angle = actor.Physics.Angle & 0xe0000000
+        delta := int(actor.Physics.Angle - (bits<32>(direction) << 29))
+        if delta > 0 { actor.Physics.Angle = actor.Physics.Angle - 0x20000000 }
+        if delta < 0 { actor.Physics.Angle = actor.Physics.Angle + 0x20000000 }
+    }
+    result := MonsterChase{Actor: actor, Random: world.Random, State: KeepMonsterState}
+    info := actorinfo.KindAt(actor.Kind)
+    if !target.Valid || target.Physics.Body.Flags & play.ActorShootable == 0 {
+        looked := LookForPlayers(level, world, actor, true)
+        result.Actor = looked.Actor
+        if !looked.Found { result.State = info.SpawnState }
+        return result
+    }
+    if actor.Physics.Body.Flags & play.ActorJustAttacked != 0 {
+        result.Actor.Physics.Body.Flags = actor.Physics.Body.Flags & ~play.ActorJustAttacked
+        if skill != 4 && !fast { result.Course = ChaseNewDirection }
+        return result
+    }
+    if info.MeleeState != play.ActorNullState && CheckMeleeRange(level, world.Actors, actor) {
+        result.State, result.Sound = info.MeleeState, info.AttackSound
+        return result
+    }
+    if info.MissileState != play.ActorNullState && (skill >= 4 || fast || actor.MoveCount == 0) {
+        decision := CheckMissileRange(level, world.Actors, actor, result.Random)
+        result.Actor, result.Random = decision.Actor, decision.Random
+        if decision.Attack {
+            result.State, result.Missile = info.MissileState, true
+            return result
+        }
+    }
+    result.Actor.MoveCount = result.Actor.MoveCount - 1
+    result.Course, result.activeSound = ChaseMove, true
+    if result.Actor.MoveCount < 0 { result.Course = ChaseNewDirection }
+    return result
+}
+
+func FinishChaseMovement(result MonsterChase, world play.CombatWorld, handle int) MonsterChase {
+    result.Actor, result.Random = world.Actors.ActorAt(handle - 1), world.Random
+    sound := actorinfo.KindAt(result.Actor.Kind).ActiveSound
+    if result.activeSound && sound != 0 {
+        roll := play.PRandom(world.Random)
+        result.Random = roll.State
+        if roll.Value < 3 { result.Sound = sound }
+    }
+    return result
+}
+
+func FaceTarget(world play.CombatWorld, handle int) play.CombatWorld {
+    actor := world.Actors.ActorAt(handle - 1)
+    target := world.Actors.ActorAt(actor.Target - 1)
+    if !target.Valid { return world }
+    actor.Physics.Body.Flags = actor.Physics.Body.Flags & ~bits<32>(play.ActorAmbush)
+    a, b := actor.Physics.Body, target.Physics.Body
+    actor.Physics.Angle = engine.PointToAngle(a.X, a.Y, b.X, b.Y)
+    if target.Physics.Body.Flags & play.ActorShadow != 0 {
+        first := play.PRandom(world.Random)
+        second := play.PRandom(first.State)
+        world.Random = second.State
+        actor.Physics.Angle = actor.Physics.Angle + bits<32>((int(first.Value) - int(second.Value)) << 21)
+    }
+    world.Actors = world.Actors.WithActor(handle, actor)
+    return world
+}

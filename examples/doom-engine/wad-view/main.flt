@@ -1,0 +1,45 @@
+package main
+
+import "wad"
+
+const Archive = readFile("LEVEL.WAD")
+
+map "Original WAD Wireframe" {
+    screen at (-80, -56) size (Width, Height) with { style = "solid", hold = true }
+    place scriptBlock at (-81, 58) with { code = "onStart(() => game.focusCamera(-85, -61, 85, 61));" }
+    register cursor int = 0
+    register marker int = -1
+    register done bit = false
+    tick {
+        if !done {
+            if marker >= 0 {
+                status := drawLevel(Archive, wad.LoadGeometry(Archive, marker))
+                switch status {
+                case 0:
+                    log("Classic WAD wireframe rendered")
+                case 1:
+                    log("Invalid LINEDEFS or VERTEXES data")
+                default:
+                    log("Level exceeds the wireframe preview work budget")
+                }
+                next done = true
+            } else {
+                count := wad.DirectoryCount(Archive)
+                if count < 0 {
+                    log("Expected an IWAD or PWAD with a valid directory")
+                    next done = true
+                } else {
+                    found := wad.FindLevel(Archive, wad.LE32(Archive, 8), count, cursor)
+                    if found >= 0 {
+                        next marker = found
+                    } else if cursor + wad.SearchBatch >= count {
+                        log("No classic Doom-format level in WAD")
+                        next done = true
+                    } else {
+                        next cursor = cursor + wad.SearchBatch
+                    }
+                }
+            }
+        }
+    }
+}

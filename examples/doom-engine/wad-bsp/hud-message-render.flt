@@ -1,0 +1,48 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted from HUlib_drawTextLine in linuxdoom-1.10/hu_lib.c.
+//
+// The source WAD supplies STCFN033 through STCFN095. This renderer retains
+// Doom's one-line 80-character widget rule and uses the same four-pixel
+// advance for spaces and unsupported characters.
+
+package main
+
+import "wad"
+import "walls"
+
+const hudMessageCharacters = 80
+const hudGlyphs = "!\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_"
+const hudLowercase = "abcdefghijklmnopqrstuvwxyz"
+
+func hudGlyphCode(character string) int {
+    if character == " " { return -1 }
+    for index, symbol := range hudGlyphs {
+        if character == symbol { return 33 + index }
+    }
+    for index, symbol := range hudLowercase {
+        if character == symbol { return 65 + index }
+    }
+    return -1
+}
+
+// drawHudMessage is HUlib_drawSText's one-line message path. It deliberately
+// stops after the first glyph that cannot fit the original 320-pixel screen.
+func drawHudMessage(mounts wad.Archives, shade walls.WadShading, message string) {
+    if !shade.Valid { return }
+    x := 0
+    for index, character := range message {
+        if index >= hudMessageCharacters { return }
+        code := hudGlyphCode(character)
+        glyph := IntermissionPatch{}
+        advance := 4
+        if code >= 33 {
+            glyph = finaleGlyph(mounts, code)
+            if glyph.Width > 0 { advance = glyph.Width }
+        }
+        if x + advance > intermissionWidth { return }
+        if glyph.Width > 0 { drawIntermissionPatch(glyph, shade, x, 0) }
+        x = x + advance
+        if x >= intermissionWidth { return }
+    }
+}

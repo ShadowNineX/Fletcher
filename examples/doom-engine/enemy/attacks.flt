@@ -1,0 +1,231 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Common monster attack actions from linuxdoom-1.10/p_enemy.c.
+
+package enemy
+
+import "actorinfo"
+import "engine"
+import "numeric"
+import "play"
+import "wad"
+
+const monsterGunRange = 32 * 64 * engine.FracUnit
+const skullSpeed = 20 * engine.FracUnit
+const monsterAttackAim = 1
+const monsterAttackShoot = 2
+const monsterAttackShot = 3
+const monsterAttackLaunch = 4
+const monsterAttackMelee = 5
+const monsterAttackSkull = 6
+const monsterAttackEnd = 7
+
+type MonsterAttack struct {
+    Combat play.CombatStep
+    Done bit
+    SpecialLine int
+    phase int
+    handle int
+    target int
+    pellets int
+    angle bits<32>
+    slope int
+    damageDice int
+    damageFactor int
+    damageAmount int
+    launchAction int
+    shotIndex int
+    shot play.LineAttackStep
+    missile play.MissileLaunch
+}
+
+func (step MonsterAttack) Shot() play.LineAttackStep {
+    if step.phase != monsterAttackShot || step.Done { return play.LineAttackStep{} }
+    return step.shot
+}
+
+func monsterAttackSound(step MonsterAttack, sound int) MonsterAttack {
+    if sound != 0 { step.Combat.Feedback.Sound, step.Combat.Feedback.SoundOrigin = sound, step.handle }
+    return step
+}
+
+func aimMonsterGun(level wad.BspLevel, blocks wad.BlockMapInfo, step MonsterAttack) MonsterAttack {
+    step.Combat.World = FaceTarget(step.Combat.World, step.handle)
+    step.angle = step.Combat.World.Actors.ActorAt(step.handle - 1).Physics.Angle
+    aim := play.AimLineAttack(level, blocks, step.Combat.World, step.handle, step.angle, monsterGunRange)
+    step.Combat.World.AttackRange = monsterGunRange
+    step.Combat.Failed, step.slope, step.phase = !aim.Valid, aim.Slope, monsterAttackShoot
+    return step
+}
+
+func publishMonsterShot(step MonsterAttack, shot play.LineAttackStep) MonsterAttack {
+    step.shot, step.Combat, step.SpecialLine, step.phase = shot, shot.Combat, -1, monsterAttackShot
+    if shot.Event == play.ShotSpecial { step.SpecialLine = shot.SpecialLine }
+    return step
+}
+
+func beginMonsterPellet(level wad.BspLevel, blocks wad.BlockMapInfo, step MonsterAttack, rules play.CombatRules) MonsterAttack {
+    world := step.Combat.World
+    first := play.PRandom(world.Random)
+    second := play.PRandom(first.State)
+    third := play.PRandom(second.State)
+    world.Random = third.State
+    angle := step.angle + bits<32>((int(first.Value) - int(second.Value)) << 20)
+    damage := (int(third.Value) % 5 + 1) * 3
+    step.pellets = step.pellets - 1
+    return publishMonsterShot(step, play.BeginLineAttack(level, blocks, world, step.handle, angle, monsterGunRange, step.slope, damage, rules))
+}
+
+func launchSkull(step MonsterAttack) MonsterAttack {
+    world := FaceTarget(step.Combat.World, step.handle)
+    actor := world.Actors.ActorAt(step.handle - 1)
+    target := world.Actors.ActorAt(step.target - 1).Physics.Body
+    body, angle := actor.Physics.Body, actor.Physics.Angle
+    time := wad.ApproxDistance(target.X - body.X, target.Y - body.Y) / skullSpeed
+    if time < 1 { time = 1 }
+    actor.Physics.MomentumX = cport.C_FixedMul(skullSpeed, engine.AngleCosine(angle))
+    actor.Physics.MomentumY = cport.C_FixedMul(skullSpeed, engine.AngleSine(angle))
+    actor.Physics.MomentumZ = (target.Z + (target.Height >> 1) - body.Z) / time
+    step.Combat.World = world
+    step.Combat.World.Actors = world.Actors.WithActor(step.handle, actor)
+    step.Done = true
+    return step
+}
+
+func BeginMonsterAttack(level wad.BspLevel, blocks wad.BlockMapInfo, world play.CombatWorld, handle int,
+    action int, rules play.CombatRules) MonsterAttack {
+    actor := world.Actors.ActorAt(handle - 1)
+    step := MonsterAttack{Combat: play.CombatStep{World: world}, handle: handle, target: actor.Target, SpecialLine: -1}
+    if action == actorinfo.ActionFatRaise {
+        step.Combat.World = FaceTarget(world, handle)
+        step.Done = true
+        return monsterAttackSound(step, actorinfo.SoundMancubusAttack)
+    }
+    if !world.Actors.ActorAt(actor.Target - 1).Valid { step.Done = true; return step }
+    kind, dice, factor, sound := -1, 0, 0, 0
+    switch action {
+    case actorinfo.ActionPosAttack:
+        step.pellets = 1
+        step = aimMonsterGun(level, blocks, step)
+        return monsterAttackSound(step, actorinfo.SoundPistol)
+    case actorinfo.ActionSPosAttack, actorinfo.ActionCPosAttack:
+        step.pellets, step.phase = 1, monsterAttackAim
+        if action == actorinfo.ActionSPosAttack { step.pellets = 3 }
+        return monsterAttackSound(step, actorinfo.SoundShotgun)
+    case actorinfo.ActionSkullAttack:
+        actor.Physics.Body.Flags = actor.Physics.Body.Flags | play.MoveSkullFly
+        step.Combat.World.Actors = world.Actors.WithActor(handle, actor)
+        step.phase = monsterAttackSkull
+        return monsterAttackSound(step, actorinfo.KindAt(actor.Kind).AttackSound)
+    case actorinfo.ActionTroopAttack:
+        step.Combat.World = FaceTarget(world, handle)
+        kind, dice, factor, sound = actorinfo.ActorTroopShot, 8, 3, actorinfo.SoundClaw
+    case actorinfo.ActionSargAttack:
+        step.Combat.World = FaceTarget(world, handle)
+        dice, factor = 10, 4
+    case actorinfo.ActionHeadAttack:
+        step.Combat.World = FaceTarget(world, handle)
+        kind, dice, factor = actorinfo.ActorHeadShot, 6, 10
+    case actorinfo.ActionBruisAttack:
+        kind, dice, factor, sound = actorinfo.ActorBruiserShot, 8, 10, actorinfo.SoundClaw
+    case actorinfo.ActionBspiAttack:
+        step.Combat.World = FaceTarget(world, handle)
+        kind = actorinfo.ActorArachPlasma
+    case actorinfo.ActionCyberAttack:
+        step.Combat.World = FaceTarget(world, handle)
+        kind = actorinfo.ActorRocket
+    case actorinfo.ActionSkelWhoosh:
+        step.Combat.World = FaceTarget(world, handle)
+        step.Done = true
+        return monsterAttackSound(step, actorinfo.SoundSkeletonSwing)
+    case actorinfo.ActionSkelFist:
+        step.Combat.World = FaceTarget(world, handle)
+        if CheckMeleeRange(level, step.Combat.World.Actors, actor) {
+            roll := play.PRandom(step.Combat.World.Random)
+            step.Combat.World.Random = roll.State
+            step.damageAmount, step.phase = (int(roll.Value) % 10 + 1) * 6, monsterAttackMelee
+            return monsterAttackSound(step, actorinfo.SoundSkeletonPunch)
+        }
+    case actorinfo.ActionSkelMissile, actorinfo.ActionFatAttack1, actorinfo.ActionFatAttack2, actorinfo.ActionFatAttack3:
+        return beginSpecialMonsterLaunch(level, step, action, rules)
+    default:
+        step.Done = true
+        return step
+    }
+    if dice > 0 && CheckMeleeRange(level, step.Combat.World.Actors, actor) {
+        step.damageDice, step.damageFactor, step.phase = dice, factor, monsterAttackMelee
+        if sound != 0 { return monsterAttackSound(step, sound) }
+        return ResumeMonsterAttack(level, blocks, step, rules)
+    }
+    if kind >= 0 {
+        step.missile = play.BeginMonsterMissile(level, step.Combat.World, handle, actor.Target, kind, rules)
+        step.Combat, step.phase = step.missile.Combat, monsterAttackLaunch
+        return step
+    }
+    step.Done = true
+    return step
+}
+
+func ResumeMonsterAttack(level wad.BspLevel, blocks wad.BlockMapInfo, step MonsterAttack, rules play.CombatRules) MonsterAttack {
+    if step.Done || step.Combat.Failed { return step }
+    step.SpecialLine = -1
+    step.Combat.Feedback = play.CombatFeedback{}
+    switch step.phase {
+    case monsterAttackAim:
+        step = aimMonsterGun(level, blocks, step)
+        if step.Combat.Failed { return step }
+        return beginMonsterPellet(level, blocks, step, rules)
+    case monsterAttackShoot:
+        return beginMonsterPellet(level, blocks, step, rules)
+    case monsterAttackShot:
+        if !step.shot.Done {
+            step.shot.Combat = step.Combat
+            return publishMonsterShot(step, play.ResumeLineAttack(level, step.shot, rules))
+        }
+        if step.pellets > 0 { return beginMonsterPellet(level, blocks, step, rules) }
+    case monsterAttackLaunch:
+        step.missile.Combat = step.Combat
+        step.missile = play.ResumeMissileLaunch(level, blocks, step.missile, rules)
+        step.Combat = step.missile.Combat
+        if step.missile.Done || step.Combat.Failed { return finishMonsterLaunch(level, step, rules) }
+        return step
+    case monsterAttackMelee:
+        damage := step.damageAmount
+        if damage == 0 {
+            roll := play.PRandom(step.Combat.World.Random)
+            step.Combat.World.Random = roll.State
+            damage = (int(roll.Value) % step.damageDice + 1) * step.damageFactor
+        }
+        step.Combat = play.DamageMobj(level, step.Combat.World, play.DamageRequest{Target: step.target,
+            Inflictor: step.handle, Source: step.handle, Amount: damage}, rules)
+        step.phase = monsterAttackEnd
+        return step
+    case monsterAttackSkull:
+        return launchSkull(step)
+    case monsterAttackEnd:
+        if step.Combat.State.Action != 0 {
+            step.Combat = play.ResumeMobjCombat(level, step.Combat, rules)
+            return step
+        }
+    }
+    step.Done = true
+    return step
+}
+
+type MonsterRefire struct {
+    World play.CombatWorld
+    State int
+}
+
+func Refire(level wad.BspLevel, world play.CombatWorld, handle int, chance int) MonsterRefire {
+    world = FaceTarget(world, handle)
+    monster := world.Actors.ActorAt(handle - 1)
+    target := world.Actors.ActorAt(monster.Target - 1)
+    roll := play.PRandom(world.Random)
+    world.Random = roll.State
+    result := MonsterRefire{World: world, State: KeepMonsterState}
+    if int(roll.Value) >= chance && (!target.Valid || target.Health <= 0 || !monsterCanSee(level, monster, target)) {
+        result.State = actorinfo.KindAt(monster.Kind).SeeState
+    }
+    return result
+}

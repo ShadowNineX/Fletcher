@@ -1,0 +1,78 @@
+package main
+
+import "engine"
+import "sprites"
+
+test "sprite depth sorting is far to near and stable for ties" {
+    var list sprites.VisibleSprites
+    list = sprites.AddVisibleSprite(list, sprites.ProjectedSprite{Valid: true, Scale: 120, WorldX: 1})
+    list = sprites.AddVisibleSprite(list, sprites.ProjectedSprite{Valid: true, Scale: 60, WorldX: 2})
+    list = sprites.AddVisibleSprite(list, sprites.ProjectedSprite{Valid: true, Scale: 120, WorldX: 3})
+    list = sprites.SortVisibleSprites(list)
+    assertEqual(list.Count, 3)
+    assertEqual([3]int{list.At(0).WorldX, list.At(1).WorldX, list.At(2).WorldX}, [3]int{2, 1, 3})
+}
+
+test "sprite depth sorting retains every entry and preserves ties across pages" {
+    var list sprites.VisibleSprites
+    const count = 1040
+    const perScale = count / 4
+    for index := range count {
+        list = sprites.AddVisibleSprite(list, sprites.ProjectedSprite{Valid: true, Scale: 4 - (index & 3), WorldX: index})
+    }
+    sorted := sprites.SortVisibleSprites(list)
+    assertEqual(sorted.Count, count)
+    for index := range sorted.Count {
+        entry := sorted.At(index)
+        assertEqual(entry.Scale, index / perScale + 1)
+        assertEqual(entry.WorldX, (index % perScale) * 4 + 3 - (index / perScale))
+        assertEqual(list.At(index).WorldX, index)
+    }
+}
+
+test "reverse draw-segment order selects the first clip for each silhouette edge" {
+    sprite := sprites.ProjectedSprite{Valid: true, Span: engine.ColumnSpan{First: 0, End: 2}, Scale: 60, WorldZ: 24, TopZ: 56}
+    var coverage engine.ColumnCoverage
+    span := engine.ColumnSpan{First: 0, End: 2}
+    coverage.DrawSegments = coverage.DrawSegments.Append(engine.DrawSegment{Span: span, ScaleFirst: 90, ScaleLast: 90, Top: true, TopClosed: true})
+    // The two open silhouettes live beyond the original 256-range boundary.
+    for range 255 { coverage.DrawSegments = coverage.DrawSegments.Append(engine.DrawSegment{}) }
+    coverage.DrawSegments = coverage.DrawSegments.Append(engine.DrawSegment{Span: span, ScaleFirst: 80, ScaleLast: 80, Bottom: true, BottomHeight: 30,
+        ClipRows: engine.PlaneRows{Values: [engine.MaxViewWidth]bits<32>{(1 << 16) | 42, (1 << 16) | 39}}})
+    coverage.DrawSegments = coverage.DrawSegments.Append(engine.DrawSegment{Span: span, ScaleFirst: 70, ScaleLast: 70, Top: true, TopHeight: 50,
+        ClipRows: engine.PlaneRows{Values: [engine.MaxViewWidth]bits<32>{(11 << 16) | 60, (13 << 16) | 58}}})
+    clips := sprites.ClipSprite(sprite, coverage, 96)
+    assertEqual(clips[0], (11 << 16) | 42)
+    assertEqual(clips[1], (13 << 16) | 39)
+}
+
+test "the wall side breaks a tie when its scale straddles the sprite" {
+    sprite := sprites.ProjectedSprite{Valid: true, Span: engine.ColumnSpan{First: 0, End: 1}, Scale: 60, WorldX: 16, TopZ: 32}
+    var coverage engine.ColumnCoverage
+    coverage.DrawSegments = coverage.DrawSegments.Append(engine.DrawSegment{Span: sprite.Span, First: engine.Vertex{X: 32, Y: 16},
+        Last: engine.Vertex{X: 32, Y: -16}, ScaleFirst: 30, ScaleLast: 90, Top: true, TopClosed: true})
+    assertEqual(sprites.ClipSprite(sprite, coverage, 96)[0], 0)
+    sprite.WorldX = 48
+    assertEqual(sprites.ClipSprite(sprite, coverage, 96)[0], (97 << 16) | 96)
+}
+
+test "silhouette page bounds preserve a clip at equal depth" {
+    span := engine.ColumnSpan{First: 12, End: 14}
+    sprite := sprites.ProjectedSprite{Valid: true, Span: span, Scale: 60, WorldZ: 24, TopZ: 56}
+    var coverage engine.ColumnCoverage
+    coverage.DrawSegments = coverage.DrawSegments.Append(engine.DrawSegment{Span: span, ScaleFirst: 60, ScaleLast: 60,
+        Top: true, TopClosed: true})
+    for range engine.DrawSegmentPageSize - 1 { coverage.DrawSegments = coverage.DrawSegments.Append(engine.DrawSegment{}) }
+    for range engine.DrawSegmentPageSize {
+        coverage.DrawSegments = coverage.DrawSegments.Append(engine.DrawSegment{Span: span, ScaleFirst: 59, ScaleLast: 59,
+            Bottom: true, BottomClosed: true})
+    }
+    outside := engine.ColumnSpan{First: span.End, End: span.End + 2}
+    coverage.DrawSegments = coverage.DrawSegments.Append(engine.DrawSegment{Span: outside, ScaleFirst: 80, ScaleLast: 80,
+        Bottom: true, BottomClosed: true})
+    clips := sprites.ClipSprite(sprite, coverage, 96)
+    assertEqual(clips[11], 0)
+    assertEqual(clips[12], (97 << 16) | 96)
+    assertEqual(clips[13], (97 << 16) | 96)
+    assertEqual(clips[14], 0)
+}

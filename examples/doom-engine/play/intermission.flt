@@ -1,0 +1,169 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Single-player WI_initStats/WI_Ticker state from linuxdoom-1.10/wi_stuff.c.
+
+package play
+
+const IntermissionInactive = 0
+const IntermissionStats = 1
+const IntermissionNext = 2
+const IntermissionDelay = 3
+const IntermissionDone = 4
+
+const intermissionTicRate = 35
+const intermissionNextDelay = 4 * intermissionTicRate
+
+const IntermissionSoundNone = 0
+const IntermissionSoundPistol = 1
+const IntermissionSoundExplode = 2
+const IntermissionSoundCock = 3
+
+type IntermissionScore struct {
+    Kills int
+    MaxKills int
+    Items int
+    MaxItems int
+    Secrets int
+    MaxSecrets int
+    TimeTics int
+    ParTics int
+}
+
+type IntermissionCounts struct {
+    Kills int
+    Items int
+    Secrets int
+    Time int
+    Par int
+}
+
+type IntermissionState struct {
+    Stage int
+    Route CampaignRoute
+    Score IntermissionScore
+    Counts IntermissionCounts
+    PointerOn bit
+    Changed bit
+    AttackDown bit
+    UseDown bit
+    StatsState int
+    Pause int
+    Countdown int
+    Accelerate bit
+    BackgroundTics int
+    Sound int
+}
+
+func intermissionPercent(value int, total int) int {
+    // WI_initVariables gives empty classes a denominator of one.
+    if total <= 0 { total = 1 }
+    return value * 100 / total
+}
+
+func intermissionParTics(route CampaignRoute, score IntermissionScore) int {
+    if route.ParTics != 0 { return route.ParTics }
+    return score.ParTics
+}
+
+func StartIntermission(route CampaignRoute, score IntermissionScore, attackDown bit, useDown bit) IntermissionState {
+    state := IntermissionState{Route: route, Score: score, AttackDown: attackDown, UseDown: useDown}
+    if !route.Valid { return state }
+    state.Stage, state.StatsState, state.Pause = IntermissionStats, 1, intermissionTicRate
+    state.Counts = IntermissionCounts{Kills: -1, Items: -1, Secrets: -1, Time: -1, Par: -1}
+    state.Changed = true
+    return state
+}
+
+func intermissionCheckAccelerate(state IntermissionState, attack bit, use bit) IntermissionState {
+    state.Accelerate = false
+    if attack {
+        if !state.AttackDown { state.Accelerate = true }
+        state.AttackDown = true
+    } else { state.AttackDown = false }
+    if use {
+        if !state.UseDown { state.Accelerate = true }
+        state.UseDown = true
+    } else { state.UseDown = false }
+    return state
+}
+
+func intermissionEnterNext(state IntermissionState) IntermissionState {
+    state.Stage, state.Accelerate, state.Countdown = IntermissionNext, false, intermissionNextDelay
+    return state
+}
+
+func intermissionEnterDelay(state IntermissionState) IntermissionState {
+    state.Stage, state.Accelerate, state.Countdown = IntermissionDelay, false, 10
+    return state
+}
+
+func intermissionTickStats(state IntermissionState) IntermissionState {
+    kills := intermissionPercent(state.Score.Kills, state.Score.MaxKills)
+    items := intermissionPercent(state.Score.Items, state.Score.MaxItems)
+    secrets := intermissionPercent(state.Score.Secrets, state.Score.MaxSecrets)
+    elapsed, par := state.Score.TimeTics / intermissionTicRate, intermissionParTics(state.Route, state.Score) / intermissionTicRate
+    if state.Accelerate && state.StatsState != 10 {
+        state.Accelerate, state.Counts = false, IntermissionCounts{Kills: kills, Items: items, Secrets: secrets, Time: elapsed, Par: par}
+        if !state.Route.ShowPar { state.Counts.Par = -1 }
+        state.StatsState, state.Sound = 10, IntermissionSoundExplode
+        return state
+    }
+    switch state.StatsState {
+    case 2:
+        state.Counts.Kills = state.Counts.Kills + 2
+        if state.BackgroundTics & 3 == 0 { state.Sound = IntermissionSoundPistol }
+        if state.Counts.Kills >= kills { state.Counts.Kills, state.StatsState, state.Sound = kills, 3, IntermissionSoundExplode }
+    case 4:
+        state.Counts.Items = state.Counts.Items + 2
+        if state.BackgroundTics & 3 == 0 { state.Sound = IntermissionSoundPistol }
+        if state.Counts.Items >= items { state.Counts.Items, state.StatsState, state.Sound = items, 5, IntermissionSoundExplode }
+    case 6:
+        state.Counts.Secrets = state.Counts.Secrets + 2
+        if state.BackgroundTics & 3 == 0 { state.Sound = IntermissionSoundPistol }
+        if state.Counts.Secrets >= secrets { state.Counts.Secrets, state.StatsState, state.Sound = secrets, 7, IntermissionSoundExplode }
+    case 8:
+        if state.BackgroundTics & 3 == 0 { state.Sound = IntermissionSoundPistol }
+        state.Counts.Time = state.Counts.Time + 3
+        if state.Counts.Time >= elapsed { state.Counts.Time = elapsed }
+        if state.Route.ShowPar { state.Counts.Par = state.Counts.Par + 3 }
+        if !state.Route.ShowPar || state.Counts.Par >= par {
+            if state.Route.ShowPar { state.Counts.Par = par }
+            if state.Counts.Time >= elapsed { state.StatsState, state.Sound = 9, IntermissionSoundExplode }
+        }
+    case 10:
+        if state.Accelerate {
+            state.Sound = IntermissionSoundCock
+            if state.Route.Commercial { return intermissionEnterDelay(state) }
+            return intermissionEnterNext(state)
+        }
+    default:
+        if state.StatsState & 1 != 0 {
+            state.Pause = state.Pause - 1
+            if state.Pause == 0 { state.StatsState, state.Pause = state.StatsState + 1, intermissionTicRate }
+        }
+    }
+    return state
+}
+
+// TickIntermission corresponds to WI_checkForAccelerate followed by the
+// single-player branch of WI_Ticker. Sound is the one event requested this tic.
+func TickIntermission(state IntermissionState, attack bit, use bit) IntermissionState {
+    beforeStage, beforeCounts, beforePointer := state.Stage, state.Counts, state.PointerOn
+    state.Changed, state.Sound = false, IntermissionSoundNone
+    if state.Stage == IntermissionInactive || state.Stage == IntermissionDone { return state }
+    state = intermissionCheckAccelerate(state, attack, use)
+    state.BackgroundTics = state.BackgroundTics + 1
+    switch state.Stage {
+    case IntermissionStats:
+        state = intermissionTickStats(state)
+    case IntermissionNext:
+        state.Countdown = state.Countdown - 1
+        if state.Countdown == 0 || state.Accelerate { state = intermissionEnterDelay(state) } else { state.PointerOn = state.Countdown & 31 < 20 }
+    case IntermissionDelay:
+        state.Countdown = state.Countdown - 1
+        if state.Countdown == 0 { state.Stage = IntermissionDone }
+    }
+    state.Changed = state.Stage != beforeStage || state.Counts.Kills != beforeCounts.Kills || state.Counts.Items != beforeCounts.Items ||
+        state.Counts.Secrets != beforeCounts.Secrets || state.Counts.Time != beforeCounts.Time || state.Counts.Par != beforeCounts.Par || state.PointerOn != beforePointer
+    return state
+}

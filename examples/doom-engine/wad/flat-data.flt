@@ -1,0 +1,108 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted on 2026-11-21 from R_InitFlats and R_InitColormaps in
+// linuxdoom-1.10/r_data.c.
+
+package wad
+
+const FlatWidth = 64
+const FlatHeight = 64
+const FlatBytes = FlatWidth * FlatHeight
+const PaletteColors = 256
+const PaletteBytes = PaletteColors * 3
+const ColorMapBytes = PaletteColors
+
+type FlatSet struct {
+    Mounts Archives
+    First int
+    Count int
+    Valid bit
+}
+
+type PaletteSet struct {
+    Data LumpRef
+    Count int
+    Valid bit
+}
+
+type ColorMapSet struct {
+    Data LumpRef
+    Count int
+    Valid bit
+}
+
+type PaletteColor struct {
+    Red bits<8>
+    Green bits<8>
+    Blue bits<8>
+    Valid bit
+}
+
+type PaletteIndex struct {
+    Value bits<8>
+    Valid bit
+}
+
+func flatStartName() LumpName { return LumpName{Low: 0x54535f46, High: 0x00545241} } // F_START
+func flatEndName() LumpName { return LumpName{Low: 0x4e455f46, High: 0x00000044} } // F_END
+func playPalName() LumpName { return LumpName{Low: 0x59414c50, High: 0x004c4150} } // PLAYPAL
+func colorMapName() LumpName { return LumpName{Low: 0x4f4c4f43, High: 0x50414d52} } // COLORMAP
+
+// As in R_InitFlats, every lump strictly between the last F_START and F_END
+// markers is a flat. The sampler validates its 64-by-64 payload before use.
+func LoadFlats(mounts Archives) FlatSet {
+    first, last := mounts.Find(flatStartName()), mounts.Find(flatEndName())
+    if !first.Found || !first.Valid || !last.Found || !last.Valid || last.Index <= first.Index { return FlatSet{} }
+    return FlatSet{Mounts: mounts, First: first.Index + 1, Count: last.Index - first.Index - 1, Valid: true}
+}
+
+func FlatLump(flats FlatSet, index int) LumpRef {
+    if !flats.Valid || index < 0 || index >= flats.Count { return LumpRef{} }
+    return flats.Mounts.LumpAt(flats.First + index)
+}
+
+func FindFlat(flats FlatSet, name LumpName) LumpRef {
+    if !flats.Valid { return LumpRef{} }
+    lump := flats.Mounts.Find(name)
+    if !lump.Valid || lump.Index < flats.First || lump.Index - flats.First >= flats.Count || lump.Size != FlatBytes {
+        return LumpRef{}
+    }
+    return lump
+}
+
+// Doom's flat addressing wraps each axis to 64 texels. The packed index is
+// y*64+x, equivalent to the masks used by the span drawer.
+func SampleFlat(flats FlatSet, index int, x int, y int) PaletteIndex {
+    lump := FlatLump(flats, index)
+    if !lump.Found || !lump.Valid || lump.Size != FlatBytes { return PaletteIndex{} }
+    offset := lump.Offset + ((y & 63) << 6) + (x & 63)
+    return PaletteIndex{Value: lump.File[offset], Valid: true}
+}
+
+func LoadPalettes(mounts Archives) PaletteSet {
+    lump := mounts.Find(playPalName())
+    if !lump.Found || !lump.Valid || lump.Size < PaletteBytes || lump.Size % PaletteBytes != 0 { return PaletteSet{} }
+    return PaletteSet{Data: lump, Count: lump.Size / PaletteBytes, Valid: true}
+}
+
+func SamplePalette(palettes PaletteSet, palette int, index int) PaletteColor {
+    if !palettes.Valid || palette < 0 || palette >= palettes.Count || index < 0 || index >= PaletteColors {
+        return PaletteColor{}
+    }
+    offset := palettes.Data.Offset + palette * PaletteBytes + index * 3
+    return PaletteColor{Red: palettes.Data.File[offset], Green: palettes.Data.File[offset + 1],
+        Blue: palettes.Data.File[offset + 2], Valid: true}
+}
+
+func LoadColorMaps(mounts Archives) ColorMapSet {
+    lump := mounts.Find(colorMapName())
+    if !lump.Found || !lump.Valid || lump.Size < ColorMapBytes || lump.Size % ColorMapBytes != 0 { return ColorMapSet{} }
+    return ColorMapSet{Data: lump, Count: lump.Size / ColorMapBytes, Valid: true}
+}
+
+func SampleColorMap(maps ColorMapSet, level int, index int) PaletteIndex {
+    if !maps.Valid || level < 0 || level >= maps.Count || index < 0 || index >= PaletteColors {
+        return PaletteIndex{}
+    }
+    return PaletteIndex{Value: maps.Data.File[maps.Data.Offset + level * ColorMapBytes + index], Valid: true}
+}

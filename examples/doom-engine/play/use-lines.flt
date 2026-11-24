@@ -1,0 +1,35 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// P_UseLines and PTR_UseTraverse from linuxdoom-1.10/p_map.c.
+
+package play
+
+import "engine"
+import "wad"
+
+const UseRange = 64
+
+type UseLineHit struct {
+    Valid bit
+    Found bit
+    Blocked bit
+    Index int
+    Back bit
+}
+
+func FindUseLine(level wad.BspLevel, blockMap wad.BlockMapInfo, x int, y int, heading bits<32>) UseLineHit {
+    endX := x + UseRange * engine.AngleCosine(heading)
+    endY := y + UseRange * engine.AngleSine(heading)
+    trace := wad.TraceMapLines(level, blockMap, x, y, endX, endY)
+    if !trace.Valid { return UseLineHit{} }
+    for i := range trace.Count {
+        index := trace.Hits.At(i).Index
+        line := level.LineAt(index)
+        if !line.Valid { return UseLineHit{} }
+        if line.Action != 0 {
+            return UseLineHit{Valid: true, Found: true, Index: index, Back: wad.PointOnCollisionLineSide(line, x, y) == 1}
+        }
+        if wad.LineOpening(level, line).Range <= 0 { return UseLineHit{Valid: true, Blocked: true, Index: index} }
+    }
+    return UseLineHit{Valid: true}
+}

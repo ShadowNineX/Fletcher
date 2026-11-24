@@ -1,0 +1,84 @@
+package wad
+
+import "engine"
+
+const HeaderSize = 12
+const IwadSignature = 0x44415749
+const DirectoryEntrySize = 16
+const LineSize = 14
+const VertexSize = 4
+const SearchBatch = 128
+
+type Lump struct {
+    Offset int
+    Count int
+    Valid bit
+}
+
+type Geometry struct {
+    Lines Lump
+    Vertices Lump
+}
+
+func U16(file bytes, offset int) int {
+    return int(file[offset]) | (int(file[offset + 1]) << 8)
+}
+
+func LE32(file bytes, offset int) int {
+    return int(file[offset]) | (int(file[offset + 1]) << 8) |
+        (int(file[offset + 2]) << 16) | (int(file[offset + 3]) << 24)
+}
+
+func nameIs(file bytes, entry int, first int, last int) bit {
+    return LE32(file, entry + 8) == first && LE32(file, entry + 12) == last
+}
+
+func DirectoryCount(file bytes) int {
+    if len(file) < HeaderSize { return -1 }
+    signature := LE32(file, 0)
+    if signature != IwadSignature && signature != 0x44415750 { return -1 } // IWAD / PWAD
+    count := LE32(file, 4)
+    directory := LE32(file, 8)
+    if count < 0 || directory < HeaderSize || directory > len(file) { return -1 }
+    if count > (len(file) - directory) / DirectoryEntrySize { return -1 }
+    return count
+}
+
+// A classic map begins with a marker followed by THINGS, LINEDEFS,
+// SIDEDEFS, and VERTEXES. A BEHAVIOR lump marks Hexen-format maps.
+func FindLevel(file bytes, directory int, count int, begin int) int {
+    for delta := range SearchBatch {
+        i := begin + delta
+        if i + 4 >= count { return -1 }
+        if classicMarker(file, directory, count, i) { return directory + i * DirectoryEntrySize }
+    }
+    return -1
+}
+
+func classicMarker(file bytes, directory int, count int, index int) bit {
+    if index < 0 || index > count - 5 { return false }
+    marker := directory + index * DirectoryEntrySize
+    return LE32(file, marker + 4) == 0 &&
+        nameIs(file, marker + 16, 0x4e494854, 0x5347) &&
+        nameIs(file, marker + 32, 0x454e494c, 0x53464544) &&
+        nameIs(file, marker + 48, 0x45444953, 0x53464544) &&
+        nameIs(file, marker + 64, 0x54524556, 0x53455845) &&
+        (index + 11 >= count || !nameIs(file, marker + 176, 0x41484542, 0x524f4956))
+}
+
+func loadLump(file bytes, entry int, recordSize int) Lump {
+    start := LE32(file, entry)
+    byteCount := LE32(file, entry + 4)
+    if byteCount == 0 { return Lump{Valid: true} }
+    if byteCount <= 0 || byteCount % recordSize != 0 || start < HeaderSize || start > len(file) - byteCount { return Lump{} }
+    return Lump{Offset: start, Count: byteCount / recordSize, Valid: true}
+}
+
+func LoadGeometry(file bytes, marker int) Geometry {
+    return Geometry{Lines: loadLump(file, marker + 32, LineSize), Vertices: loadLump(file, marker + 64, VertexSize)}
+}
+
+func VertexAt(file bytes, vertices Lump, index int) engine.Vertex {
+    offset := vertices.Offset + index * VertexSize
+    return engine.DecodeVertex([4]bits<8>{file[offset], file[offset + 1], file[offset + 2], file[offset + 3]})
+}

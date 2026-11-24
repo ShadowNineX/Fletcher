@@ -1,0 +1,103 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// EV_Teleport from linuxdoom-1.10/p_telept.c.
+
+package play
+
+import "actorinfo"
+import "engine"
+import "wad"
+
+const teleportMoving = 0
+const teleportSourceFog = 1
+const teleportDestinationFog = 2
+const TeleportPlayerDelay = 18
+
+type LineTeleportStep struct {
+    Combat CombatStep
+    Hit DamageRequest
+    Done bit
+    Teleported bit
+    Destination int
+    EyeZ int
+    handle int
+    move TeleportMoveStep
+    oldX int
+    oldY int
+    oldZ int
+    phase int
+}
+
+func teleportDestination(level wad.BspLevel, actors MapActors, tag int) int {
+    best, sector := 0, level.Sectors.Count
+    for index := range actors.Count {
+        actor := actors.ActorAt(index)
+        if actor.Valid && actor.Kind == actorinfo.ActorTeleportTarget && actor.Sector >= 0 && actor.Sector < sector &&
+            level.SectorTag(actor.Sector) == tag {
+            best, sector = index + 1, actor.Sector
+        }
+    }
+    return best
+}
+
+func BeginLineTeleport(level wad.BspLevel, blocks wad.BlockMapInfo, world CombatWorld,
+    handle int, tag int, side int, rules CombatRules) LineTeleportStep {
+    step := LineTeleportStep{Combat: CombatStep{World: world}, handle: handle}
+    actor := world.Actors.ActorAt(handle - 1)
+    if side == 1 || !actor.Valid || actor.Physics.Body.Flags & MoveMissile != 0 { step.Done = true; return step }
+    step.Destination = teleportDestination(level, world.Actors, tag)
+    if step.Destination == 0 { step.Done = true; return step }
+    source := actor.Physics.Body
+    target := world.Actors.ActorAt(step.Destination - 1).Physics.Body
+    step.oldX, step.oldY, step.oldZ = source.X, source.Y, source.Z
+    step.move = BeginTeleportMove(level, blocks, world, handle, target.X, target.Y, BossMapNumber(level.MapName), rules)
+    step.Combat, step.Hit = step.move.Combat, step.move.Hit
+    return step
+}
+
+func spawnTeleportFog(level wad.BspLevel, world CombatWorld, x int, y int, z int, rules CombatRules) CombatStep {
+    handle := world.Actors.NextTransientHandle()
+    if handle == 0 { return CombatStep{World: world, Failed: true} }
+    spawn := SpawnMobj(level, actorinfo.ActorTeleportFog, x, y, z, rules.Skill, world.Random)
+    linked := world.Links.SetActorPosition(level, handle, spawn.Actor)
+    if !linked.Valid { return CombatStep{World: world, Failed: true} }
+    world.Actors = world.Actors.AppendTransient(linked.Actor)
+    world.Links, world.Random = linked.Links, spawn.Random
+    return CombatStep{World: world, ActorHandle: handle, Feedback: CombatFeedback{Sound: actorinfo.SoundTeleport, SoundOrigin: handle}}
+}
+
+func ResumeLineTeleport(level wad.BspLevel, step LineTeleportStep, rules CombatRules) LineTeleportStep {
+    if step.Done || step.Combat.Failed { return step }
+    step.Hit = DamageRequest{}
+    world := step.Combat.World
+    actor := world.Actors.ActorAt(step.handle - 1)
+    target := world.Actors.ActorAt(step.Destination - 1).Physics
+    switch step.phase {
+    case teleportMoving:
+        if !step.move.Done {
+            step.move.Combat = step.Combat
+            step.move = ResumeTeleportMove(level, step.move, rules)
+            step.Combat, step.Hit = step.move.Combat, step.move.Hit
+            return step
+        }
+        if !step.move.Allowed { step.Done = true; return step }
+        actor.Physics.Body.Z = actor.Physics.Body.Floor
+        world.Actors = world.Actors.WithActor(step.handle, actor)
+        if actor.Physics.Body.Player { step.EyeZ = actor.Physics.Body.Z + actor.Physics.ViewHeight }
+        step.Combat = spawnTeleportFog(level, world, step.oldX, step.oldY, step.oldZ, rules)
+        step.phase = teleportSourceFog
+    case teleportSourceFog:
+        x := target.Body.X + 20 * engine.AngleCosine(target.Angle)
+        y := target.Body.Y + 20 * engine.AngleSine(target.Angle)
+        step.Combat = spawnTeleportFog(level, world, x, y, actor.Physics.Body.Z, rules)
+        step.phase = teleportDestinationFog
+    case teleportDestinationFog:
+        actor.Physics.Angle = target.Angle
+        actor.Physics.MomentumX, actor.Physics.MomentumY, actor.Physics.MomentumZ = 0, 0, 0
+        if actor.Physics.Body.Player { actor.ReactionTime = TeleportPlayerDelay }
+        world.Actors = world.Actors.WithActor(step.handle, actor)
+        step.Combat = CombatStep{World: world, ActorHandle: step.handle}
+        step.Done, step.Teleported = true, true
+    }
+    return step
+}

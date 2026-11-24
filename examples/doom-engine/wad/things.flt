@@ -1,0 +1,80 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted on 2026-11-21 from P_LoadThings in p_setup.c and P_SpawnMapThing
+// in p_mobj.c.
+
+package wad
+
+const VanillaPlayers = 4
+
+type MapThing struct {
+    X int
+    Y int
+    Angle int
+    Type int
+    Options int
+    Valid bit
+}
+
+// ThingRules are the map-setup inputs needed before actor allocation.
+type ThingRules struct {
+    Commercial bit
+    NoMonsters bit
+    Skill int
+    Fast bit
+}
+
+// ThingActorClass deliberately leaves mobj enum/info lookup with the caller.
+// Supplying Known=false represents P_SpawnMapThing's unknown-type error path.
+type ThingActorClass struct {
+    Known bit
+    CountKill bit
+    Skull bit
+}
+
+type ThingSpawn struct {
+    Valid bit
+    StopLoad bit
+    SpawnPlayer bit
+    SpawnActor bit
+    UnknownActor bit
+}
+
+func (level BspLevel) ThingAt(index int) MapThing {
+    if index < 0 || index >= level.Things.Count || !recordLumpInFile(level.File, level.Things, ThingSize) { return MapThing{} }
+    offset := level.Things.Offset + index * ThingSize
+    return MapThing{
+        X: signed16(U16(level.File, offset)), Y: signed16(U16(level.File, offset + 2)),
+        Angle: signed16(U16(level.File, offset + 4)), Type: signed16(U16(level.File, offset + 6)),
+        Options: signed16(U16(level.File, offset + 8)), Valid: true,
+    }
+}
+
+// LoadThingsStops is the exact non-commercial P_LoadThings compatibility
+// break for Doom II-only mapthing numbers. The breaking thing is not spawned,
+// and no later record is observed.
+func LoadThingsStops(thing MapThing, rules ThingRules) bit {
+    if !thing.Valid || rules.Commercial { return false }
+    return thing.Type == 68 || thing.Type == 64 || thing.Type == 88 || thing.Type == 89 || thing.Type == 69 ||
+        thing.Type == 67 || thing.Type == 71 || thing.Type == 65 || thing.Type == 66 || thing.Type == 84
+}
+
+func skillBit(skill int) int {
+    if skill == 0 { return 1 }
+    if skill == 4 { return 4 }
+    if skill < 1 || skill > 3 { return 0 }
+    return 1 << (skill - 1)
+}
+
+// SpawnThing exposes P_SpawnMapThing's control flow without actor allocation.
+func SpawnThing(thing MapThing, rules ThingRules, actor ThingActorClass) ThingSpawn {
+    if !thing.Valid { return ThingSpawn{} }
+    if LoadThingsStops(thing, rules) { return ThingSpawn{Valid: true, StopLoad: true} }
+    // P_SpawnMapThing handles start records before reading their option bits.
+    if thing.Type == 1 { return ThingSpawn{Valid: true, SpawnPlayer: true} }
+    if (thing.Type >= 2 && thing.Type <= VanillaPlayers) || thing.Type == 11 { return ThingSpawn{Valid: true} }
+    if thing.Options & 16 != 0 || thing.Options & skillBit(rules.Skill) == 0 { return ThingSpawn{Valid: true} }
+    if !actor.Known { return ThingSpawn{Valid: true, UnknownActor: true} }
+    if rules.NoMonsters && (actor.Skull || actor.CountKill) { return ThingSpawn{Valid: true} }
+    return ThingSpawn{Valid: true, SpawnActor: true}
+}

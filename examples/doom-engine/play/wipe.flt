@@ -1,0 +1,90 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Doom's column melt transition from linuxdoom-1.10/f_wipe.c.
+//
+// The target renderer owns the two framebuffers. This state describes which
+// frame supplies each physical pixel. Doom transforms its 8-bit surface as
+// 16-bit words, so one melt column covers two physical columns.
+
+package play
+
+const MeltMaxColumns = 320
+
+type MeltState struct {
+    Active bit
+    Width int
+    Height int
+    Rows [MeltMaxColumns]int
+}
+
+type MeltStart struct {
+    State MeltState
+    Random RandomState
+}
+
+// StartMelt consumes M_Random once for each physical screen column, just as
+// wipe_initMelt does. Only the first half later drives the 16-bit melt pairs.
+// Invalid dimensions deliberately produce no transition.
+func StartMelt(width int, height int, random RandomState) MeltStart {
+    state := MeltState{}
+    if width <= 0 || width > MeltMaxColumns || (width & 1) != 0 || height <= 0 { return MeltStart{Random: random} }
+
+    first := MRandom(random)
+    random = first.State
+    state.Active, state.Width, state.Height = true, width, height
+    state.Rows[0] = -int(first.Value & 15)
+    for offset := range width - 1 {
+        column := offset + 1
+        roll := MRandom(random)
+        random = roll.State
+        row := state.Rows[column - 1] + int(roll.Value % 3) - 1
+        if row > 0 { row = 0 }
+        if row == -16 { row = -15 }
+        state.Rows[column] = row
+    }
+    return MeltStart{State: state, Random: random}
+}
+
+// MeltPairAt maps a physical pixel x coordinate to f_wipe.c's 16-bit column.
+func MeltPairAt(state MeltState, column int) int {
+    if column < 0 || column >= state.Width { return -1 }
+    return column / 2
+}
+
+// MeltUsesEnd selects the captured destination screen. The rest of the pair
+// uses the captured start screen from row zero. It represents the complete
+// composited surface after the preceding TickMelt call.
+func MeltUsesEnd(state MeltState, column int, row int) bit {
+    pair := MeltPairAt(state, column)
+    if pair < 0 || row < 0 || row >= state.Height { return false }
+    boundary := state.Rows[pair]
+    if boundary < 0 { return false }
+    if boundary > state.Height { boundary = state.Height }
+    return row < boundary
+}
+
+// TickMelt advances the same paired columns as wipe_doMelt. A call that moves
+// any column stays active even if it reaches the end during an earlier tick in
+// the same call. The following call observes completion, matching Doom's
+// sticky done result.
+func TickMelt(state MeltState, ticks int) MeltState {
+    if !state.Active || ticks <= 0 { return state }
+    moved := false
+    for index := range ticks {
+        for column := range state.Width / 2 {
+            row := state.Rows[column]
+            if row < 0 {
+                state.Rows[column] = row + 1
+                moved = true
+            } else if row < state.Height {
+                count := 8
+                if row < 16 { count = row + 1 }
+                if row + count >= state.Height { count = state.Height - row }
+                state.Rows[column] = row + count
+                moved = true
+            }
+        }
+    }
+    state.Active = moved
+    return state
+}

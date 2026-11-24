@@ -1,0 +1,59 @@
+package main
+
+import "engine"
+import "walls"
+
+func flat(low bits<32>, high bits<32>, height int, light int, sky bit) engine.PlaneKey {
+    return engine.PlaneKey{TextureLow: low, TextureHigh: high, Height: height, Light: light, Sky: sky}
+}
+
+func sharedSky(planes engine.Visplanes) engine.ColumnCoverage {
+    unit := engine.FracUnit
+    camera := engine.Camera{Z: 4 * unit, View: engine.NewViewProjection(16)}
+    sky := flat(1, 0, 0, 0, true)
+    coverage := engine.BeginSubsectorPlanes(engine.ColumnCoverage{Planes: planes}, camera.Z, sky, sky)
+    coverage.Rows[4], coverage.Rows[12] = (1 << 16) | 3, (14 << 16) | 16
+    return walls.DrawWall(camera, coverage, engine.Vertex{X: 16 * unit, Y: 32 * unit},
+        engine.Vertex{X: 16 * unit, Y: -32 * unit}, 0xc0000000,
+        walls.Surface{Front: engine.SectorHeights{Ceiling: 8 * unit}, Solid: true, FrontSky: true, Shade: color.White}, 16)
+}
+
+map "Doom visplane capacity" {
+    screen at (0, 0) size (16, 16) with { style = "solid", hold = true }
+    tick {
+        var full engine.Visplanes
+        for i := range 260 {
+            found := engine.FindPlane(full, flat(bits<32>(i), 0, i, i, false))
+            full = found.State
+        }
+        matches := 0
+        for i := range 260 {
+            found := engine.FindPlane(full, flat(bits<32>(i), 0, i, i, false))
+            if found.Index == i && found.State.Count == full.Count { matches = matches + 1 }
+        }
+        log(matches)
+        index := engine.InlineVisplaneCount + 33
+        key := flat(bits<32>(index), 0, index, index, false)
+        found := engine.FindPlane(full, key)
+        checked := engine.CheckPlane(found.State, found.Index, 30, 36)
+        marked := engine.MarkPlaneColumns(checked.State, checked.Index, 31, 34)
+        expanded := engine.CheckPlane(marked, checked.Index, 34, 42)
+        split := engine.CheckPlane(expanded.State, expanded.Index, 32, 41)
+        original := split.State.PlaneAt(index)
+        duplicate := split.State.PlaneAt(split.Index)
+        first := engine.FindPlane(split.State, key)
+        log(full.Count, full.Failed, checked.Index, checked.Split, expanded.Index, expanded.Split)
+        log(original.Min, original.Max, split.Index, split.Split, duplicate.Min, duplicate.Max, first.Index)
+        log(engine.PlaneColumnUsed(split.State, index, 30), engine.PlaneColumnUsed(split.State, index, 31),
+            engine.PlaneColumnUsed(split.State, index, 32), engine.PlaneColumnUsed(split.State, index, 33),
+            engine.PlaneColumnUsed(split.State, index, 34), engine.PlaneColumnUsed(split.State, split.Index, 32),
+            engine.PlaneColumnUsed(full, index, 32))
+        invalid := engine.CheckPlane(engine.Visplanes{}, 0, 0, 1)
+        log(split.State.Count, split.State.Failed, invalid.Index, invalid.State.Failed)
+        near := sharedSky(engine.Visplanes{})
+        far := sharedSky(full)
+        log(near.CeilingPlane == near.FloorPlane, far.CeilingPlane == far.FloorPlane,
+            engine.PlaneColumnUsed(near.Planes, 0, 4), engine.PlaneColumnUsed(near.Planes, 0, 12),
+            engine.PlaneColumnUsed(far.Planes, 260, 4), engine.PlaneColumnUsed(far.Planes, 260, 12))
+    }
+}

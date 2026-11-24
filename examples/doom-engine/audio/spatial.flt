@@ -1,0 +1,87 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted from S_AdjustSoundParams and S_getChannel in linuxdoom-1.10/s_sound.c.
+
+package audio
+
+import "engine"
+import "numeric"
+
+const SoundChannels = 8
+const SoundClippingDistance = 1200 * engine.FracUnit
+const SoundCloseDistance = 160 * engine.FracUnit
+const SoundAttenuator = (SoundClippingDistance - SoundCloseDistance) >> 16
+const SoundStereoSwing = 96 * engine.FracUnit
+const SoundMapEightFloor = 15
+
+type SoundPoint struct {
+    X int
+    Y int
+    Angle bits<32>
+}
+
+type SoundParameters struct {
+    Audible bit
+    Volume int
+    Separation int
+}
+
+type SoundSlot struct {
+    Active bit
+    Origin int
+    Priority int
+}
+
+func soundMagnitude(value int) int {
+    if value < 0 { return -value }
+    return value
+}
+
+func soundMinimum(left int, right int) int {
+    if left < right { return left }
+    return right
+}
+
+// AdjustSound is the positional part of S_StartSoundAtVolume. The caller
+// centers a sound whose source is the listener before calling this helper.
+func AdjustSound(listener SoundPoint, source SoundPoint, mapNumber int, volume int) SoundParameters {
+    adx, ady := soundMagnitude(listener.X - source.X), soundMagnitude(listener.Y - source.Y)
+    distance := adx + ady - (soundMinimum(adx, ady) >> 1)
+    if mapNumber != 8 && distance > SoundClippingDistance {
+        return SoundParameters{Volume: volume}
+    }
+
+    direction := engine.PointToAngle(listener.X, listener.Y, source.X, source.Y)
+    if direction > listener.Angle {
+        direction = direction - listener.Angle
+    } else {
+        direction = direction + (bits<32>(0xffffffff) - listener.Angle)
+    }
+    separation := 128 - (cport.C_FixedMul(SoundStereoSwing, engine.AngleSine(direction)) >> 16)
+
+    if distance < SoundCloseDistance {
+        return SoundParameters{Audible: volume > 0, Volume: volume, Separation: separation}
+    }
+    if mapNumber == 8 {
+        if distance > SoundClippingDistance { distance = SoundClippingDistance }
+        volume = SoundMapEightFloor + ((volume - SoundMapEightFloor) *
+            ((SoundClippingDistance - distance) >> 16)) / SoundAttenuator
+    } else {
+        volume = (volume * ((SoundClippingDistance - distance) >> 16)) / SoundAttenuator
+    }
+    return SoundParameters{Audible: volume > 0, Volume: volume, Separation: separation}
+}
+
+// SelectSoundSlot matches S_getChannel. Origin zero represents Doom's null
+// origin and therefore never replaces a channel merely because it is zero.
+func SelectSoundSlot(slots [SoundChannels]SoundSlot, origin int, priority int) int {
+    for index := range SoundChannels {
+        slot := slots[index]
+        if !slot.Active { return index }
+        if origin != 0 && slot.Origin == origin { return index }
+    }
+    for index := range SoundChannels {
+        if slots[index].Priority >= priority { return index }
+    }
+    return -1
+}

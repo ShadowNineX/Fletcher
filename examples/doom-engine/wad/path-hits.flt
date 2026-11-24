@@ -1,0 +1,76 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
+package wad
+
+import "engine"
+
+const inlinePathHits = 32
+
+type PathIntercept struct {
+    IsLine bit
+    Index int
+    Fraction int
+}
+
+// Most traces fit inline. Dense traces allocate pages in collection order.
+type PathHits struct {
+    indices [inlinePathHits]int
+    fractions [inlinePathHits]int
+    lines bits<32>
+    overflow engine.PagedSlots<PathIntercept>
+}
+
+func (hits PathHits) At(index int) PathIntercept {
+    if index < inlinePathHits {
+        return PathIntercept{IsLine: hits.lines[index], Index: hits.indices[index], Fraction: hits.fractions[index]}
+    }
+    return hits.overflow.At(index - inlinePathHits)
+}
+
+func (hits PathHits) With(index int, hit PathIntercept) PathHits {
+    if index < inlinePathHits {
+        hits.indices[index] = hit.Index
+        hits.fractions[index] = hit.Fraction
+        hits.lines[index] = hit.IsLine
+    } else { hits.overflow = hits.overflow.With(index - inlinePathHits, hit) }
+    return hits
+}
+
+func (hits PathHits) Sorted(count int) PathHits {
+    for index := range count - 1 {
+        if hits.At(index).Fraction > hits.At(index + 1).Fraction { return hits.merge(count) }
+    }
+    return hits
+}
+
+// The left merge run wins ties, keeping P_TraverseIntercepts' encounter order.
+func (hits PathHits) merge(count int) PathHits {
+    var merged PathHits
+    width := 1
+    for range 31 {
+        if width >= count { return hits }
+        runSize := count
+        if width < count - width { runSize = width * 2 }
+        for run := range (count - 1) / runSize + 1 {
+            start := run * runSize
+            left, middle, end := start, count, count
+            if count - start > width { middle = start + width }
+            if count - start > runSize { end = start + runSize }
+            right := middle
+            for offset := range end - start {
+                var hit PathIntercept
+                if left < middle && (right >= end || hits.At(left).Fraction <= hits.At(right).Fraction) {
+                    hit = hits.At(left)
+                    left = left + 1
+                } else {
+                    hit = hits.At(right)
+                    right = right + 1
+                }
+                merged = merged.With(start + offset, hit)
+            }
+        }
+        hits, merged = merged, hits
+        width = runSize
+    }
+    return hits
+}

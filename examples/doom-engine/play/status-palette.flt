@@ -1,0 +1,33 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// PLAYPAL selection from ST_doPaletteStuff in linuxdoom-1.10/st_stuff.c.
+
+package play
+
+const statusRedStart = 1
+const statusRedRows = 8
+const statusBonusStart = 9
+const statusBonusRows = 4
+const statusRadiationRow = 13
+
+func StatusPalette(player PlayerInventory) int {
+    damage := player.DamageCount
+    strength := player.Powers[PowerStrength]
+    if strength != 0 {
+        berserk := 12 - (strength >> 6)
+        if berserk > damage { damage = berserk }
+    }
+    if damage != 0 {
+        row := (damage + 7) >> 3
+        if row >= statusRedRows { row = statusRedRows - 1 }
+        return statusRedStart + row
+    }
+    if player.BonusCount != 0 {
+        row := (player.BonusCount + 7) >> 3
+        if row >= statusBonusRows { row = statusBonusRows - 1 }
+        return statusBonusStart + row
+    }
+    ironFeet := player.Powers[PowerIronFeet]
+    if ironFeet > powerBlinkTics || ironFeet & 8 != 0 { return statusRadiationRow }
+    return 0
+}

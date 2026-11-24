@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <PackageReference Include="Antlr4.Runtime.Standard" Version="4.13.1" />
+    <PackageReference Include="Antlr4BuildTasks" Version="12.14.0" PrivateAssets="all" IncludeAssets="build" />
+    <Antlr4 Include="Syntax/Fletcher.g4"
+            Package="Fletcher.Compiler.Syntax.Generated"
+            AntlrToolJar="$(FletcherAntlrJar)"
+            JavaExec="PATH"
+            Listener="false"
+            Visitor="true"
+            Error="true" />
+    <Antlr4 Include="Translation/PortableC.g4"
+            Package="Fletcher.Compiler.Translation.Generated"
+            AntlrToolJar="$(FletcherAntlrJar)"
+            JavaExec="PATH"
+            Listener="false"
+            Visitor="false"
+            Error="true" />
+  </ItemGroup>
+</Project>

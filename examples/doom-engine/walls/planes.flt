@@ -1,0 +1,314 @@
+package walls
+
+import "engine"
+import "wad"
+
+type PlanePainter struct {
+    View engine.PlaneView
+    Z int
+    First color
+    Second color
+}
+
+func (plane PlanePainter) PlaneSpan(row int, firstColumn int, endColumn int) {
+    plane.DrawPlaneSpan(row, firstColumn, endColumn, engine.MapPlane(plane.View, plane.Z, row, firstColumn))
+}
+
+func (plane PlanePainter) DrawPlaneSpan(row int, firstColumn int, endColumn int, sample engine.PlaneSample) {
+    u, v := sample.U, sample.V
+    view := plane.View.Camera.View
+    y := view.ScreenY + row
+    for offset := range endColumn - firstColumn {
+        shade := plane.First
+        if ((u ^ v) >> 20) & 1 != 0 { shade = plane.Second }
+        x := view.ScreenX + ((firstColumn + offset) << view.DetailShift)
+        pixel(x, y, true, shade)
+        if view.DetailShift != 0 { pixel(x + 1, y, true, shade) }
+        u, v = u + sample.StepU, v + sample.StepV
+    }
+}
+
+type WadPlanePainter struct {
+    View engine.PlaneView
+    Z int
+    Light int
+    ExtraLight int
+    Flat wad.LumpRef
+    Shade WadShading
+    ColumnAngles [engine.MaxViewWidth]bits<32>
+    CachedAngles bit
+    LightRowBase int
+}
+
+func (plane WadPlanePainter) PlaneSpan(row int, firstColumn int, endColumn int) {
+    var sample engine.PlaneSample
+    if plane.CachedAngles {
+        sample = engine.MapPlaneAngle(plane.View, plane.Z, row, plane.ColumnAngles[firstColumn])
+    } else { sample = engine.MapPlane(plane.View, plane.Z, row, firstColumn) }
+    plane.DrawPlaneSpan(row, firstColumn, endColumn, sample)
+}
+
+func (plane WadPlanePainter) DrawPlaneSpan(row int, firstColumn int, endColumn int, sample engine.PlaneSample) {
+    light := plane.Shade.FixedRow
+    if light == 0 {
+        if plane.LightRowBase > 0 {
+            index := int(bits<32>(sample.Distance) >> engine.LightZShift)
+            if index >= engine.MaxLightZ { index = engine.MaxLightZ - 1 }
+            light = int(plane.Shade.LightRows[plane.LightRowBase + index])
+        } else { light = engine.PlaneLightRow(plane.Light, plane.ExtraLight, sample.Distance) }
+    }
+    table := plane.Shade.ColorMaps.Offset + light * wad.ColorMapBytes
+    flat, maps := plane.Flat.File, plane.Shade.ColorMaps.File
+    flatOffset := plane.Flat.Offset
+    u, v := sample.U, sample.V
+    stepU, stepV := sample.StepU, sample.StepV
+    y := row + plane.Shade.ScreenY
+    patternRow := (y & 3) << 2
+    detailShift := plane.Shade.DetailShift
+    dithered := plane.Shade.Dithered
+    // Distinct texels can share a palette index. The light row and swatches
+    // stay fixed for the span, while the Bayer choice follows each screen pixel.
+    previousTexel, previousSource, index, coverage := -1, -1, 0, 0
+    var first color
+    var second color
+    for offset := range endColumn - firstColumn {
+        texel := ((v >> 10) & 4032) + ((u >> 16) & 63)
+        if texel != previousTexel {
+            source := int(flat[flatOffset + texel])
+            previousTexel = texel
+            if source != previousSource {
+                previousSource = source
+                index = int(maps[table + source])
+                if dithered {
+                    first = plane.Shade.Patterns.First[index]
+                    second = plane.Shade.Patterns.Second[index]
+                    coverage = plane.Shade.Patterns.Coverage[index]
+                } else { first = plane.Shade.Palette[index] }
+            }
+        }
+        x := plane.Shade.ScreenX + ((firstColumn + offset) << detailShift)
+        // Keep the swatch selection inside the raster loop, avoiding a
+        // sliced function entry for each texel.
+        swatch, adjacent := first, first
+        if dithered {
+            pattern := patternRow | (x & 3)
+            if Bayer4[pattern] < coverage { swatch = second }
+            if detailShift != 0 && Bayer4[patternRow | ((x + 1) & 3)] < coverage { adjacent = second }
+        }
+        pixel(x, y, true, swatch, index)
+        if detailShift != 0 { pixel(x + 1, y, true, adjacent, index) }
+        u, v = u + stepU, v + stepV
+    }
+}
+
+func projectPalette(source wad.PaletteSet, row int, gamma int) [wad.PaletteColors]color {
+    var result [wad.PaletteColors]color
+    for index := range wad.PaletteColors {
+        rgb := gammaPaletteColor(source, row, index, gamma)
+        // Each score is the squared distance to black minus the squared
+        // distance to that nominal RGB swatch. Higher scores are nearer.
+        red, green, blue := int(rgb.Red), int(rgb.Green), int(rgb.Blue)
+        r, g, b := 255 * (2 * red - 255), 255 * (2 * green - 255), 255 * (2 * blue - 255)
+        best, shade := 0, color.Black
+        if r + g + b > best { best, shade = r + g + b, color.White }
+        if r > best { best, shade = r, color.Red }
+        orange := r + 128 * (2 * green - 128)
+        if orange > best { best, shade = orange, color.Orange }
+        if r + g > best { best, shade = r + g, color.Yellow }
+        if g > best { best, shade = g, color.Green }
+        if b > best { best, shade = b, color.Blue }
+        purple := 128 * (2 * (red + blue) - 256)
+        if purple > best { shade = color.Purple }
+        result[index] = shade
+    }
+    return result
+}
+
+type WadShading struct {
+    ColorMaps wad.LumpRef
+    Palette [wad.PaletteColors]color
+    Patterns DitheredPalette
+    Palettes wad.PaletteSet
+    PaletteRow int
+    Gamma int
+    FixedRow int
+    LightRows bytes
+    WindowLightRows bytes
+    WindowLightOffset int
+    DetailShift int
+    ScreenX int
+    ScreenY int
+    Dithered bit
+    Valid bit
+}
+
+func (shade WadShading) WallLightTable(sectorLight int, extraLight int) (bytes, int) {
+    base := engine.LightBand(sectorLight, extraLight) * engine.MaxLightScale
+    if len(shade.WindowLightRows) >= shade.WindowLightOffset + engine.PlaneLightTableOffset {
+        return shade.WindowLightRows, shade.WindowLightOffset + base
+    }
+    if len(shade.LightRows) == engine.LightTableBytes { return shade.LightRows, base }
+    return shade.LightRows, -1
+}
+
+func (shade WadShading) WithDithering() WadShading {
+    if shade.Valid && shade.Palettes.Valid && !shade.Dithered {
+        shade.Patterns = projectDitheredPalette(shade.Palettes, shade.PaletteRow, shade.Gamma)
+        shade.Dithered = true
+    }
+    return shade
+}
+
+func (shade WadShading) ColorAt(index int, x int, y int) color {
+    if shade.Dithered {
+        // Select the swatch here to save a Fletcher slice step per pixel.
+        if Bayer4[((y & 3) << 2) | (x & 3)] < shade.Patterns.Coverage[index] { return shade.Patterns.Second[index] }
+        return shade.Patterns.First[index]
+    }
+    return shade.Palette[index]
+}
+
+// Masked surfaces and psprites share the display mapping. Only the 3D
+// camera sets DetailShift, so HUD drawing continues using physical X.
+func (shade WadShading) DrawMappedPixel(index int, column int, y int) {
+    x := shade.ScreenX + (column << shade.DetailShift)
+    y = y + shade.ScreenY
+    var first color
+    var second color
+    paired := shade.DetailShift != 0
+    if shade.Dithered {
+        patternRow := (y & 3) << 2
+        coverage := shade.Patterns.Coverage[index]
+        first, second = shade.Patterns.First[index], shade.Patterns.First[index]
+        if Bayer4[patternRow | (x & 3)] < coverage { first = shade.Patterns.Second[index] }
+        if paired && Bayer4[patternRow | ((x + 1) & 3)] < coverage { second = shade.Patterns.Second[index] }
+    } else {
+        first = shade.Palette[index]
+        second = first
+    }
+    pixel(x, y, true, first, index)
+    if paired { pixel(x + 1, y, true, second, index) }
+}
+
+func (shade WadShading) projectWith(row int, gamma int) WadShading {
+    shade.Palette = projectPalette(shade.Palettes, row, gamma)
+    if shade.Dithered { shade.Patterns = projectDitheredPalette(shade.Palettes, row, gamma) }
+    shade.PaletteRow, shade.Gamma = row, gamma
+    return shade
+}
+
+func (shade WadShading) WithPalette(row int) WadShading {
+    if !shade.Valid || !shade.Palettes.Valid { return shade }
+    if row < 0 || row >= shade.Palettes.Count { row = 0 }
+    if row != shade.PaletteRow { return shade.projectWith(row, shade.Gamma) }
+    return shade
+}
+
+func (shade WadShading) WithGamma(gamma int) WadShading {
+    if gamma < 0 || gamma >= engine.DoomGammaCount { gamma = engine.DefaultDoomGamma }
+    if shade.Valid && shade.Palettes.Valid && gamma != shade.Gamma { return shade.projectWith(shade.PaletteRow, gamma) }
+    return shade
+}
+
+func (shade WadShading) WithFixedColormap(row int) WadShading {
+    shade.FixedRow = 0
+    if shade.Valid && row > 0 && row < shade.ColorMaps.Size / wad.ColorMapBytes { shade.FixedRow = row }
+    return shade
+}
+
+func (shade WadShading) ColorRow(light int) int {
+    if shade.FixedRow != 0 { return shade.FixedRow }
+    return light
+}
+
+type Materials struct {
+    Flats wad.FlatSet
+    Textures wad.TextureSet
+    Sky wad.TextureDef
+    Shade WadShading
+    Animations wad.AnimationSet
+    LevelTime int
+    ExtraLight int
+}
+
+func LoadShading(mounts wad.Archives) WadShading {
+    maps, palettes := wad.LoadColorMaps(mounts), wad.LoadPalettes(mounts)
+    if maps.Count < engine.NumColorMaps || !palettes.Valid { return WadShading{} }
+    return WadShading{ColorMaps: maps.Data, Palette: projectPalette(palettes, 0, engine.DefaultDoomGamma),
+        Palettes: palettes, Gamma: engine.DefaultDoomGamma, Valid: true}
+}
+
+func LoadMaterials(mounts wad.Archives, skyName wad.LumpName) Materials {
+    flats, textures := wad.LoadFlats(mounts), wad.LoadMountedTextureSet(mounts)
+    if !flats.Valid && !textures.Valid { return Materials{} }
+    shade := LoadShading(mounts)
+    if !shade.Valid { return Materials{} }
+    return Materials{Flats: flats, Textures: textures, Sky: wad.FindWallTexture(textures, skyName),
+        Shade: shade}
+}
+
+func drawSky(camera engine.Camera, height int, rows [engine.MaxViewWidth]bits<32>,
+    bounds engine.ColumnSpan, materials Materials, angles [engine.MaxViewWidth]bits<32>, cache ColumnCache) ColumnCache {
+    run := WallTextureRun{Bounds: bounds, Height: height, Width: camera.View.Width, Sky: true}
+    for offset := range bounds.End - bounds.First {
+        x := bounds.First + offset
+        run.Columns[x] = int((camera.Heading + angles[x]) >> 22)
+    }
+    tier := WallTier{Texture: materials.Sky, Middle: 100 * engine.FracUnit}
+    return drawTextureRun(run, tier, WallMaterials{Shade: materials.Shade}, rows, color.Black, cache)
+}
+
+func DrawPlanes(camera engine.Camera, height int, coverage engine.ColumnCoverage, materials Materials,
+    columnAngles [engine.MaxViewWidth]bits<32>) {
+    DrawPlanesCached(camera, height, coverage, materials, columnAngles, ColumnCache{})
+}
+
+func DrawPlanesCached(camera engine.Camera, height int, coverage engine.ColumnCoverage, materials Materials,
+    columnAngles [engine.MaxViewWidth]bits<32>, cache ColumnCache) ColumnCache {
+    textured := materials.Flats.Valid && materials.Shade.Valid
+    view := engine.NewPlaneView(camera, height)
+    spanCache := engine.NewPlaneSpanCache(view, columnAngles, materials.Textures.Valid)
+    for index := range coverage.Planes.Count {
+        plane := coverage.Planes.PlaneAt(index)
+        var rowBuffer engine.PlaneColumnBuffer
+        var hasRows bit
+        if index < engine.InlineVisplaneCount {
+            rowBuffer, hasRows = coverage.PlaneRows[index], coverage.HasPlaneRows[index]
+        } else {
+            raster := coverage.Planes.OverflowRasterAt(index)
+            rowBuffer, hasRows = raster.Rows, raster.HasRows
+        }
+        if hasRows && plane.Key.Sky && materials.Sky.Valid {
+            cache = drawSky(camera, height, rowBuffer.ReadRows(),
+                engine.ColumnSpan{First: plane.Min, End: plane.Max + 1}, materials, columnAngles, cache)
+        } else if hasRows && !plane.Key.Sky {
+            var flat wad.LumpRef
+            if textured {
+                name := wad.LumpName{Low: int(plane.Key.TextureLow), High: int(plane.Key.TextureHigh)}
+                flat = wad.FindFlat(materials.Flats, name)
+                if flat.Valid && materials.Animations.Count > 0 && materials.LevelTime >= 0 {
+                    index := flat.Index - materials.Flats.First
+                    frame := wad.AnimatedFlatIndex(materials.Animations, index, materials.LevelTime)
+                    if frame != index { flat = wad.FlatLump(materials.Flats, frame) }
+                    if flat.Size != wad.FlatBytes { flat = wad.LumpRef{} }
+                }
+            }
+            rows := rowBuffer.ReadRows()
+            bounds := engine.ColumnSpan{First: plane.Min, End: plane.Max + 1}
+            if flat.Valid {
+                painter := WadPlanePainter{Light: plane.Key.Light, ExtraLight: materials.ExtraLight, Flat: flat, Shade: materials.Shade}
+                if len(materials.Shade.LightRows) == engine.LightTableBytes {
+                    painter.LightRowBase = engine.PlaneLightTableOffset + engine.LightBand(plane.Key.Light, materials.ExtraLight) * engine.MaxLightZ
+                }
+                spanCache = engine.MakeProjectedPlaneSpans(painter, rows, bounds, plane.Key.Height, spanCache)
+            } else {
+                first, second := color.Green, color.Yellow
+                if plane.Key.Height > camera.Z { first, second = color.Blue, color.Purple }
+                if plane.Key.Light < 128 { second = color.Black }
+                painter := PlanePainter{View: view, First: first, Second: second}
+                spanCache = engine.MakeProjectedPlaneSpans(painter, rows, bounds, plane.Key.Height, spanCache)
+            }
+        }
+    }
+    return cache
+}

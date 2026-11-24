@@ -1,0 +1,112 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// R_FillBackScreen and R_DrawViewBorder from Linux Doom 1.10 r_draw.c.
+
+package main
+
+import "wad"
+import "walls"
+
+type ViewBorderCache struct {
+    Blocks int
+    Width int
+    Snapshot viewBorderRef
+}
+
+type viewBorderRef interface {
+    FrameFor(mounts wad.Archives, paletteRow int, gamma int, dithered bit, commercial bit) string
+}
+
+type viewBorderFrame struct {
+    Mounts wad.Archives
+    PaletteRow int
+    Gamma int
+    Dithered bit
+    Commercial bit
+    Pixels string
+}
+
+func (frame viewBorderFrame) FrameFor(mounts wad.Archives, paletteRow int, gamma int, dithered bit, commercial bit) string {
+    if frame.PaletteRow == paletteRow && frame.Gamma == gamma && frame.Dithered == dithered && frame.Commercial == commercial &&
+        mounts.SnapshotIsCurrent(frame.Mounts) {
+        return frame.Pixels
+    }
+    return ""
+}
+
+// Render only the border into the empty frame and keep it before drawing
+// the scene, status, or overlays. Palette or archive changes replace it.
+func (cache ViewBorderCache) Draw(mounts wad.Archives, shade walls.WadShading, mapName wad.LumpName, window ViewWindow) ViewBorderCache {
+    if !shade.Valid { return cache }
+    commercial := mapName.Low & 0xffffff == 0x50414d
+    if cache.Blocks == window.Blocks && cache.Width == window.Width {
+        frame := cache.Snapshot.FrameFor(mounts, shade.PaletteRow, shade.Gamma, shade.Dithered, commercial)
+        if frame != "" {
+            revealScreen(frame, frame, [1]int{0}, Width)
+            return cache
+        }
+    }
+    drawViewBorder(mounts, shade, commercial, window)
+    return ViewBorderCache{Blocks: window.Blocks, Width: window.Width, Snapshot: viewBorderFrame{
+        Mounts: mounts, PaletteRow: shade.PaletteRow, Gamma: shade.Gamma,
+        Dithered: shade.Dithered, Commercial: commercial, Pixels: captureScreen(false)}}
+}
+
+func drawBorderStrip(flat wad.LumpRef, shade walls.WadShading, row int, first int, end int) {
+    sourceRow := ((row * intermissionHeight / Height) & 63) << 6
+    patternRow := (row & 3) << 2
+    for offset := range end - first {
+        x := first + offset
+        sourceColumn := (x * intermissionWidth / Width) & 63
+        index := int(flat.File[flat.Offset + sourceRow + sourceColumn])
+        var swatch color
+        if shade.Dithered {
+            if walls.Bayer4[patternRow | (x & 3)] < shade.Patterns.Coverage[index] {
+                swatch = shade.Patterns.Second[index]
+            } else { swatch = shade.Patterns.First[index] }
+        } else { swatch = shade.Palette[index] }
+        pixel(x, row, true, swatch)
+    }
+}
+
+func viewBorderPatch(mounts wad.Archives, first int, second int) IntermissionPatch {
+    return readIntermissionPatch(mounts, statusName(66, 82, 68, 82, 95, first, second, 0)) // BRDR_
+}
+
+func drawViewBorder(mounts wad.Archives, shade walls.WadShading, commercial bit, window ViewWindow) {
+    name := statusName(70, 76, 79, 79, 82, 55, 95, 50) // FLOOR7_2
+    if commercial {
+        name = statusName(71, 82, 78, 82, 79, 67, 75, 0) // GRNROCK
+    }
+    flat := mounts.Find(name)
+    if flat.Valid && flat.Size == wad.FlatBytes {
+        for y := range StatusViewHeight {
+            if y < window.Y || y >= window.Y + window.Height {
+                drawBorderStrip(flat, shade, y, 0, Width)
+            } else {
+                drawBorderStrip(flat, shade, y, 0, window.X)
+                drawBorderStrip(flat, shade, y, window.X + window.Width, Width)
+            }
+        }
+    }
+
+    top, bottom := viewBorderPatch(mounts, 84, 0), viewBorderPatch(mounts, 66, 0)
+    left, right := viewBorderPatch(mounts, 76, 0), viewBorderPatch(mounts, 82, 0)
+    nativeViewLeft := (intermissionWidth - window.NativeWidth) / 2
+    nativeViewTop := (statusBarTop - window.NativeHeight) / 2
+    edgeRight, edgeBottom := nativeViewLeft + window.NativeWidth, nativeViewTop + window.NativeHeight
+    for column := range window.NativeWidth / 8 {
+        x := nativeViewLeft + column * 8
+        drawIntermissionPatch(top, shade, x, nativeViewTop - 8)
+        drawIntermissionPatch(bottom, shade, x, edgeBottom)
+    }
+    for row := range window.NativeHeight / 8 {
+        y := nativeViewTop + row * 8
+        drawIntermissionPatch(left, shade, nativeViewLeft - 8, y)
+        drawIntermissionPatch(right, shade, edgeRight, y)
+    }
+    drawIntermissionPatch(viewBorderPatch(mounts, 84, 76), shade, nativeViewLeft - 8, nativeViewTop - 8)
+    drawIntermissionPatch(viewBorderPatch(mounts, 84, 82), shade, edgeRight, nativeViewTop - 8)
+    drawIntermissionPatch(viewBorderPatch(mounts, 66, 76), shade, nativeViewLeft - 8, edgeBottom)
+    drawIntermissionPatch(viewBorderPatch(mounts, 66, 82), shade, edgeRight, edgeBottom)
+}

@@ -1,0 +1,238 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted on 2026-11-22 from linuxdoom-1.10/am_map.c.
+//
+// The automap owns map-space coordinates in 16.16 fixed point.  Width and
+// Height are deliberately framebuffer pixels so that renderers can project a
+// view onto any sized target without changing the original Doom camera math.
+
+package automap
+
+import "numeric"
+import "engine"
+
+const panPixelsPerTic = 4
+const zoomIn = 66846 // int(1.02 * FRACUNIT)
+const zoomOut = 64250 // int(FRACUNIT / 1.02)
+const initialScale = engine.FracUnit / 5
+const initialFitDenominator = 45875 // int(0.7 * FRACUNIT)
+const playerDiameter = 32 * engine.FracUnit
+
+type Bounds struct {
+    MinX int
+    MinY int
+    MaxX int
+    MaxY int
+}
+
+type Window struct {
+    X int
+    Y int
+    MapWidth int
+    MapHeight int
+    Scale int
+    Width int
+    Height int
+}
+
+type View struct {
+    Window Window
+    Follow bit
+    Grid bit
+    Full bit
+    MinScale int
+    MaxScale int
+    Saved Window
+    followed bit
+    followX int
+    followY int
+}
+
+type ViewCommand struct {
+    Follow bit
+    Grid bit
+    Full bit
+    Left bit
+    Right bit
+    Up bit
+    Down bit
+    ZoomIn bit
+    ZoomOut bit
+}
+
+type ScaleLimits struct {
+    Min int
+    Max int
+}
+
+func minimum(a int, b int) int {
+    if a < b { return a }
+    return b
+}
+
+func maximum(a int, b int) int {
+    if a > b { return a }
+    return b
+}
+
+func scaleLimits(bounds Bounds, width int, height int) ScaleLimits {
+    mapWidth := bounds.MaxX - bounds.MinX
+    mapHeight := bounds.MaxY - bounds.MinY
+    if width <= 0 || height <= 0 || mapWidth <= 0 || mapHeight <= 0 {
+        return ScaleLimits{Min: initialScale, Max: initialScale}
+    }
+
+    // AM_findMinMaxBoundaries: the low scale fits every vertex, while the
+    // high scale is a two-player-radius tall window.
+    low := minimum(cport.C_FixedDiv(width << 16, mapWidth), cport.C_FixedDiv(height << 16, mapHeight))
+    high := cport.C_FixedDiv(height << 16, playerDiameter)
+    if low < 1 { low = 1 }
+    if high < low { high = low }
+    return ScaleLimits{Min: low, Max: high}
+}
+
+func inverseScale(scale int) int {
+    if scale <= 0 { return engine.FracUnit }
+    return cport.C_FixedDiv(engine.FracUnit, scale)
+}
+
+// FrameToMap is Doom's FTOM macro. pixel is an integer framebuffer distance;
+// the result is a 16.16 map distance.
+func FrameToMap(pixel int, scale int) int {
+    return cport.C_FixedMul(pixel << 16, inverseScale(scale))
+}
+
+// MapToFrame is Doom's MTOF macro. It converts a 16.16 map distance to an
+// integer framebuffer distance.
+func MapToFrame(distance int, scale int) int {
+    return cport.C_FixedMul(distance, scale) >> 16
+}
+
+func resizeWindow(window Window, scale int) Window {
+    centerX := window.X + window.MapWidth / 2
+    centerY := window.Y + window.MapHeight / 2
+    window.Scale = scale
+    window.MapWidth = FrameToMap(window.Width, scale)
+    window.MapHeight = FrameToMap(window.Height, scale)
+    window.X = centerX - window.MapWidth / 2
+    window.Y = centerY - window.MapHeight / 2
+    return window
+}
+
+func clampWindow(window Window, bounds Bounds) Window {
+    if bounds.MaxX <= bounds.MinX || bounds.MaxY <= bounds.MinY { return window }
+    centerX := window.X + window.MapWidth / 2
+    centerY := window.Y + window.MapHeight / 2
+    centerX = maximum(bounds.MinX, minimum(bounds.MaxX, centerX))
+    centerY = maximum(bounds.MinY, minimum(bounds.MaxY, centerY))
+    window.X = centerX - window.MapWidth / 2
+    window.Y = centerY - window.MapHeight / 2
+    return window
+}
+
+func centerWindow(window Window, x int, y int) Window {
+    window.X = x - window.MapWidth / 2
+    window.Y = y - window.MapHeight / 2
+    return window
+}
+
+func initialView(bounds Bounds, playerX int, playerY int, width int, height int) View {
+    limits := scaleLimits(bounds, width, height)
+    low, high := limits.Min, limits.Max
+    scale := cport.C_FixedDiv(low, initialFitDenominator)
+    if scale > high { scale = low }
+    if scale < low { scale = low }
+    window := resizeWindow(Window{Width: width, Height: height}, scale)
+    window = clampWindow(centerWindow(window, playerX, playerY), bounds)
+    return View{Window: window, Follow: true, MinScale: low, MaxScale: high, Saved: window}
+}
+
+func NewView(bounds Bounds, playerX int, playerY int, width int, height int) View {
+    return initialView(bounds, playerX, playerY, width, height)
+}
+
+// RecenterView is used when reopening the automap. AM_initVariables centers
+// every reopen (even if follow had been disabled), while retaining its scale
+// and options from AM_LevelInit.
+func RecenterView(view View, bounds Bounds, playerX int, playerY int) View {
+    limits := scaleLimits(bounds, view.Window.Width, view.Window.Height)
+    low, high := limits.Min, limits.Max
+    view.MinScale, view.MaxScale = low, high
+    scale := view.Window.Scale
+    if scale < low { scale = low }
+    if scale > high { scale = high }
+    view.Window = resizeWindow(view.Window, scale)
+    view.Window = centerWindow(view.Window, playerX, playerY)
+    view.Window = clampWindow(view.Window, bounds)
+    // AM_Responder clears bigstate when Tab closes the map. It deliberately
+    // leaves the selected scale alone, so reopening is centered but not a
+    // pending full-scale toggle.
+    view.Full = false
+    view.Saved = view.Window
+    view.followed = false
+    return view
+}
+
+func applyScale(view View, bounds Bounds, multiplier int) View {
+    scale := cport.C_FixedMul(view.Window.Scale, multiplier)
+    if scale < view.MinScale { scale = view.MinScale }
+    if scale > view.MaxScale { scale = view.MaxScale }
+    view.Window = clampWindow(resizeWindow(view.Window, scale), bounds)
+    return view
+}
+
+func followPlayer(view View, bounds Bounds, playerX int, playerY int) View {
+    // AM_doFollowPlayer goes through MTOF then FTOM, snapping to the current
+    // framebuffer precision rather than retaining subpixel map movement.
+    snappedX := FrameToMap(MapToFrame(playerX, view.Window.Scale), view.Window.Scale)
+    snappedY := FrameToMap(MapToFrame(playerY, view.Window.Scale), view.Window.Scale)
+    view.Window = clampWindow(centerWindow(view.Window, snappedX, snappedY), bounds)
+    return view
+}
+
+func TickView(view View, bounds Bounds, playerX int, playerY int, command ViewCommand) View {
+    if command.Grid { view.Grid = !view.Grid }
+    if command.Follow {
+        view.Follow = !view.Follow
+        view.followed = false
+    }
+
+    if command.Full {
+        if view.Full {
+            view.Full = false
+            view.Window = view.Saved
+            if view.Window.MapWidth > 0 && view.Window.Width > 0 {
+                view.Window.Scale = cport.C_FixedDiv(view.Window.Width << 16, view.Window.MapWidth)
+            }
+            if view.Follow { view.Window = centerWindow(view.Window, playerX, playerY) }
+            view.Window = clampWindow(view.Window, bounds)
+        } else {
+            view.Full = true
+            view.Saved = view.Window
+            view.Window = clampWindow(resizeWindow(view.Window, view.MinScale), bounds)
+        }
+    }
+
+    if command.Left || command.Right || command.Up || command.Down {
+        view.Follow = false
+        view.followed = false
+    }
+    // AM_doFollowPlayer only snaps when the tracked position changes.
+    if view.Follow && (!view.followed || playerX != view.followX || playerY != view.followY) {
+        view = followPlayer(view, bounds, playerX, playerY)
+        view.followed, view.followX, view.followY = true, playerX, playerY
+    }
+
+    if command.ZoomIn { view = applyScale(view, bounds, zoomIn) }
+    if command.ZoomOut { view = applyScale(view, bounds, zoomOut) }
+
+    if !view.Follow {
+        pan := FrameToMap(panPixelsPerTic, view.Window.Scale)
+        if command.Left { view.Window.X = view.Window.X - pan }
+        if command.Right { view.Window.X = view.Window.X + pan }
+        if command.Up { view.Window.Y = view.Window.Y + pan }
+        if command.Down { view.Window.Y = view.Window.Y - pan }
+        view.Window = clampWindow(view.Window, bounds)
+    }
+    return view
+}

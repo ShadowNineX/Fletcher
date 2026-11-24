@@ -1,0 +1,38 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted on 2026-11-21 from R_PointToAngle and R_PointToAngle2 in linuxdoom-1.10/r_main.c.
+
+package engine
+
+import "numeric"
+
+const angle90 bits<32> = 0x40000000
+const angle180 bits<32> = 0x80000000
+const angle270 bits<32> = 0xc0000000
+
+// Angles wrap after one turn. The view origin is an argument instead of global state.
+func PointToAngle(viewX int, viewY int, pointX int, pointY int) bits<32> {
+    dx, dy := pointX - viewX, pointY - viewY
+    if dx == 0 && dy == 0 { return 0 }
+
+    x, y := bits<32>(dx), bits<32>(dy)
+    if dx < 0 { x = -x }
+    if dy < 0 { y = -y }
+    if x > y {
+        angle := slopeAngles[cport.C_SlopeDiv(y, x)]
+        if dx >= 0 {
+            if dy >= 0 { return angle }
+            return -angle
+        }
+        if dy >= 0 { return angle180 - 1 - angle }
+        return angle180 + angle
+    }
+
+    angle := slopeAngles[cport.C_SlopeDiv(x, y)]
+    if dx >= 0 {
+        if dy >= 0 { return angle90 - 1 - angle }
+        return angle270 + angle
+    }
+    if dy >= 0 { return angle90 + angle }
+    return angle270 - 1 - angle
+}

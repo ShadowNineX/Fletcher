@@ -1,0 +1,74 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Thinker sounds from linuxdoom-1.10/p_doors.c, p_floor.c, p_plats.c and p_ceilng.c.
+
+package play
+
+import "actorinfo"
+
+type MoverTickSounds struct {
+    First int
+    Second int
+}
+
+func orderedMoverSounds(moving int, transition int) MoverTickSounds {
+    if moving == 0 { return MoverTickSounds{First: transition} }
+    return MoverTickSounds{First: moving, Second: transition}
+}
+
+func DoorTickSounds(before DoorState, after DoorState) MoverTickSounds {
+    if !before.Active { return MoverTickSounds{} }
+    switch before.Direction {
+    case 0:
+        if after.Direction == -1 {
+            if before.Mode == DoorBlazeRaise { return MoverTickSounds{First: actorinfo.SoundBlazeClose} }
+            return MoverTickSounds{First: actorinfo.SoundDoorClose}
+        }
+        if after.Direction == 1 { return MoverTickSounds{First: actorinfo.SoundDoorOpen} }
+    case 2:
+        if after.Direction == 1 { return MoverTickSounds{First: actorinfo.SoundDoorOpen} }
+    case -1:
+        // Even a blazing raise uses the normal open sound when obstructed.
+        if after.Direction == 1 { return MoverTickSounds{First: actorinfo.SoundDoorOpen} }
+        if !after.Active && (before.Mode == DoorBlazeRaise || before.Mode == DoorBlazeClose) {
+            return MoverTickSounds{First: actorinfo.SoundBlazeClose}
+        }
+    }
+    return MoverTickSounds{}
+}
+
+func FloorTickSounds(before FloorState, after FloorState, levelTime int) MoverTickSounds {
+    if !before.Active { return MoverTickSounds{} }
+    moving, transition := 0, 0
+    if (levelTime & 7) == 0 { moving = actorinfo.SoundStoneMove }
+    if !after.Active { transition = actorinfo.SoundPlatformStop }
+    return orderedMoverSounds(moving, transition)
+}
+
+func PlatformTickSounds(before PlatformState, after PlatformState, levelTime int) MoverTickSounds {
+    if !before.Active { return MoverTickSounds{} }
+    moving, transition := 0, 0
+    switch before.Status {
+    case PlatformUp:
+        if (levelTime & 7) == 0 && (before.Mode == PlatformRaiseAndChange || before.Mode == PlatformRaiseNearestAndChange) {
+            moving = actorinfo.SoundStoneMove
+        }
+        if after.Status == PlatformDown { transition = actorinfo.SoundPlatformStart }
+        if after.Status == PlatformWaiting { transition = actorinfo.SoundPlatformStop }
+    case PlatformDown:
+        if after.Status == PlatformWaiting { transition = actorinfo.SoundPlatformStop }
+    case PlatformWaiting:
+        if after.Status == PlatformUp || after.Status == PlatformDown { transition = actorinfo.SoundPlatformStart }
+    }
+    return orderedMoverSounds(moving, transition)
+}
+
+func CeilingTickSounds(before CeilingState, after CeilingState, levelTime int) MoverTickSounds {
+    if !before.Active || (before.Direction != -1 && before.Direction != 1) { return MoverTickSounds{} }
+    if before.Mode == CeilingSilentCrushAndRaise {
+        if after.Direction == -before.Direction { return MoverTickSounds{First: actorinfo.SoundPlatformStop} }
+    } else if (levelTime & 7) == 0 {
+        return MoverTickSounds{First: actorinfo.SoundStoneMove}
+    }
+    return MoverTickSounds{}
+}

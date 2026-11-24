@@ -1,0 +1,119 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted from R_DrawMaskedColumn and R_DrawVisSprite in linuxdoom-1.10/r_things.c.
+
+package walls
+
+import "engine"
+import "numeric"
+import "sprites"
+import "wad"
+
+// clip words use zero for an unclipped column. Otherwise the high half stores
+// first+1 and the low half stores the exclusive end.
+func clipRange(word bits<32>, height int) engine.ColumnSpan {
+    if height <= 0 { return engine.ColumnSpan{} }
+    if word == 0 { return engine.ColumnSpan{First: 0, End: height} }
+    first := int((word >> 16) & 65535) - 1
+    end := int(word & 65535)
+    if first < 0 { first = 0 }
+    if end > height { end = height }
+    if first > end { first = end }
+    return engine.ColumnSpan{First: first, End: end}
+}
+
+type PostRaster struct {
+    Patch wad.LumpRef
+    Scale int
+    TopScreen int
+    Mid int
+    Inverse int
+    Center int
+    LightBase int
+    Shade WadShading
+    Height int
+    Translation int
+    Fuzzy bit
+}
+
+func drawPostColumn(raster PostRaster, cursor int, x int, clip engine.ColumnSpan, phase int) int {
+    patch := raster.Patch
+    end := patch.Offset + patch.Size
+    for range (end - cursor) / 4 + 1 {
+        if cursor >= end { return phase }
+        top := int(patch.File[cursor])
+        if top == 255 || cursor > end - 4 { return phase }
+        length := int(patch.File[cursor + 1])
+        if length > end - cursor - 4 { return phase }
+
+        postTop := raster.TopScreen + top * raster.Scale
+        first := (postTop + engine.FracUnit - 1) >> 16
+        last := (postTop + length * raster.Scale + engine.FracUnit - 1) >> 16
+        if first < clip.First { first = clip.First }
+        if last > clip.End { last = clip.End }
+        if raster.Fuzzy {
+            phase = DrawFuzzColumn(x, first, last, raster.Height, phase, raster.Shade)
+        } else {
+            fraction := raster.Mid - (top << 16) + (first - raster.Center) * raster.Inverse
+            for offset := range last - first {
+                source := fraction >> 16
+                if raster.Translation == 0 { source = source & 127 }
+                if source >= 0 && source < length {
+                    index := int(patch.File[cursor + 3 + source])
+                    if raster.Translation != 0 { index = TranslateSpriteIndex(index, raster.Translation) }
+                    value := int(raster.Shade.ColorMaps.File[raster.LightBase + index])
+                    raster.Shade.DrawMappedPixel(value, x, first + offset)
+                }
+                fraction = fraction + raster.Inverse
+            }
+        }
+        cursor = cursor + length + 4
+    }
+    return phase
+}
+
+// DrawSprite draws masked WAD posts, preserving transparent gaps and applying
+// Doom's fixed-point column scale and COLORMAP palette lookup. StartFrac and
+// XStep are 16.16 texture-column coordinates, so mirrored sprites are handled
+// by a negative XStep without a second raster path.
+func DrawSprite(sprite sprites.ProjectedSprite, screenHeight int, clips [engine.MaxViewWidth]bits<32>,
+    shading WadShading) {
+    DrawSpriteWithFuzz(sprite, screenHeight, clips, shading, 0)
+}
+
+func DrawSpriteWithFuzz(sprite sprites.ProjectedSprite, screenHeight int, clips [engine.MaxViewWidth]bits<32>,
+    shading WadShading, phase int) int {
+    if !sprite.Valid || !shading.Valid || !shading.ColorMaps.Valid || screenHeight <= 0 ||
+        screenHeight > 65534 || sprite.Scale <= 0 || !sprite.Patch.Valid { return phase }
+    patch := sprite.Patch
+    if patch.Size < wad.PatchHeaderSize || patch.Offset < 0 || patch.Offset > len(patch.File) - patch.Size { return phase }
+    width := (wad.U16(patch.File, patch.Offset) << 16) >> 16
+    directoryEnd := wad.PatchHeaderSize + width * 4
+    if width <= 0 || directoryEnd > patch.Size { return phase }
+    lightBase := shading.ColorMaps.Offset + shading.ColorRow(sprite.LightRow) * wad.ColorMapBytes
+    if shading.ColorMaps.Offset < 0 || shading.ColorMaps.Offset > len(shading.ColorMaps.File) - shading.ColorMaps.Size ||
+        sprite.LightRow < 0 || sprite.LightRow >= engine.NumColorMaps || lightBase < shading.ColorMaps.Offset ||
+        lightBase > shading.ColorMaps.Offset + shading.ColorMaps.Size - wad.ColorMapBytes { return phase }
+    centerY := screenHeight / 2
+    inverse := sprite.XStep
+    if inverse < 0 { inverse = -inverse }
+    inverse = inverse >> shading.DetailShift
+    raster := PostRaster{Patch: patch, Scale: sprite.Scale, TopScreen: (centerY << 16) - cport.C_FixedMul(sprite.TextureMid, sprite.Scale),
+        Mid: sprite.TextureMid, Inverse: inverse, Center: centerY, LightBase: lightBase, Shade: shading,
+        Height: screenHeight, Translation: sprite.Translation, Fuzzy: sprite.Fuzzy}
+    for offset := range sprite.Span.End - sprite.Span.First {
+        x := sprite.Span.First + offset
+        if x >= 0 && x < engine.MaxViewWidth {
+            clip := clipRange(clips[x], screenHeight)
+            fraction := sprite.StartFrac + offset * sprite.XStep
+            column := fraction >> 16
+            if clip.First < clip.End && column >= 0 && column < width {
+                relative := wad.LE32(patch.File, patch.Offset + wad.PatchHeaderSize + column * 4)
+                if relative >= directoryEnd && relative < patch.Size {
+                    phase = drawPostColumn(raster, patch.Offset + relative, x, clip, phase)
+                }
+            }
+        }
+    }
+    return phase
+}

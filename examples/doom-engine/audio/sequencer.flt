@@ -1,0 +1,163 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// MUS scheduling is adapted from the 140 Hz timing used by the original Doom
+// music player.  The Logic Arrows backend receives note starts only.
+
+package audio
+
+import "wad"
+import "play"
+
+const MusVoiceCount = 16
+const MusChannels = 16
+const MusClocksPerTic = 4
+
+type MusNote struct {
+    Key int
+    Program int
+    Channel int
+    Velocity int
+    Bend int
+}
+
+type MusNotes struct {
+    Count int
+    Inline [MusVoiceCount]MusNote
+    extra play.PagedSlots<MusNote>
+}
+
+func (notes MusNotes) At(index int) MusNote {
+    if index < 0 || index >= notes.Count { return MusNote{} }
+    if index < MusVoiceCount { return notes.Inline[index] }
+    return notes.extra.At(index - MusVoiceCount)
+}
+
+type MusChannelState struct {
+    Program int
+    Velocity int
+    Volume int
+    Expression int
+    Bend int
+}
+
+type MusPlayer struct {
+    Active bit
+    Repeat bit
+    Cursor MusCursor
+    Wait int
+    Channels [MusChannels]MusChannelState
+    LoopAdvanced bit
+}
+
+type MusFrame struct {
+    Player MusPlayer
+    Notes MusNotes
+}
+
+func defaultMusChannels() [MusChannels]MusChannelState {
+    var channels [MusChannels]MusChannelState
+    for index := range MusChannels {
+        channels[index] = MusChannelState{Velocity: 127, Volume: 127, Expression: 127, Bend: 128}
+    }
+    return channels
+}
+
+func LoadMusPlayer(lump wad.LumpRef, repeat bit) MusPlayer {
+    cursor := OpenMus(lump)
+    if !cursor.Valid { return MusPlayer{} }
+    return MusPlayer{Active: true, Repeat: repeat, Cursor: cursor, Channels: defaultMusChannels()}
+}
+
+func musVelocity(channel MusChannelState) int {
+    return channel.Velocity * channel.Volume * channel.Expression / (127 * 127)
+}
+
+func resetMusLoop(player MusPlayer) MusPlayer {
+    cursor := OpenMus(player.Cursor.Lump)
+    if !cursor.Valid { return MusPlayer{} }
+    player.Cursor = cursor
+    player.Wait = 0
+    player.Channels = defaultMusChannels()
+    player.LoopAdvanced = false
+    return player
+}
+
+func applyMusEvent(player MusPlayer, event MusEvent, frame MusFrame) MusFrame {
+    channel := player.Channels[event.Channel]
+    if event.Kind == MusNoteOn {
+        if event.Data2 >= 0 { channel.Velocity = event.Data2 }
+        player.Channels[event.Channel] = channel
+        velocity := musVelocity(channel)
+        if velocity > 0 {
+            note := MusNote{Key: event.Data1, Program: channel.Program, Channel: event.Channel,
+                Velocity: velocity, Bend: channel.Bend}
+            if frame.Notes.Count < MusVoiceCount {
+                frame.Notes.Inline[frame.Notes.Count] = note
+            } else {
+                frame.Notes.extra = frame.Notes.extra.With(frame.Notes.Count - MusVoiceCount, note)
+            }
+            frame.Notes.Count = frame.Notes.Count + 1
+        }
+    } else if event.Kind == MusPitch {
+        channel.Bend = event.Data1
+        player.Channels[event.Channel] = channel
+    } else if event.Kind == MusController {
+        if event.Data1 == 0 { channel.Program = event.Data2 }
+        if event.Data1 == 3 { channel.Volume = event.Data2 }
+        if event.Data1 == 5 { channel.Expression = event.Data2 }
+        player.Channels[event.Channel] = channel
+    } else if event.Kind == MusSystem {
+        // MUS system controller 14 is reset-all-controllers.  It deliberately
+        // retains program and note velocity, as the original MIDI conversion does.
+        if event.Data1 == 14 {
+            channel.Volume = 127
+            channel.Expression = 127
+            channel.Bend = 128
+            player.Channels[event.Channel] = channel
+        }
+    }
+    frame.Player = player
+    return frame
+}
+
+// TickMusPlayer advances the half-open 140 Hz interval [now, now + 4), one
+// Doom 35 Hz gameplay tic.  Delays equal to four therefore begin next tic.
+func TickMusPlayer(player MusPlayer) MusFrame {
+    frame := MusFrame{Player: player}
+    if !player.Active { return frame }
+    if player.Wait >= MusClocksPerTic {
+        player.Wait = player.Wait - MusClocksPerTic
+        frame.Player = player
+        return frame
+    }
+    remaining := MusClocksPerTic - player.Wait
+    player.Wait = 0
+    // Each event consumes at least one score byte. A repeating score may
+    // wrap before spending a clock in this tic, then has to advance at least
+    // one clock per pass or stop. The header bounds the score extent.
+    reads := player.Cursor.End - player.Cursor.Position + 1
+    if player.Repeat { reads = reads + remaining * (player.Cursor.End - player.Cursor.Lump.Offset) }
+    for range reads {
+        event := ReadMusEvent(player.Cursor)
+        // A corrupt tail discards the whole frame, including earlier notes.
+        if !event.Valid { return MusFrame{} }
+        if event.Kind == MusEnd {
+            if !player.Repeat || !player.LoopAdvanced { player.Active = false; frame.Player = player; return frame }
+            player = resetMusLoop(player)
+            if !player.Active { return MusFrame{} }
+            frame.Player = player
+        } else {
+            player.Cursor = event.Cursor
+            frame = applyMusEvent(player, event, frame)
+            player = frame.Player
+            if event.Delay > 0 { player.LoopAdvanced = true }
+            if event.Delay >= remaining {
+                player.Wait = event.Delay - remaining
+                frame.Player = player
+                return frame
+            }
+            remaining = remaining - event.Delay
+        }
+    }
+    return MusFrame{}
+}

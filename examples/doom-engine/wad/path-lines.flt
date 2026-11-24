@@ -1,0 +1,168 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted from linuxdoom-1.10/p_maputl.c (P_PathTraverse).
+
+package wad
+
+import "numeric"
+
+const PathBlockLimit = 64
+const FixedUnit = 65536
+const BlockSizeFixed = 128 << 16
+const pathLineWords = 65536 / 32
+
+func onPathBlockBoundary(value int) bit { return (value & (BlockSizeFixed - 1)) == 0 }
+
+// PathWalk is P_PathTraverse's bounded BLOCKMAP DDA. A rounding stall revisits
+// the same cell through its 64-pass native bound rather than exiting early.
+type PathWalk struct {
+    Valid bit
+    Done bit
+    Ray DivLine
+    MapX int
+    MapY int
+    EndX int
+    EndY int
+    MapXStep int
+    MapYStep int
+    XStep int
+    YStep int
+    XIntercept int
+    YIntercept int
+    Pass int
+}
+
+func BeginPathWalk(blockMap BlockMapInfo, x1 int, y1 int, x2 int, y2 int) PathWalk {
+    if !blockMap.Valid { return PathWalk{} }
+    if onPathBlockBoundary(x1 - blockMap.OriginX) { x1 = x1 + FixedUnit }
+    if onPathBlockBoundary(y1 - blockMap.OriginY) { y1 = y1 + FixedUnit }
+    walk := PathWalk{Valid: true, Ray: DivLine{Valid: true, X: x1, Y: y1, DeltaX: x2 - x1, DeltaY: y2 - y1}}
+    localX1, localY1 := x1 - blockMap.OriginX, y1 - blockMap.OriginY
+    localX2, localY2 := x2 - blockMap.OriginX, y2 - blockMap.OriginY
+    walk.MapX, walk.MapY = localX1 >> MapBlockShift, localY1 >> MapBlockShift
+    walk.EndX, walk.EndY = localX2 >> MapBlockShift, localY2 >> MapBlockShift
+    absDX, absDY := localX2 - localX1, localY2 - localY1
+    if absDX < 0 { absDX = -absDX }
+    if absDY < 0 { absDY = -absDY }
+    if walk.EndX > walk.MapX {
+        walk.MapXStep = 1
+        partial := FixedUnit - ((localX1 >> (MapBlockShift - 16)) & (FixedUnit - 1))
+        walk.YStep = cport.C_FixedDiv(localY2 - localY1, absDX)
+        walk.YIntercept = (localY1 >> (MapBlockShift - 16)) + cport.C_FixedMul(partial, walk.YStep)
+    } else if walk.EndX < walk.MapX {
+        walk.MapXStep = -1
+        partial := (localX1 >> (MapBlockShift - 16)) & (FixedUnit - 1)
+        walk.YStep = cport.C_FixedDiv(localY2 - localY1, absDX)
+        walk.YIntercept = (localY1 >> (MapBlockShift - 16)) + cport.C_FixedMul(partial, walk.YStep)
+    } else {
+        walk.YStep = 256 * FixedUnit
+        walk.YIntercept = (localY1 >> (MapBlockShift - 16)) + walk.YStep
+    }
+    if walk.EndY > walk.MapY {
+        walk.MapYStep = 1
+        partial := FixedUnit - ((localY1 >> (MapBlockShift - 16)) & (FixedUnit - 1))
+        walk.XStep = cport.C_FixedDiv(localX2 - localX1, absDY)
+        walk.XIntercept = (localX1 >> (MapBlockShift - 16)) + cport.C_FixedMul(partial, walk.XStep)
+    } else if walk.EndY < walk.MapY {
+        walk.MapYStep = -1
+        partial := (localY1 >> (MapBlockShift - 16)) & (FixedUnit - 1)
+        walk.XStep = cport.C_FixedDiv(localX2 - localX1, absDY)
+        walk.XIntercept = (localX1 >> (MapBlockShift - 16)) + cport.C_FixedMul(partial, walk.XStep)
+    } else {
+        walk.XStep = 256 * FixedUnit
+        walk.XIntercept = (localX1 >> (MapBlockShift - 16)) + walk.XStep
+    }
+    return walk
+}
+
+func (walk PathWalk) Cell(blockMap BlockMapInfo) BlockCell {
+    if !walk.Valid || walk.Done || walk.MapX < 0 || walk.MapY < 0 || walk.MapX >= blockMap.Width || walk.MapY >= blockMap.Height { return BlockCell{} }
+    return BlockCell{Valid: true, X: walk.MapX, Y: walk.MapY}
+}
+
+func (walk PathWalk) Advance() PathWalk {
+    if !walk.Valid || walk.Done { return walk }
+    if walk.MapX == walk.EndX && walk.MapY == walk.EndY { walk.Done = true; return walk }
+    if (walk.YIntercept >> 16) == walk.MapY {
+        walk.YIntercept = walk.YIntercept + walk.YStep
+        walk.MapX = walk.MapX + walk.MapXStep
+    } else if (walk.XIntercept >> 16) == walk.MapX {
+        walk.XIntercept = walk.XIntercept + walk.XStep
+        walk.MapY = walk.MapY + walk.MapYStep
+    }
+    walk.Pass = walk.Pass + 1
+    if walk.Pass >= PathBlockLimit { walk.Done = true }
+    return walk
+}
+
+// PathLineFraction is PIT_AddLineIntercepts without its validcount state.
+// -1 means that the finite linedef is not crossed or lies behind the source.
+func PathLineFraction(ray DivLine, line CollisionLine) int {
+    firstSide, secondSide := 0, 0
+    if ray.DeltaX > 16 * FixedUnit || ray.DeltaY > 16 * FixedUnit || ray.DeltaX < -(16 * FixedUnit) || ray.DeltaY < -(16 * FixedUnit) {
+        firstSide = PointOnDivLineSide(ray, line.First.X, line.First.Y)
+        secondSide = PointOnDivLineSide(ray, line.Last.X, line.Last.Y)
+    } else {
+        firstSide = PointOnCollisionLineSide(line, ray.X, ray.Y)
+        secondSide = PointOnCollisionLineSide(line, ray.X + ray.DeltaX, ray.Y + ray.DeltaY)
+    }
+    if firstSide == secondSide { return -1 }
+    fraction := InterceptVector(ray, MakeDivLine(line))
+    if fraction < 0 { return -1 }
+    return fraction
+}
+
+type LineTrace struct {
+    Valid bit
+    Count int
+    Hits PathHits
+    seenLines [pathLineWords]bits<32>
+}
+
+func traceBlockLines(level BspLevel, blockMap BlockMapInfo, cell BlockCell, ray DivLine, result LineTrace) LineTrace {
+    start := BlockLineListStart(level, blockMap, cell)
+    if start < 0 { result.Valid = false; return result }
+    for entry := range (level.BlockMap.Count - start) / 2 {
+        lineIndex := BlockLineAt(level, blockMap, start, entry)
+        if lineIndex < 0 { return result }
+        word, bitIndex := lineIndex >> 5, lineIndex & 31
+        if !result.seenLines[word][bitIndex] {
+            result.seenLines[word][bitIndex] = true
+            line := level.LineAt(lineIndex)
+            if !line.Valid { result.Valid = false; return result }
+            fraction := PathLineFraction(ray, line)
+            if fraction >= 0 && fraction <= FixedUnit {
+                result.Hits = result.Hits.With(result.Count, PathIntercept{IsLine: true, Index: lineIndex, Fraction: fraction})
+                result.Count = result.Count + 1
+            }
+        }
+    }
+    result.Valid = false
+    return result
+}
+
+func (result LineTrace) sorted() LineTrace {
+    result.Hits = result.Hits.Sorted(result.Count)
+    return result
+}
+
+func TraceMapLines(level BspLevel, blockMap BlockMapInfo, x1 int, y1 int, x2 int, y2 int) LineTrace {
+    result := LineTrace{Valid: true}
+    walk := BeginPathWalk(blockMap, x1, y1, x2, y2)
+    if !walk.Valid { result.Valid = false; return result }
+    for range PathBlockLimit {
+        cell := walk.Cell(blockMap)
+        if cell.Valid {
+            result = traceBlockLines(level, blockMap, cell, walk.Ray, result)
+            if !result.Valid { return result }
+        }
+        nextWalk := walk.Advance()
+        // No new line callbacks can occur once the DDA stalls in one cell.
+        if nextWalk.Done || (nextWalk.MapX == walk.MapX && nextWalk.MapY == walk.MapY &&
+            nextWalk.XIntercept == walk.XIntercept && nextWalk.YIntercept == walk.YIntercept) {
+            return result.sorted()
+        }
+        walk = nextWalk
+    }
+    return result.sorted()
+}

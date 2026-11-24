@@ -1,0 +1,85 @@
+// SPDX-License-Identifier: GPL-2.0-only
+package main
+
+import "audio"
+import "automap"
+import "enemy"
+import "play"
+import "wad"
+import "walls"
+
+// An unused slot has no actor, renderer, or mover arrays to initialize.
+type CheckpointSlot struct {
+    Valid bit
+    Value CheckpointValue
+}
+
+type CheckpointValue interface {
+    Recall() PreviewCheckpoint
+}
+
+// Capture the boundary before a gameplay tic, including thinker order and the
+// derived presentation state needed to resume without running an extra tic.
+type PreviewCheckpoint struct {
+    Marker int
+    Skill int
+    DidSecret bit
+    PreviousNextMap int
+    IntermissionPointerOn bit
+    LevelTime int
+    GameTime int
+    Paused bit
+    Shareware bit
+    TurnHeld int
+
+    Player play.ActorPhysics
+    EyeZ int
+    ViewOnGround bit
+    Inventory play.PlayerInventory
+    Weapon play.WeaponView
+    UseHeld bit
+    AttackRange int
+
+    BlockMap wad.BlockMapInfo
+    Actors play.MapActors
+    ActorLinks play.ActorLinks
+    PassiveActors play.PassiveActors
+    MapActors int
+    FirstActive int
+    Hearing PreviewHearing
+    Brain enemy.BrainState
+    Light play.LevelLightStep
+    Doors play.LevelDoors
+    Floors play.LevelFloors
+    Ceilings play.LevelCeilings
+    Scrolls play.LineScrolls
+    SoundBounds play.PagedSlots<sectorSoundBounds>
+
+    Materials walls.Materials
+    Animations wad.AnimationSet
+    ActorSprites PreviewSprites
+    Screen string
+    Shade walls.WadShading
+    FuzzPhase int
+    FuzzVisible bit
+    StatusAvailable bit
+    StatusHidden bit
+    ViewBlocks int
+    LowDetail bit
+    Gamma int
+    StatusVisible bit
+    StatusFace play.StatusFace
+    AutomapActive bit
+    MapView automap.View
+    MapBounds automap.Bounds
+    MappedLines MappedLines
+    MapMarks AutomapMarks
+    HudMessages play.HudMessages
+    HudMessagesEnabled bit
+
+    Soundtrack audio.MusPlayer
+    SoundtrackQueue SoundtrackQueue
+    SoundtrackId int
+}
+
+func (saved PreviewCheckpoint) Recall() PreviewCheckpoint { return saved }

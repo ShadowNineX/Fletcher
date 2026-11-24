@@ -1,0 +1,60 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted from HU_Start, HU_Responder, and HU_Ticker in linuxdoom-1.10/hu_stuff.c.
+
+package play
+
+const HudMessageTimeout = 4 * 35
+
+// HudMessages retains the single-line HUD message widget state. Current is
+// intentionally retained after timeout because HUlib's text line remains
+// allocated while message_on decides whether it is drawn.
+type HudMessages struct {
+    Current string
+    Pending string
+    Tics int
+    Visible bit
+    Protected bit
+    Force bit
+}
+
+// QueueHudMessage models writes to player_t.message and
+// message_dontfuckwithme. A later write in the same tic replaces an earlier
+// pending message, just as player_t has one message pointer.
+func QueueHudMessage(state HudMessages, message string, forced bit) HudMessages {
+    state.Pending = message
+    // P_ message writers do not clear message_dontfuckwithme. A forced
+    // writer therefore remains forced when a later regular writer supplies
+    // the final message in the same tic.
+    state.Force = state.Force || forced
+    return state
+}
+
+// TickHudMessages models HU_Responder's message-refresh key before
+// HU_Ticker. Forced messages can replace a protected message and are processed
+// even while ordinary messages are disabled.
+func TickHudMessages(state HudMessages, enabled bit, refresh bit) HudMessages {
+    if refresh {
+        state.Visible = true
+        state.Tics = HudMessageTimeout
+    }
+
+    if state.Tics != 0 {
+        state.Tics = state.Tics - 1
+        if state.Tics == 0 {
+            state.Visible = false
+            state.Protected = false
+        }
+    }
+
+    if (enabled || state.Force) &&
+        state.Pending != "" && (!state.Protected || state.Force) {
+        state.Current = state.Pending
+        state.Pending = ""
+        state.Visible = true
+        state.Tics = HudMessageTimeout
+        state.Protected = state.Force
+        state.Force = false
+    }
+    return state
+}

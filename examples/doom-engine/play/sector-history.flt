@@ -1,0 +1,26 @@
+package play
+
+// SIDEDEFS address sectors by a 16-bit index. A completed mover changes the
+// sector permanently. Immutable pages keep that change out of the thinker
+// array and stay cheap to pass through the actor and rendering snapshots.
+const sectorHistoryCapacity = 65536
+
+type SectorHistory<T> struct {
+    LastRelease int
+    entries PagedSlots<T>
+}
+
+func (history SectorHistory<T>) entryAt(sector int) T {
+    if history.LastRelease == 0 || sector < 0 || sector >= sectorHistoryCapacity {
+        var empty T
+        return empty
+    }
+    return history.entries.At(sector)
+}
+
+func (history SectorHistory<T>) withEntry(sector int, entry T, released int) SectorHistory<T> {
+    if sector < 0 || sector >= sectorHistoryCapacity { return history }
+    history.entries = history.entries.With(sector, entry)
+    if released > history.LastRelease { history.LastRelease = released }
+    return history
+}

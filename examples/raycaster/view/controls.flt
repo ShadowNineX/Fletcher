@@ -1,0 +1,19 @@
+package view
+
+func drawControls() {
+    drawLabel(16, [5]int{6, 5, 6, 4, 4})
+    drawLabel(42, [5]int{5, 7, 7, 5, 5})
+    drawLabel(78, [5]int{4, 4, 4, 4, 7})
+    drawLabel(114, [5]int{7, 4, 6, 4, 4})
+    drawLabel(150, [5]int{6, 5, 6, 5, 5})
+}
+
+func drawLabel(center int, glyph [5]int) {
+    for y, row := range glyph {
+        for x := range 3 {
+            if row & (4 >> x) != 0 {
+                pixel(center - 1 + x, Height + 3 + y, true, color.White)
+            }
+        }
+    }
+}

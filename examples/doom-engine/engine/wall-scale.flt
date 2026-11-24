@@ -1,0 +1,99 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted on 2026-11-21 from R_PointToDist and R_ScaleFromGlobalAngle in
+// linuxdoom-1.10/r_main.c and the range setup in r_segs.c.
+
+package engine
+
+import "numeric"
+
+const MaxWallScale = 64 * FracUnit
+const MinWallScale = 256
+
+type Camera struct {
+    X int
+    Y int
+    Z int
+    Heading bits<32>
+    View ViewProjection
+}
+
+type WallDistance struct {
+    Normal bits<32>
+    Distance int
+    Hypotenuse int
+}
+
+type WallTextureProjection struct {
+    Center bits<32>
+    Offset int
+    Distance int
+}
+
+type WallScale struct {
+    First int
+    Last int
+    Step int
+}
+
+func magnitude(value int) int {
+    if value == -2147483648 { return 2147483647 }
+    if value < 0 { return -value }
+    return value
+}
+
+func PointToDistance(viewX int, viewY int, x int, y int) int {
+    dx, dy := magnitude(x - viewX), magnitude(y - viewY)
+    if dy > dx { dx, dy = dy, dx }
+    if dx == 0 { return 0 }
+    angle := slopeAngles[cport.C_FixedDiv(dy, dx) >> 5] + angle90
+    return cport.C_FixedDiv(dx, fineSine(int(angle >> FineAngleShift)))
+}
+
+func PrepareWall(camera Camera, vertex Vertex, direction bits<32>, vertexAngle bits<32>) WallDistance {
+    normal := direction + angle90
+    off := normal - vertexAngle
+    if off > angle180 { off = -off }
+    if off > angle90 { off = angle90 }
+    hyp := PointToDistance(camera.X, camera.Y, vertex.X, vertex.Y)
+    sine := fineSine(int((angle90 - off) >> FineAngleShift))
+    return WallDistance{Normal: normal, Distance: cport.C_FixedMul(hyp, sine), Hypotenuse: hyp}
+}
+
+func PrepareWallTexture(wall WallDistance, heading bits<32>, firstAngle bits<32>, offsetU int) WallTextureProjection {
+    direction := wall.Normal - firstAngle
+    offset := direction
+    if offset > angle180 { offset = -offset }
+    if offset > angle90 { offset = angle90 }
+    distance := cport.C_FixedMul(wall.Hypotenuse, fineSine(int(offset >> FineAngleShift)))
+    if direction < angle180 { distance = -distance }
+    return WallTextureProjection{Center: angle90 + heading - wall.Normal, Offset: distance + offsetU, Distance: wall.Distance}
+}
+
+func WallTextureColumn(wall WallTextureProjection, viewAngle bits<32>) int {
+    angle := int((wall.Center + viewAngle) >> FineAngleShift)
+    if angle >= FineTangentCount { return wall.Offset >> 16 }
+    return (wall.Offset - cport.C_FixedMul(fineTangent(angle), wall.Distance)) >> 16
+}
+
+func ScaleFromAngle(camera Camera, wall WallDistance, visibleAngle bits<32>) int {
+    a := angle90 + (visibleAngle - camera.Heading)
+    b := angle90 + (visibleAngle - wall.Normal)
+    projection := (camera.View.Width / 2) << 16
+    numerator := cport.C_FixedMul(projection, fineSine(int(b >> FineAngleShift))) << camera.View.DetailShift
+    denominator := cport.C_FixedMul(wall.Distance, fineSine(int(a >> FineAngleShift)))
+    if denominator <= (numerator >> 16) { return MaxWallScale }
+    scale := cport.C_FixedDiv(numerator, denominator)
+    if scale < MinWallScale { return MinWallScale }
+    if scale > MaxWallScale { return MaxWallScale }
+    return scale
+}
+
+func ScaleWallSpan(camera Camera, wall WallDistance, span ColumnSpan) WallScale {
+    if !validSpan(span) || span.End > camera.View.Width { return WallScale{} }
+    start := ScaleFromAngle(camera, wall, camera.Heading + AngleForColumn(camera.View, span.First))
+    width := span.End - span.First - 1
+    if width == 0 { return WallScale{First: start, Last: start} }
+    stop := ScaleFromAngle(camera, wall, camera.Heading + AngleForColumn(camera.View, span.End - 1))
+    return WallScale{First: start, Last: stop, Step: (stop - start) / width}
+}

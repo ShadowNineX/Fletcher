@@ -1,0 +1,118 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Level completion and route selection from linuxdoom-1.10/g_game.c.
+
+package play
+
+import "wad"
+
+const CampaignStory = 1
+const CampaignVictory = 2
+const CampaignCast = 3
+
+const mapsPerEpisode = 9
+const episodesWithPars = 3
+const campaignEpisodeCount = 4
+const campaignCommercialCount = 32
+const campaignEpisodePars = [27]int{
+    30, 75, 120, 90, 165, 180, 180, 30, 165,
+    90, 90, 90, 120, 90, 360, 240, 30, 170,
+    90, 45, 90, 150, 90, 90, 165, 30, 135,
+}
+const campaignCommercialPars = [campaignCommercialCount]int{
+    30, 90, 120, 120, 90, 150, 120, 120, 270, 90,
+    210, 150, 150, 150, 210, 150, 420, 150, 210, 150,
+    240, 150, 180, 150, 150, 300, 330, 420, 300, 180, 120, 30,
+}
+const campaignSecretReturns = [campaignEpisodeCount]int{3, 5, 6, 2}
+
+type CampaignRoute struct {
+    Valid bit
+    Commercial bit
+    Episode int
+    LastMap int
+    NextMap int
+    NextName wad.LumpName
+    DidSecret bit
+    SecretExit bit
+    ShowPar bit
+    ParTics int
+    Finale int
+}
+
+func commercialMapName(index int) wad.LumpName {
+    number := index + 1
+    return wad.LumpName{Low: 0x50414d | ((48 + number / 10) << 24), High: 48 + number % 10}
+}
+
+// The caller has already resolved the MAP31 availability check in
+// G_SecretExitLevel. Route indices follow the zero-based intermission record.
+func PlanCampaignRoute(name wad.LumpName, secretExit bit, didSecret bit, previousNext int) CampaignRoute {
+    route := CampaignRoute{SecretExit: secretExit, DidSecret: didSecret}
+    if name.Low & 0xdfdfdf == 0x50414d {
+        tens, ones := ((name.Low >> 24) & 255) - 48, name.High - 48
+        if tens < 0 || tens > 9 || ones < 0 || ones > 9 { return route }
+        number := tens * 10 + ones
+        if number < 1 || number > campaignCommercialCount { return route }
+        route.Valid, route.Commercial, route.ShowPar = true, true, true
+        route.LastMap, route.NextMap = number - 1, number
+        route.ParTics = campaignCommercialPars[route.LastMap] * 35
+        if secretExit {
+            switch number {
+            case 15: route.NextMap = 30
+            case 31: route.NextMap = 31
+            default: route.NextMap = previousNext
+            }
+        } else if number == 31 || number == 32 { route.NextMap = 15 }
+        switch number {
+        case 6, 11, 20: route.Finale = CampaignStory
+        case 15, 31:
+            if secretExit { route.Finale = CampaignStory }
+        case 30: route.Finale = CampaignCast
+        }
+        route.NextName = commercialMapName(route.NextMap)
+        return route
+    }
+    if name.Low & 0xdf00df != 0x4d0045 || name.High != 0 { return route }
+    episode, number := ((name.Low >> 8) & 255) - 49, ((name.Low >> 24) & 255) - 48
+    if episode < 0 || episode >= campaignEpisodeCount || number < 1 || number > mapsPerEpisode { return route }
+    route.Valid, route.Episode, route.LastMap = true, episode, number - 1
+    if number == 8 {
+        route.Finale = CampaignVictory
+        return route
+    }
+    if episode < episodesWithPars {
+        route.ShowPar = true
+        route.ParTics = campaignEpisodePars[episode * mapsPerEpisode + route.LastMap] * 35
+    }
+    route.DidSecret = didSecret || number == 9
+    route.NextMap = number
+    if secretExit {
+        route.NextMap = 8
+    } else if number == 9 { route.NextMap = campaignSecretReturns[episode] }
+    route.NextName = wad.LumpName{Low: 0x4d0045 | ((49 + episode) << 8) | ((49 + route.NextMap) << 24)}
+    return route
+}
+
+type CampaignPlayerFinish struct {
+    Inventory PlayerInventory
+    Actor LevelActor
+    View WeaponView
+}
+
+func FinishCampaignPlayer(inventory PlayerInventory, actor LevelActor, view WeaponView) CampaignPlayerFinish {
+    inventory.Cards = [CardCount]bit{}
+    inventory.Powers = [PowerCount]int{}
+    actor.Physics.Body.Flags = actor.Physics.Body.Flags & ~bits<32>(ActorShadow)
+    view.ExtraLight = 0
+    inventory.FixedColormap, inventory.DamageCount, inventory.BonusCount = 0, 0, 0
+    return CampaignPlayerFinish{Inventory: inventory, Actor: actor, View: view}
+}
+
+// G_DoLoadLevel resets frags. P_SetupLevel starts fresh level totals.
+func CampaignSpawnInventory(inventory PlayerInventory) PlayerInventory {
+    if inventory.Dead { return NewPlayerInventory(PickupMaxHealth) }
+    inventory.KillCount, inventory.ItemCount, inventory.SecretCount, inventory.Attacker = 0, 0, 0, 0
+    inventory.Frags = [4]int{}
+    return inventory
+}

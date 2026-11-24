@@ -1,0 +1,25 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Single-player automap reveal sequence from linuxdoom-1.10/am_map.c and m_cheat.c.
+
+package automap
+
+const revealSequence = [4]int{105, 100, 100, 116} // iddt
+
+type RevealState struct {
+    Mode int
+    progress int
+}
+
+func RespondReveal(state RevealState, key int) RevealState {
+    if key != revealSequence[state.progress] {
+        state.progress = 0
+        return state
+    }
+    state.progress = state.progress + 1
+    if state.progress == 4 {
+        state.progress = 0
+        state.Mode = (state.Mode + 1) % 3
+    }
+    return state
+}

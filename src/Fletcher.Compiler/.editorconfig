@@ -1,0 +1,3 @@
+# ANTLR generates context constructors that call ParserRuleContext.CopyFrom.
+[obj/**/PortableCParser.cs]
+dotnet_diagnostic.S1699.severity = none

@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>fletcher</AssemblyName>
+    <Version>0.1.0</Version>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="System.CommandLine" Version="3.0.0" />
+    <ProjectReference Include="../Fletcher.Compiler/Fletcher.Compiler.csproj" />
+  </ItemGroup>
+</Project>

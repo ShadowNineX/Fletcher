@@ -1,0 +1,153 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Sprite silhouettes from R_StoreWallRange in linuxdoom-1.10/r_segs.c.
+
+package engine
+
+const DrawSegmentPageSize = 32
+const drawSegmentInlinePages = 32
+
+type DrawSegmentRef interface {
+    ReadDrawSegment() DrawSegment
+}
+
+type MaskedColumnDrawer interface {
+    DrawMask(first int, end int, drawn [CoverageWords]bits<32>) [CoverageWords]bits<32>
+}
+
+type DrawSegment struct {
+    Span ColumnSpan
+    First Vertex
+    Last Vertex
+    ScaleFirst int
+    ScaleLast int
+    Top bit
+    Bottom bit
+    TopClosed bit
+    BottomClosed bit
+    TopHeight int
+    BottomHeight int
+    ClipRows PlaneColumnBuffer
+    Masked bit
+    Mask MaskedColumnDrawer
+    PreviousMask int
+}
+
+func (segment DrawSegment) ReadDrawSegment() DrawSegment { return segment }
+
+type drawSegmentPageRef interface {
+    At(index int) DrawSegment
+    With(index int, segment DrawSegment) drawSegmentPage
+    Count() int
+    CanClip(span ColumnSpan, scale int) bit
+    OverlappingMasks(span ColumnSpan) (int, int)
+}
+
+type drawSegmentPage struct {
+    entries [DrawSegmentPageSize]DrawSegmentRef
+    count int
+    clipSpan ColumnSpan
+    maxClipScale int
+    maskSpan ColumnSpan
+    maskCount int
+    maskBefore int
+}
+
+func (page drawSegmentPage) At(index int) DrawSegment { return page.entries[index].ReadDrawSegment() }
+func (page drawSegmentPage) Count() int { return page.count }
+
+func (page drawSegmentPage) CanClip(span ColumnSpan, scale int) bit {
+    return page.clipSpan.First < page.clipSpan.End && page.clipSpan.First < span.End &&
+        page.clipSpan.End > span.First && page.maxClipScale >= scale
+}
+
+func (page drawSegmentPage) OverlappingMasks(span ColumnSpan) (int, int) {
+    // Keep the preceding page's handle even when this page has no overlap.
+    if page.maskCount > 0 && page.maskSpan.First < span.End && page.maskSpan.End > span.First {
+        return page.maskCount, page.maskBefore
+    }
+    return 0, page.maskBefore
+}
+
+func extendSegmentBounds(bounds ColumnSpan, span ColumnSpan) ColumnSpan {
+    if bounds.First >= bounds.End { return span }
+    if span.First < bounds.First { bounds.First = span.First }
+    if span.End > bounds.End { bounds.End = span.End }
+    return bounds
+}
+
+func (page drawSegmentPage) With(index int, segment DrawSegment) drawSegmentPage {
+    page.entries[index] = segment
+    page.count = index + 1
+    span := segment.Span
+    if (segment.Top || segment.Bottom) && span.First < span.End {
+        if page.clipSpan.First >= page.clipSpan.End { page.maxClipScale = segment.ScaleFirst }
+        page.clipSpan = extendSegmentBounds(page.clipSpan, span)
+        if segment.ScaleFirst > page.maxClipScale { page.maxClipScale = segment.ScaleFirst }
+        if segment.ScaleLast > page.maxClipScale { page.maxClipScale = segment.ScaleLast }
+    }
+    if segment.Masked {
+        page.maskSpan = extendSegmentBounds(page.maskSpan, span)
+        if page.maskCount == 0 { page.maskBefore = segment.PreviousMask }
+        page.maskCount = page.maskCount + 1
+    }
+    return page
+}
+
+// Boxing each populated page keeps changes to one range from copying the
+// whole frame's retained draw segments and their clip rows.
+type DrawSegmentStore struct {
+    Count int
+    MaskCount int
+    LastMask int
+    MaskPageCount int
+    pages [drawSegmentInlinePages]drawSegmentPageRef
+    overflow PagedSlots<drawSegmentPageRef>
+}
+
+func (store DrawSegmentStore) PageCount() int {
+    if store.Count == 0 { return 0 }
+    return (store.Count - 1) / DrawSegmentPageSize + 1
+}
+
+func (store DrawSegmentStore) PageAt(index int) drawSegmentPageRef {
+    if index < drawSegmentInlinePages { return store.pages[index] }
+    return store.overflow.At(index - drawSegmentInlinePages)
+}
+
+func (store DrawSegmentStore) At(index int) DrawSegment {
+    page, slot := index / DrawSegmentPageSize, index % DrawSegmentPageSize
+    if page < drawSegmentInlinePages { return store.pages[page].At(slot) }
+    return store.overflow.At(page - drawSegmentInlinePages).At(slot)
+}
+
+func (store DrawSegmentStore) Append(segment DrawSegment) DrawSegmentStore {
+    // Mask handles are one-based so an empty store has no head.
+    index, slot := store.Count / DrawSegmentPageSize, store.Count % DrawSegmentPageSize
+    if segment.Masked {
+        if store.LastMask == 0 || (store.LastMask - 1) / DrawSegmentPageSize != index {
+            store.MaskPageCount = store.MaskPageCount + 1
+        }
+        segment.PreviousMask = store.LastMask
+        store.LastMask = store.Count + 1
+        store.MaskCount = store.MaskCount + 1
+    }
+    if index < drawSegmentInlinePages {
+        if slot == 0 {
+            store.pages[index] = drawSegmentPage{}.With(slot, segment)
+        } else {
+            store.pages[index] = store.pages[index].With(slot, segment)
+        }
+    } else {
+        pageIndex := index - drawSegmentInlinePages
+        var page drawSegmentPage
+        if slot == 0 {
+            page = drawSegmentPage{}.With(slot, segment)
+        } else {
+            page = store.overflow.At(pageIndex).With(slot, segment)
+        }
+        store.overflow = store.overflow.With(pageIndex, page)
+    }
+    store.Count = store.Count + 1
+    return store
+}

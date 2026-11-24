@@ -1,0 +1,50 @@
+package play
+
+// BLOCKMAP and SEG records address classic linedefs with 16-bit indices.
+// Store immutable bitset pages so level snapshots can share unused and
+// unchanged pages without copying a full linedef table on every tick.
+const linePageWords = 64
+const linePageSize = linePageWords * 32
+const linePageCount = 65536 / linePageSize
+
+type linePageRef interface {
+    HasLine(local int) bit
+    ReadLinePage() linePage
+}
+
+type linePage struct {
+    words [linePageWords]bits<32>
+}
+
+func (page linePage) HasLine(local int) bit {
+    return page.words[local >> 5][local & 31]
+}
+
+func (page linePage) ReadLinePage() linePage { return page }
+
+type UsedLines struct {
+    pages [linePageCount]linePageRef
+    present bits<linePageCount>
+}
+
+func (lines UsedLines) contains(line int) bit {
+    if line < 0 || line >= linePageCount * linePageSize { return false }
+    index := line / linePageSize
+    return lines.present[index] && lines.pages[index].HasLine(line % linePageSize)
+}
+
+func (doors LevelDoors) consumeLine(line int) LevelDoors {
+    if line < 0 || line >= linePageCount * linePageSize { return doors }
+    index, local := line / linePageSize, line % linePageSize
+    var page linePage
+    if doors.UsedLines.present[index] {
+        existing := doors.UsedLines.pages[index]
+        if existing.HasLine(local) { return doors }
+        page = existing.ReadLinePage()
+    }
+    page.words[local >> 5][local & 31] = true
+    doors.UsedLines.pages[index] = page
+    doors.UsedLines.present[index] = true
+    doors.UsedCount = doors.UsedCount + 1
+    return doors
+}

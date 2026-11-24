@@ -1,0 +1,67 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted from P_CheckMeleeRange and P_CheckMissileRange in p_enemy.c.
+
+package enemy
+
+import "actorinfo"
+import "engine"
+import "play"
+import "wad"
+
+const revenant = 5 // MT_UNDEAD
+const meleeRange = 64 * engine.FracUnit
+
+type MissileDecision struct {
+    Actor play.LevelActor
+    Random play.RandomState
+    Attack bit
+}
+
+func sightEndpoint(actor play.LevelActor) wad.SightEndpoint {
+    body := actor.Physics.Body
+    return wad.SightEndpoint{X: body.X, Y: body.Y, Z: body.Z, Height: body.Height, Sector: actor.Sector}
+}
+
+func CheckMeleeRange(level wad.BspLevel, actors play.MapActors, actor play.LevelActor) bit {
+    target := actors.ActorAt(actor.Target - 1)
+    if !actor.Valid || !target.Valid { return false }
+    a, b := actor.Physics.Body, target.Physics.Body
+    distance := wad.ApproxDistance(b.X - a.X, b.Y - a.Y)
+    if distance >= meleeRange - 20 * engine.FracUnit + actorinfo.KindAt(target.Kind).Radius { return false }
+    return wad.CheckSight(level, sightEndpoint(actor), sightEndpoint(target)).Visible
+}
+
+func CheckMissileRange(level wad.BspLevel, actors play.MapActors, actor play.LevelActor, random play.RandomState) MissileDecision {
+    result := MissileDecision{Actor: actor, Random: random}
+    target := actors.ActorAt(actor.Target - 1)
+    if !actor.Valid || !target.Valid || !wad.CheckSight(level, sightEndpoint(actor), sightEndpoint(target)).Visible {
+        return result
+    }
+    if actor.Physics.Body.Flags & play.ActorJustHit != 0 {
+        result.Actor.Physics.Body.Flags = actor.Physics.Body.Flags & ~bits<32>(play.ActorJustHit)
+        result.Attack = true
+        return result
+    }
+    if actor.ReactionTime != 0 { return result }
+
+    a, b := actor.Physics.Body, target.Physics.Body
+    distance := wad.ApproxDistance(a.X - b.X, a.Y - b.Y) - 64 * engine.FracUnit
+    info := actorinfo.KindAt(actor.Kind)
+    if info.MeleeState == play.ActorNullState { distance = distance - 128 * engine.FracUnit }
+    distance = distance >> 16
+    switch actor.Kind {
+    case actorinfo.ActorVile:
+        if distance > 14 * 64 { return result }
+    case revenant:
+        if distance < 196 { return result }
+        distance = distance >> 1
+    case actorinfo.ActorCyborg, actorinfo.ActorSpider, actorinfo.ActorSkull:
+        distance = distance >> 1
+    }
+    if distance > 200 { distance = 200 }
+    if actor.Kind == actorinfo.ActorCyborg && distance > 160 { distance = 160 }
+    roll := play.PRandom(random)
+    result.Random, result.Attack = roll.State, int(roll.Value) >= distance
+    return result
+}

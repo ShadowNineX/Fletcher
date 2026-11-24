@@ -1,0 +1,99 @@
+package main
+
+import "actorinfo"
+import "play"
+import "wad"
+
+type PreviewTick struct {
+    Valid bit
+    Actor play.ActorPhysics
+    EyeZ int
+    Level wad.BspLevel
+    Specials play.LevelSpecials
+    Contacts play.PlayerContacts
+    Teleported bit
+    StopWalking bit
+    Cues bits<8>
+}
+
+func advancePreviewPlayer(level wad.BspLevel, blockMap wad.BlockMapInfo, actor play.ActorPhysics, command play.PlayerMoveCommand,
+    view play.PlayerView, state play.LevelSpecials, contacts play.PlayerContacts) PreviewTick {
+    actor.ViewHeight, actor.ViewHeightDelta = view.Height, view.Delta
+    teleported := false
+    stopWalking := false
+    var cues bits<8>
+
+    if actor.MomentumX != 0 || actor.MomentumY != 0 {
+        horizontal := play.MovePlayerWithContacts(level, blockMap, actor, command, state, contacts)
+        if !horizontal.Valid { return PreviewTick{} }
+        actor = horizontal.Actor
+        level = horizontal.Level
+        contacts = horizontal.Contacts
+        state.Doors, state.Lighting, state.Floors, state.Ceilings = horizontal.Doors, horizontal.Lighting, horizontal.Floors, horizontal.Ceilings
+        state.ExitRequested, state.SecretExit = horizontal.ExitRequested, horizontal.SecretExit
+        teleported, stopWalking = horizontal.Teleported, horizontal.StopWalking
+        if teleported { view.Z = horizontal.TeleportEyeZ }
+    }
+    if actor.Body.Z != actor.Body.Floor || actor.MomentumZ != 0 {
+        vertical := play.MoveVertically(actor, play.FloatTarget{})
+        actor = vertical.Actor
+        if vertical.HardLanding { cues = cues | previewSoundCue(actorinfo.SoundOof) }
+    }
+    return PreviewTick{Valid: true, Actor: actor, EyeZ: view.Z, Level: level, Specials: state, Contacts: contacts,
+        Teleported: teleported, StopWalking: stopWalking, Cues: cues}
+}
+
+type PreviewWorldActorStep struct {
+    Thinkers PreviewMapActorStep
+    EyeZ int
+    PickupMessage int
+    PickupSound int
+    Removed bit
+    LinksChanged bit
+}
+
+// Commands and psprites have already run in the player-think phase. At the
+// player's slot, move the live body left by the earlier actor callbacks.
+func tickPreviewWorldActors(scene PreviewCombat, blocks wad.BlockMapInfo, command play.PlayerMoveCommand,
+    view play.PlayerView, contacts play.PlayerContacts, passive play.PassiveActors, levelTime int) PreviewWorldActorStep {
+    handle := contacts.Handle
+    phase := tickPreviewMapActors(PreviewMapActorStep{Combat: scene}, blocks, levelTime, passive, 1, handle)
+    scene = phase.Combat
+    if scene.Failed { return PreviewWorldActorStep{Thinkers: phase} }
+
+    actor := scene.World.Actors.ActorAt(handle - 1)
+    contacts.Actors, contacts.Links, contacts.Inventory = scene.World.Actors, scene.World.Links, scene.World.Players[0]
+    contacts.AttackRange = scene.World.AttackRange
+    contacts.Callback = previewCallbackContext(scene)
+    contacts.FastMonsters = scene.Rules.Fast
+    scene.Specials.Lighting.Random = scene.World.Random
+    moved := advancePreviewPlayer(scene.Level, blocks, actor.Physics, command, view, scene.Specials, contacts)
+    if !moved.Valid {
+        phase.Combat.Failed = true
+        return PreviewWorldActorStep{Thinkers: phase}
+    }
+
+    after := moved.Contacts
+    actor = after.Actors.ActorAt(handle - 1)
+    actor.Physics = moved.Actor
+    if moved.StopWalking { actor = play.StopPlayerWalk(actor) }
+    scene.World.Actors, scene.World.Links = after.Actors.WithActor(handle, actor), after.Links
+    scene.World.Players[0], scene.World.AttackRange = after.Inventory, after.AttackRange
+    scene.Level, scene.Specials, scene.World.Random = moved.Level, moved.Specials, moved.Specials.Lighting.Random
+    scene = resumePreviewCallback(scene, after.Callback)
+    scene.Cues = scene.Cues | moved.Cues
+    if moved.Teleported { scene = afterPreviewTeleport(scene) }
+    if !scene.Failed && actor.Tics != -1 {
+        body := play.TickPlayerBodyState(scene.World, handle, levelTime)
+        if body.State.Action != 0 { scene = finishPreviewMobjCombat(scene, blocks, body, scene.Rules) } else {
+            scene.World, scene.Failed = body.World, body.Failed
+        }
+    }
+
+    phase.Combat = scene
+    if !scene.Failed {
+        phase = tickPreviewMapActors(phase, blocks, levelTime, passive, handle + 1, scene.MapActors + 1)
+    }
+    return PreviewWorldActorStep{Thinkers: phase, EyeZ: moved.EyeZ, PickupMessage: after.PickupMessage,
+        PickupSound: after.PickupSound, Removed: after.Removed, LinksChanged: after.LinksChanged}
+}

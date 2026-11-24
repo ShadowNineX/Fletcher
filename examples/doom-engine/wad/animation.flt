@@ -1,0 +1,194 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted on 2026-11-21 from P_InitPicAnims and P_UpdateSpecials in
+// linuxdoom-1.10/p_spec.c.
+
+package wad
+
+const AnimationTics = 8
+const BuiltinAnimationCount = 22
+
+// Animation represents one inclusive texture or flat sequence after its names
+// have been resolved by the caller into the original global indices.
+type Animation struct {
+    Base int
+    Last int
+    Count int
+    Texture bit
+    Valid bit
+}
+
+// AnimationSet holds only the resolved P_InitPicAnims cycles. Its lookup cost
+// is bounded by the original 22 definitions, not by WAD texture count.
+type AnimationSet struct {
+    Ranges [BuiltinAnimationCount]Animation
+    Count int
+}
+
+const BuiltinFlatCount = 9
+const AnimationEndpointCount = BuiltinAnimationCount * 2
+
+// animdefs[] in upstream order. The prefix dispatch checks the first four
+// bytes; these words contain the remaining bytes of the two endpoints.
+const AnimationSuffixes = [BuiltinAnimationCount][2]int{
+    [2]int{0x00314547, 0x00334547}, // NUKAGE1..NUKAGE3
+    [2]int{0x00315245, 0x00345245}, // FWATER1..FWATER4
+    [2]int{0x00315245, 0x00345245}, // SWATER1..SWATER4
+    [2]int{0x31, 0x34}, // LAVA1..LAVA4
+    [2]int{0x3144, 0x3344}, // BLOOD1..BLOOD3
+    [2]int{0x0035304b, 0x0038304b}, // RROCK05..RROCK08
+    [2]int{0x00313045, 0x00343045}, // SLIME01..SLIME04
+    [2]int{0x00353045, 0x00383045}, // SLIME05..SLIME08
+    [2]int{0x00393045, 0x00323145}, // SLIME09..SLIME12
+    [2]int{0x00315247, 0x00345247}, // BLODGR1..BLODGR4
+    [2]int{0x31504952, 0x33504952}, // SLADRIP1..SLADRIP3
+    [2]int{0x31504952, 0x34504952}, // BLODRIP1..BLODRIP4
+    [2]int{0x414c4157, 0x4c4c4157}, // FIREWALA..FIREWALL
+    [2]int{0x31544e4f, 0x33544e4f}, // GSTFONT1..GSTFONT3
+    [2]int{0x3356414c, 0x4156414c}, // FIRELAV3..FIRELAVA
+    [2]int{0x3147414d, 0x3347414d}, // FIREMAG1..FIREMAG3
+    [2]int{0x31554c42, 0x32554c42}, // FIREBLU1..FIREBLU2
+    [2]int{0x31444552, 0x33444552}, // ROCKRED1..ROCKRED3
+    [2]int{0x314c, 0x344c}, // BFALL1..BFALL4
+    [2]int{0x314c, 0x344c}, // SFALL1..SFALL4
+    [2]int{0x314c, 0x344c}, // WFALL1..WFALL4
+    [2]int{0x00314e49, 0x00344e49}, // DBRAIN1..DBRAIN4
+}
+
+func animationEndpoint(high int, index int) int {
+    if high == AnimationSuffixes[index][0] { return index * 2 }
+    if high == AnimationSuffixes[index][1] { return index * 2 + 1 }
+    return -1
+}
+
+func flatEndpoint(name LumpName) int {
+    switch name.Low {
+    case 0x414b554e: return animationEndpoint(name.High, 0) // NUKA
+    case 0x54415746: return animationEndpoint(name.High, 1) // FWAT
+    case 0x54415753: return animationEndpoint(name.High, 2) // SWAT
+    case 0x4156414c: return animationEndpoint(name.High, 3) // LAVA
+    case 0x4f4f4c42: return animationEndpoint(name.High, 4) // BLOO
+    case 0x434f5252: return animationEndpoint(name.High, 5) // RROC
+    case 0x4d494c53: // SLIM
+        for delta := range 3 {
+            endpoint := animationEndpoint(name.High, 6 + delta)
+            if endpoint >= 0 { return endpoint }
+        }
+    }
+    return -1
+}
+
+func textureEndpoint(name LumpName) int {
+    // Every built-in prefix consists of four letters, so the case bit can
+    // be cleared for all four bytes before dispatch.
+    switch bits<32>(name.Low) & 0xdfdfdfdf {
+    case 0x444f4c42: // BLOD
+        high := upperWord(name.High)
+        endpoint := animationEndpoint(high, 9)
+        if endpoint >= 0 { return endpoint }
+        return animationEndpoint(high, 11)
+    case 0x44414c53: return animationEndpoint(upperWord(name.High), 10) // SLAD
+    case 0x45524946: // FIRE
+        high := upperWord(name.High)
+        wall := animationEndpoint(high, 12)
+        if wall >= 0 { return wall }
+        for delta := range 3 {
+            endpoint := animationEndpoint(high, 14 + delta)
+            if endpoint >= 0 { return endpoint }
+        }
+    case 0x46545347: return animationEndpoint(upperWord(name.High), 13) // GSTF
+    case 0x4b434f52: return animationEndpoint(upperWord(name.High), 17) // ROCK
+    case 0x4c414642: return animationEndpoint(upperWord(name.High), 18) // BFAL
+    case 0x4c414653: return animationEndpoint(upperWord(name.High), 19) // SFAL
+    case 0x4c414657: return animationEndpoint(upperWord(name.High), 20) // WFAL
+    case 0x41524244: return animationEndpoint(upperWord(name.High), 21) // DBRA
+    }
+    return -1
+}
+
+// LoadAnimations resolves P_InitPicAnims' complete built-in table once. An
+// absent endpoint skips its optional sequence, which permits partial IWAD/PWAD
+// test archives without turning a missing Doom II animation into a failure.
+func LoadAnimations(flats FlatSet, textures TextureSet) AnimationSet {
+    var indices [AnimationEndpointCount]int
+    // Store index+1 so that an unset endpoint still decodes to -1.
+    for flatIndex := range flats.Count {
+        lump := FlatLump(flats, flatIndex)
+        endpoint := flatEndpoint(lump.Name)
+        if endpoint >= 0 {
+            indices[endpoint] = 0
+            if lump.Valid { indices[endpoint] = flatIndex + 1 }
+        }
+    }
+    for textureIndex := range TextureCount(textures) {
+        lump, index := textures.First, textureIndex
+        if index >= textures.FirstCount {
+            lump, index = textures.Second, index - textures.FirstCount
+        }
+        offset := textureOffset(lump, index)
+        if offset >= 0 {
+            endpoint := textureEndpoint(lumpNameAt(lump.File, lump.Offset + offset))
+            if endpoint >= 0 && indices[endpoint] == 0 { indices[endpoint] = textureIndex + 1 }
+        }
+    }
+    result := AnimationSet{}
+    for index := range BuiltinAnimationCount {
+        animation := newAnimation(index >= BuiltinFlatCount, indices[index * 2] - 1, indices[index * 2 + 1] - 1)
+        if animation.Valid {
+            result.Ranges[result.Count] = animation
+            result.Count = result.Count + 1
+        }
+    }
+    return result
+}
+
+func newAnimation(texture bit, base int, last int) Animation {
+    count := last - base + 1
+    // P_InitPicAnims rejects cycles shorter than two frames. A missing optional
+    // episode sequence conventionally resolves to -1 and is simply skipped.
+    if base < 0 || last < base || count < 2 { return Animation{} }
+    return Animation{Base: base, Last: last, Count: count, Texture: texture, Valid: true}
+}
+
+func NewTextureAnimation(base int, last int) Animation { return newAnimation(true, base, last) }
+func NewFlatAnimation(base int, last int) Animation { return newAnimation(false, base, last) }
+
+// AnimationIndex is P_UpdateSpecials' translation assignment for a single
+// source index. The original global index, rather than index-Base, is part of
+// the modulo phase and must remain so for C-compatible animation timing.
+func AnimationIndex(animation Animation, originalIndex int, levelTime int) int {
+    if !animation.Valid || levelTime < 0 || originalIndex < animation.Base || originalIndex > animation.Last {
+        return originalIndex
+    }
+    return animation.Base + ((levelTime / AnimationTics + originalIndex) % animation.Count)
+}
+
+func AnimationTextureIndex(animation Animation, originalIndex int, levelTime int) int {
+    if !animation.Texture { return originalIndex }
+    return AnimationIndex(animation, originalIndex, levelTime)
+}
+
+func AnimationFlatIndex(animation Animation, originalIndex int, levelTime int) int {
+    if animation.Texture { return originalIndex }
+    return AnimationIndex(animation, originalIndex, levelTime)
+}
+
+func AnimatedTextureIndex(animations AnimationSet, index int, gameTic int) int {
+    for delta := range animations.Count {
+        animation := animations.Ranges[animations.Count - 1 - delta]
+        if animation.Texture && index >= animation.Base && index <= animation.Last {
+            return AnimationIndex(animation, index, gameTic)
+        }
+    }
+    return index
+}
+
+func AnimatedFlatIndex(animations AnimationSet, index int, gameTic int) int {
+    for delta := range animations.Count {
+        animation := animations.Ranges[animations.Count - 1 - delta]
+        if !animation.Texture && index >= animation.Base && index <= animation.Last {
+            return AnimationIndex(animation, index, gameTic)
+        }
+    }
+    return index
+}

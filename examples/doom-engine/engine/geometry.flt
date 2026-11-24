@@ -1,0 +1,113 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted on 2026-11-21 from linuxdoom-1.10/m_bbox.c and r_main.c.
+
+package engine
+
+import "numeric"
+
+const FracUnit = 65536
+const SubsectorFlag = 0x8000
+
+type Box struct {
+    Top int
+    Bottom int
+    Left int
+    Right int
+}
+
+func ClearBox() Box {
+    return Box{Top: -2147483648, Bottom: 2147483647, Left: 2147483647, Right: -2147483648}
+}
+
+// AddToBox preserves the mutually exclusive updates of M_AddToBox.
+func AddToBox(box Box, x int, y int) Box {
+    if x < box.Left { box.Left = x } else if x > box.Right { box.Right = x }
+    if y < box.Bottom { box.Bottom = y } else if y > box.Top { box.Top = y }
+    return box
+}
+
+// AddPointToBox expands both bounds independently, as R_AddPointToBox does.
+func AddPointToBox(box Box, x int, y int) Box {
+    if x < box.Left { box.Left = x }
+    if x > box.Right { box.Right = x }
+    if y < box.Bottom { box.Bottom = y }
+    if y > box.Top { box.Top = y }
+    return box
+}
+
+type Node struct {
+    X int
+    Y int
+    DeltaX int
+    DeltaY int
+    Front int
+    Back int
+    FrontBounds Box
+    BackBounds Box
+}
+
+type BspPartition struct {
+    X int
+    Y int
+    DeltaX int
+    DeltaY int
+    Front int
+    Back int
+}
+
+func (node Node) Partition() BspPartition {
+    return BspPartition{X: node.X, Y: node.Y, DeltaX: node.DeltaX, DeltaY: node.DeltaY,
+        Front: node.Front, Back: node.Back}
+}
+
+func (partition BspPartition) Side(x int, y int) int {
+    return cport.C_R_PointOnSide(x, y, partition.X, partition.Y, partition.DeltaX, partition.DeltaY)
+}
+
+func PointOnSide(x int, y int, node Node) int {
+    return cport.C_R_PointOnSide(x, y, node.X, node.Y, node.DeltaX, node.DeltaY)
+}
+
+func PointOnSegSide(x int, y int, fromX int, fromY int, toX int, toY int) int {
+    return cport.C_R_PointOnSide(x, y, fromX, fromY, toX - fromX, toY - fromY)
+}
+
+type NodeSource interface {
+    NodeCount() int
+    NodeAt(index int) Node
+}
+
+type PartitionSource interface {
+    NodeCount() int
+    PartitionAt(index int) BspPartition
+}
+
+type nodePartitions<T extends NodeSource> struct { Source T }
+
+func (nodes nodePartitions<T>) NodeCount() int { return nodes.Source.NodeCount() }
+func (nodes nodePartitions<T>) PartitionAt(index int) BspPartition { return nodes.Source.NodeAt(index).Partition() }
+
+func PointInSubsector<T extends NodeSource>(nodes T, subsectorCount int, x int, y int) int {
+    return PointInPartition(nodePartitions<T>{Source: nodes}, subsectorCount, x, y)
+}
+
+// The bounded walk returns -1 for invalid child references and cycles.
+func PointInPartition<T extends PartitionSource>(nodes T, subsectorCount int, x int, y int) int {
+    nodeCount := nodes.NodeCount()
+    if nodeCount < 0 || nodeCount > SubsectorFlag || subsectorCount < 1 || subsectorCount > SubsectorFlag { return -1 }
+    if nodeCount == 0 { return 0 }
+    child := nodeCount - 1
+    for range nodeCount {
+        if child < 0 || child >= nodeCount { return -1 }
+        partition := nodes.PartitionAt(child)
+        child = partition.Front
+        if partition.Side(x, y) == 1 { child = partition.Back }
+        if child >= SubsectorFlag && child < 2 * SubsectorFlag {
+            leaf := child - SubsectorFlag
+            if leaf < subsectorCount { return leaf }
+            return -1
+        }
+    }
+    return -1
+}

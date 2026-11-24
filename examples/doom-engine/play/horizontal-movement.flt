@@ -1,0 +1,232 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted from P_XYMovement in linuxdoom-1.10/p_mobj.c.
+
+package play
+
+import "engine"
+import "numeric"
+import "wad"
+
+const MoveCorpse = 0x100000
+const maxMove = 30 * engine.FracUnit
+const stopSpeed = 0x1000
+const groundFriction = 0xe800
+const maxHorizontalSteps = 2
+const maxSlideAttempts = 2
+
+type HorizontalMove struct {
+    Valid bit
+    Actor ActorPhysics
+    Event int
+    StopWalking bit
+    CrossingCount int
+    Crossings PagedSlots<SpecialCrossing>
+    Level wad.BspLevel
+    Doors LevelDoors
+    Lighting LevelLightStep
+    Floors LevelFloors
+    Ceilings LevelCeilings
+    ExitRequested bit
+    SecretExit bit
+    DispatchSpecials bit
+    Contacts PlayerContacts
+    Teleported bit
+    TeleportEyeZ int
+    DamageSound int
+    LastAllowed bit
+    LastCeilingLine int
+}
+
+func recordHorizontalMove(result HorizontalMove, step MapMove) HorizontalMove {
+    result.LastAllowed, result.LastCeilingLine = step.Allowed, step.Position.CeilingLine
+    if !step.Position.Valid { result.Valid = false }
+    if step.Allowed {
+        result.Actor.Body = step.Actor
+        for i := range step.CrossingCount {
+            crossing := step.Crossings.At(i)
+            result.Crossings = result.Crossings.With(result.CrossingCount + i, crossing)
+            if result.DispatchSpecials && result.Contacts.Handle <= 0 {
+                count, consumed := result.Doors.Count, result.Doors.UsedCount
+                before := LevelSpecials{Doors: result.Doors, Lighting: result.Lighting, Floors: result.Floors,
+                    Ceilings: result.Ceilings, ExitRequested: result.ExitRequested, SecretExit: result.SecretExit}
+                applied := CrossLevelSpecial(result.Level, before, crossing.Line)
+                result.Doors, result.Lighting, result.Floors, result.Ceilings = applied.Doors, applied.Lighting, applied.Floors, applied.Ceilings
+                result.ExitRequested, result.SecretExit = applied.ExitRequested, applied.SecretExit
+                if result.Doors.Count != count || result.Doors.UsedCount != consumed ||
+                    result.Floors.Count != before.Floors.Count || result.Floors.Revision != before.Floors.Revision ||
+                    result.Floors.ClearedSpecials.Count != before.Floors.ClearedSpecials.Count ||
+                    result.Ceilings.Count != before.Ceilings.Count {
+                    result.Level = applied.ApplyTo(result.Level)
+                }
+            }
+        }
+        result.CrossingCount = result.CrossingCount + step.CrossingCount
+    }
+    return result
+}
+
+func applyPlayerWalkovers(blockMap wad.BlockMapInfo, result HorizontalMove, move MapMove, old MapActor) HorizontalMove {
+    contacts := result.Contacts
+    var players [wad.VanillaPlayers]PlayerInventory
+    players[0] = contacts.Inventory
+    world := CombatWorld{Actors: contacts.Actors, Links: contacts.Links, Players: players,
+        Random: result.Lighting.Random, AttackRange: contacts.AttackRange}
+    state := LevelSpecials{Doors: result.Doors, Lighting: result.Lighting, Floors: result.Floors,
+        Ceilings: result.Ceilings, ExitRequested: result.ExitRequested, SecretExit: result.SecretExit}
+    rules := CombatRules{Skill: contacts.Rules.Skill, Fast: contacts.FastMonsters}
+    var actions WalkoverTelefrag = DefaultWalkoverTelefrag{}
+    if contacts.CustomTelefrag { actions = contacts.Telefrag }
+    crossed := CrossActorMove(blockMap, WalkoverState{Level: result.Level, Specials: state, World: world, Callback: contacts.Callback},
+        contacts.Handle, old.X, old.Y, move.Position, rules, actions)
+    if crossed.Failed { result.Valid = false; return result }
+    move.Actor = crossed.World.Actors.ActorAt(contacts.Handle - 1).Physics.Body
+    move.Crossings, move.CrossingCount = crossed.Crossings, crossed.Count
+    result.Actor = crossed.World.Actors.ActorAt(contacts.Handle - 1).Physics
+    result.Level = crossed.Level
+    state = crossed.Specials
+    result.Doors, result.Lighting, result.Floors, result.Ceilings = state.Doors, state.Lighting, state.Floors, state.Ceilings
+    result.ExitRequested, result.SecretExit = state.ExitRequested, state.SecretExit
+    result.Contacts.Actors, result.Contacts.Links = crossed.World.Actors, crossed.World.Links
+    result.Contacts.Inventory, result.Contacts.AttackRange = crossed.World.Players[0], crossed.World.AttackRange
+    result.Contacts.Callback = crossed.Callback
+    if crossed.DamageSound != 0 { result.DamageSound = crossed.DamageSound }
+    if crossed.Teleported { result.Teleported, result.TeleportEyeZ = true, crossed.EyeZ }
+    return recordHorizontalMove(result, move)
+}
+
+func tryHorizontalMove(blockMap wad.BlockMapInfo, result HorizontalMove, x int, y int) HorizontalMove {
+    body := result.Actor.Body
+    if result.Contacts.Handle <= 0 {
+        return recordHorizontalMove(result, TryMapMove(result.Level, blockMap, body, x, y))
+    }
+    check := checkPlayerPosition(result.Level, blockMap, body, result.Contacts, x, y)
+    result.Contacts, result.Actor.Body = check.Contacts, check.Body
+    move := finishTryMapMove(result.Level, check.Body, x, y, check.Position)
+    if move.Allowed {
+        handle := result.Contacts.Handle
+        actor := result.Contacts.Actors.ActorAt(handle - 1)
+        actor.Physics = result.Actor
+        actor.Physics.Body = move.Actor
+        linked := result.Contacts.Links.SetActorPosition(result.Level, handle, actor)
+        if !linked.Valid { result.Valid = false; return result }
+        result.Contacts.Actors = result.Contacts.Actors.WithActor(handle, linked.Actor)
+        result.Contacts.Links, result.Contacts.LinksChanged = linked.Links, true
+        if result.DispatchSpecials && move.Position.SpecialCount > 0 { return applyPlayerWalkovers(blockMap, result, move, body) }
+    }
+    return recordHorizontalMove(result, move)
+}
+
+func capMomentum(momentum int) int {
+    if momentum > maxMove { return maxMove }
+    if momentum < -maxMove { return -maxMove }
+    return momentum
+}
+
+type HorizontalSubstep struct {
+    X int
+    Y int
+    RemainingX int
+    RemainingY int
+}
+
+func splitMomentum(x int, y int) HorizontalSubstep {
+    // Doom subdivides only a positive component above half of MAXMOVE.
+    // Division truncates toward zero, whereas the remaining shift rounds down.
+    if x > maxMove / 2 || y > maxMove / 2 {
+        return HorizontalSubstep{X: x / 2, Y: y / 2, RemainingX: x >> 1, RemainingY: y >> 1}
+    }
+    return HorizontalSubstep{X: x, Y: y}
+}
+
+func applyGroundFriction(result HorizontalMove, command PlayerMoveCommand, noMomentum bit) HorizontalMove {
+    actor := result.Actor
+    if actor.Body.Player && noMomentum {
+        result.Actor.MomentumX, result.Actor.MomentumY = 0, 0
+        return result
+    }
+    if actor.Body.Flags & (MoveMissile | MoveSkullFly) != 0 || actor.Body.Z > actor.Body.Floor { return result }
+
+    x, y := actor.MomentumX, actor.MomentumY
+    quarter := engine.FracUnit / 4
+    if actor.Body.Flags & MoveCorpse != 0 && (x > quarter || x < -quarter || y > quarter || y < -quarter) {
+        sector := result.Level.SectorAtPoint(actor.Body.X, actor.Body.Y)
+        if !sector.Valid { result.Valid = false; return result }
+        if actor.Body.Floor != sector.Heights.Floor { return result }
+    }
+    if x > -stopSpeed && x < stopSpeed && y > -stopSpeed && y < stopSpeed &&
+        (!actor.Body.Player || (command.Forward == 0 && command.Side == 0)) {
+        result.Actor.MomentumX, result.Actor.MomentumY = 0, 0
+        result.StopWalking = actor.Body.Player
+    } else {
+        result.Actor.MomentumX = cport.C_FixedMul(x, groundFriction)
+        result.Actor.MomentumY = cport.C_FixedMul(y, groundFriction)
+    }
+    return result
+}
+
+// MoveHorizontally runs the terrain portion of P_XYMovement and reports
+// crossings for callers which only need the movement calculation.
+func MoveHorizontally(level wad.BspLevel, blockMap wad.BlockMapInfo, actor ActorPhysics, command PlayerMoveCommand, noMomentum bit) HorizontalMove {
+    return moveHorizontally(blockMap, HorizontalMove{Valid: true, Actor: actor, Level: level}, command, noMomentum)
+}
+
+func MoveHorizontallyWithDoors(level wad.BspLevel, blockMap wad.BlockMapInfo, actor ActorPhysics, command PlayerMoveCommand,
+    doors LevelDoors) HorizontalMove {
+    return MoveHorizontallyWithSpecials(level, blockMap, actor, command, LevelSpecials{Doors: doors})
+}
+
+// Apply player walkover specials at each accepted P_TryMove, including split
+// and sliding moves. The next attempt sees any consumed action immediately.
+func MoveHorizontallyWithSpecials(level wad.BspLevel, blockMap wad.BlockMapInfo, actor ActorPhysics, command PlayerMoveCommand,
+    state LevelSpecials) HorizontalMove {
+    return MovePlayerWithContacts(level, blockMap, actor, command, state, PlayerContacts{})
+}
+
+func MovePlayerWithContacts(level wad.BspLevel, blockMap wad.BlockMapInfo, actor ActorPhysics, command PlayerMoveCommand,
+    state LevelSpecials, contacts PlayerContacts) HorizontalMove {
+    return moveHorizontally(blockMap, HorizontalMove{Valid: true, Actor: actor, Level: level,
+        Doors: state.Doors, Lighting: state.Lighting, Floors: state.Floors, Ceilings: state.Ceilings,
+        ExitRequested: state.ExitRequested, SecretExit: state.SecretExit, DispatchSpecials: actor.Body.Player, Contacts: contacts},
+        command, contacts.Inventory.Cheats & CheatNoMomentum != 0)
+}
+
+func moveHorizontally(blockMap wad.BlockMapInfo, result HorizontalMove, command PlayerMoveCommand, noMomentum bit) HorizontalMove {
+    actor := result.Actor
+    if actor.MomentumX == 0 && actor.MomentumY == 0 {
+        if actor.Body.Flags & MoveSkullFly != 0 {
+            result.Actor.Body.Flags = actor.Body.Flags & ~bits<32>(MoveSkullFly)
+            result.Actor.MomentumZ = 0
+            result.Event = MotionResetSkull
+        }
+        return result
+    }
+    mx, my := capMomentum(actor.MomentumX), capMomentum(actor.MomentumY)
+    result.Actor.MomentumX, result.Actor.MomentumY = mx, my
+    for range maxHorizontalSteps {
+        if mx == 0 && my == 0 { return applyGroundFriction(result, command, noMomentum) }
+        split := splitMomentum(mx, my)
+        mx, my = split.RemainingX, split.RemainingY
+
+        body := result.Actor.Body
+        result = tryHorizontalMove(blockMap, result, body.X + split.X, body.Y + split.Y)
+        if !result.Valid { return result }
+        if !result.LastAllowed {
+            if body.Player {
+                result = slideMove(blockMap, result)
+                if !result.Valid { return result }
+            } else if body.Flags & MoveMissile != 0 {
+                blocker := result.Level.LineAt(result.LastCeilingLine)
+                if blocker.Valid && result.Level.SectorHasSkyCeiling(blocker.BackSector) {
+                    result.Event = MotionRemoveMissile
+                    return result
+                }
+                result.Actor = stopMissile(result.Actor)
+                result.Event = MotionExplodeMissile
+            } else {
+                result.Actor.MomentumX, result.Actor.MomentumY = 0, 0
+            }
+        }
+    }
+    return applyGroundFriction(result, command, noMomentum)
+}

@@ -1,0 +1,55 @@
+package main
+
+import "engine"
+import "walls"
+
+const Width = 96
+const Height = 72
+const Unit = engine.FracUnit
+const EyeHeight = 32 * Unit
+
+type Scene struct {
+    View engine.ViewProjection
+    Closed bit
+}
+
+func (scene Scene) NodeCount() int { return 1 }
+func (scene Scene) SubsectorCount() int { return 2 }
+
+func (scene Scene) NodeAt(index int) engine.Node {
+    return engine.Node{
+        X: 96 * Unit, DeltaY: Unit,
+        Front: engine.SubsectorFlag + 1, Back: engine.SubsectorFlag,
+        FrontBounds: engine.Box{Left: 128 * Unit, Right: 144 * Unit, Bottom: -160 * Unit, Top: 160 * Unit},
+        BackBounds: engine.Box{Left: 48 * Unit, Right: 80 * Unit, Bottom: -160 * Unit, Top: 160 * Unit},
+    }
+}
+
+func (scene Scene) DrawSubsector(index int, coverage engine.ColumnCoverage) engine.ColumnCoverage {
+    depth, halfWidth, shade := 128 * Unit, 160 * Unit, color.Blue
+    if index == 0 {
+        depth, halfWidth, shade = 64 * Unit, 16 * Unit, color.Orange
+        if scene.Closed { halfWidth = 160 * Unit }
+    }
+    camera := engine.Camera{Z: EyeHeight, View: scene.View}
+    return walls.DrawSolidWall(camera, coverage,
+        engine.Vertex{X: depth, Y: halfWidth}, engine.Vertex{X: depth, Y: -halfWidth},
+        0xc0000000, engine.SectorHeights{Ceiling: 64 * Unit}, Height, shade)
+}
+
+map "Original BSP Walls" {
+    screen at (-48, -36) size (Width, Height) with { style = "solid", hold = true }
+    place scriptBlock at (-51, 41) with { code = "onStart(() => game.focusCamera(-53, -42, 52, 45));" }
+    input closeWall bit at (0, 39)
+    register drawn bit = false
+    register closed bit = false
+    tick {
+        if !drawn || closed != closeWall {
+            view := engine.NewViewProjection(Width)
+            coverage := engine.RenderBsp(Scene{View: view, Closed: closeWall}, view, 0, 0, 0)
+            if coverage.Failed { log("BSP rendering failed") }
+            next closed = closeWall
+            next drawn = true
+        }
+    }
+}

@@ -1,0 +1,114 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Platform activation and registry from linuxdoom-1.10 p_plats.c.
+
+package play
+
+import "wad"
+
+const MaxActivePlatforms = 30
+const platformStop = -1
+
+type PlatformAction struct {
+    Mode int
+    Amount int
+    Once bit
+}
+
+func usePlatformAction(special int) PlatformAction {
+    switch special {
+    case 14, 67: return PlatformAction{Mode: PlatformRaiseAndChange, Amount: 32, Once: special == 14}
+    case 15, 66: return PlatformAction{Mode: PlatformRaiseAndChange, Amount: 24, Once: special == 15}
+    case 20, 68: return PlatformAction{Mode: PlatformRaiseNearestAndChange, Once: special == 20}
+    case 21, 62: return PlatformAction{Mode: PlatformDownWaitUpStay, Once: special == 21}
+    case 122, 123: return PlatformAction{Mode: PlatformBlazeDownWaitUpStay, Once: special == 122}
+    }
+    return PlatformAction{}
+}
+
+func walkPlatformAction(special int) PlatformAction {
+    switch special {
+    case 10, 88: return PlatformAction{Mode: PlatformDownWaitUpStay, Once: special == 10}
+    case 22, 95: return PlatformAction{Mode: PlatformRaiseNearestAndChange, Once: special == 22}
+    case 53, 87: return PlatformAction{Mode: PlatformPerpetual, Once: special == 53}
+    case 54, 89: return PlatformAction{Mode: platformStop, Once: special == 54}
+    case 120, 121: return PlatformAction{Mode: PlatformBlazeDownWaitUpStay, Once: special == 121}
+    }
+    return PlatformAction{}
+}
+
+// A stopped platform retains both its sector and its slot in activeplats.
+// The perpetual action reactivates every stopped platform of the same tag.
+func (floors LevelFloors) setPlatformStasis(level wad.BspLevel, tag int, stopped bit) LevelFloors {
+    handle := floors.First()
+    for range floors.Count {
+        entry := floors.EntryAt(handle)
+        motion := entry.Platform
+        if motion.Active && level.SectorTag(entry.Sector) == tag {
+            if stopped && motion.Status != PlatformStasis {
+                motion.OldStatus, motion.Status = motion.Status, PlatformStasis
+            } else if !stopped && motion.Status == PlatformStasis {
+                motion.Status = motion.OldStatus
+            }
+            entry.Platform = motion
+            floors = floors.withEntry(handle, entry)
+        }
+        handle = floors.Following(handle)
+    }
+    return floors
+}
+
+func startTaggedPlatforms(level wad.BspLevel, state LevelSpecials, line wad.CollisionLine,
+    action PlatformAction) TaggedFloorStart {
+    if action.Mode == PlatformPerpetual { state.Floors = state.Floors.setPlatformStasis(level, line.Tag, false) }
+    started := false
+    for sector := range level.Sectors.Count {
+        if level.SectorTag(sector) == line.Tag && !state.MoverOccupied(sector) {
+            neighborMode := FloorRaiseNearest
+            if action.Mode == PlatformRaiseAndChange { neighborMode = FloorRaise24 }
+            adjacent := resolveFloorNeighbors(level, sector, neighborMode, wad.TextureSet{}).Setup
+            random := 0
+            if action.Mode == PlatformPerpetual {
+                roll := PRandom(state.Lighting.Random)
+                state.Lighting.Random, random = roll.State, int(roll.Value)
+            }
+            motion := StartPlatform(action.Mode, adjacent.Height, adjacent.LowestFloor,
+                adjacent.HighestFloor, adjacent.NextFloor, action.Amount, random)
+            state = state.queueFloorEntry(SectorFloor{Sector: sector, Platform: motion})
+            if action.Mode == PlatformRaiseAndChange || action.Mode == PlatformRaiseNearestAndChange {
+                surface := state.floorSurface(level, sector)
+                surface.Flat = state.floorSurface(level, line.FrontSector).Flat
+                if action.Mode == PlatformRaiseNearestAndChange { surface.Special = 0 }
+                state.Floors = state.Floors.withSurface(sector, surface)
+                state.Floors.Revision = state.Floors.Revision + 1
+            }
+            state.Doors.Sounds = state.Doors.Sounds.add(platformStartSound(action.Mode), sector)
+            // EV_DoPlat sets up the sector and starts its sound before P_AddActivePlat.
+            if state.Floors.ActivePlatforms == MaxActivePlatforms {
+                state.Floors.PlatformOverflow = true
+                return TaggedFloorStart{State: state}
+            }
+            state.Floors.ActivePlatforms = state.Floors.ActivePlatforms + 1
+            started = true
+        }
+    }
+    return TaggedFloorStart{State: state, Started: started}
+}
+
+func activatePlatformLine(level wad.BspLevel, state LevelSpecials, index int, line wad.CollisionLine,
+    action PlatformAction, use bit) LevelSpecials {
+    started := false
+    if action.Mode == platformStop {
+        state.Floors = state.Floors.setPlatformStasis(level, line.Tag, true)
+    } else {
+        activation := startTaggedPlatforms(level, state, line, action)
+        state, started = activation.State, activation.Started
+        if state.Floors.PlatformOverflow { return state }
+    }
+    if use {
+        if started { state.Doors = changeLineSwitch(level, state.Doors, index, action.Once) }
+    } else if action.Once {
+        state.Doors = state.Doors.consumeLine(index)
+    }
+    return state
+}

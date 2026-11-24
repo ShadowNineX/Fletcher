@@ -1,0 +1,30 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Indexed equivalent of the reverse name lookup in linuxdoom-1.10/w_wad.c.
+
+package wad
+
+func (mounts Archives) IndexKey(index int) indexKey {
+    source, found := mounts.sourceAt(index)
+    if !found { return indexKey{} }
+    if source.Directory < 0 { return indexKey{Name: source.SingleName, Found: true} }
+    entry := source.Directory + (index - source.First) * DirectoryEntrySize
+    return indexKey{Name: lumpNameAt(source.File, entry + 8), Found: true}
+}
+
+func (mounts Archives) CanIndex() bit { return !mounts.Failed }
+
+func (mounts Archives) IndexReady() bit { return !mounts.Failed && mounts.indexed == mounts.Lumps }
+
+// BuildIndex adds at most batch directory entries. Find retains the reverse
+// scan until every entry is indexed. Appending a WAD extends the same prefix.
+func (mounts Archives) BuildIndex(batch int) Archives {
+    if !mounts.CanIndex() || mounts.IndexReady() || batch <= 0 { return mounts }
+    count := mounts.Lumps - mounts.indexed
+    if batch < count { count = batch }
+    var directory nameIndexRef = mounts.directory
+    if mounts.indexed == 0 { directory = newNameIndex() }
+    // The last entry wins, including entries with malformed extents.
+    mounts.directory = directory.Extend(mounts, mounts.indexed, count, true)
+    mounts.indexed = mounts.indexed + count
+    return mounts
+}

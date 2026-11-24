@@ -1,0 +1,96 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted on 2026-11-21 from P_GroupLines in linuxdoom-1.10/p_setup.c.
+
+package wad
+
+import "engine"
+
+const SectorLineRadius = 32 << 16
+
+type SectorBlockBox struct {
+    Top int
+    Bottom int
+    Left int
+    Right int
+    Valid bit
+}
+
+// SectorLineInfo is the derived P_GroupLines state for one sector. Membership
+// is enumerated lazily through SectorLineAt rather than stored in a capped
+// per-sector buffer.
+type SectorLineInfo struct {
+    Bounds engine.Box
+    SoundX int
+    SoundY int
+    Count int
+    Block SectorBlockBox
+    Valid bit
+}
+
+func lineInSector(line CollisionLine, sector int) bit {
+    return line.Valid && (line.FrontSector == sector || line.BackSector == sector)
+}
+
+// SectorLineCount follows P_GroupLines: a two-sided line whose front and back
+// side are the same sector is counted once.
+func (level BspLevel) SectorLineCount(sector int) int {
+    if sector < 0 || sector >= level.Sectors.Count { return -1 }
+    count := 0
+    for index := range level.Lines.Count {
+        line := level.LineAt(index)
+        if !line.Valid { return -1 }
+        if lineInSector(line, sector) { count = count + 1 }
+    }
+    return count
+}
+
+// SectorLineAt returns the global linedef index at a sector-local ordinal.
+func (level BspLevel) SectorLineAt(sector int, ordinal int) int {
+    if ordinal < 0 || sector < 0 || sector >= level.Sectors.Count { return -1 }
+    current := 0
+    for index := range level.Lines.Count {
+        line := level.LineAt(index)
+        if !line.Valid { return -1 }
+        if lineInSector(line, sector) {
+            if current == ordinal { return index }
+            current = current + 1
+        }
+    }
+    return -1
+}
+
+func clipSectorBlock(blockMap BlockMapInfo, bounds engine.Box) SectorBlockBox {
+    if !blockMap.Valid { return SectorBlockBox{} }
+    top := (bounds.Top - blockMap.OriginY + SectorLineRadius) >> MapBlockShift
+    if top >= blockMap.Height { top = blockMap.Height - 1 }
+    bottom := (bounds.Bottom - blockMap.OriginY - SectorLineRadius) >> MapBlockShift
+    if bottom < 0 { bottom = 0 }
+    right := (bounds.Right - blockMap.OriginX + SectorLineRadius) >> MapBlockShift
+    if right >= blockMap.Width { right = blockMap.Width - 1 }
+    left := (bounds.Left - blockMap.OriginX - SectorLineRadius) >> MapBlockShift
+    if left < 0 { left = 0 }
+    return SectorBlockBox{Top: top, Bottom: bottom, Left: left, Right: right, Valid: true}
+}
+
+// SectorLineInfo derives one sector's P_GroupLines setup data without mutable
+// game state: bounds, sound origin, and collision block clipping.
+func (level BspLevel) SectorLineInfo(sector int) SectorLineInfo {
+    if sector < 0 || sector >= level.Sectors.Count { return SectorLineInfo{Count: -1} }
+    bounds := engine.ClearBox()
+    count := 0
+    for index := range level.Lines.Count {
+        line := level.LineAt(index)
+        if !line.Valid { return SectorLineInfo{Count: -1} }
+        if lineInSector(line, sector) {
+            count = count + 1
+            bounds = engine.AddToBox(bounds, line.First.X, line.First.Y)
+            bounds = engine.AddToBox(bounds, line.Last.X, line.Last.Y)
+        }
+    }
+    if count == 0 { return SectorLineInfo{} }
+    return SectorLineInfo{
+        Bounds: bounds, SoundX: (bounds.Right + bounds.Left) / 2, SoundY: (bounds.Top + bounds.Bottom) / 2,
+        Count: count, Block: clipSectorBlock(LoadBlockMap(level), bounds), Valid: true,
+    }
+}

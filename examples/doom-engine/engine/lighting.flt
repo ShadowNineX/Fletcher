@@ -1,0 +1,69 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted on 2026-11-21 from linuxdoom-1.10/r_main.c and r_plane.c.
+
+package engine
+
+// These are the renderer constants used by the original 320-pixel-wide Doom
+// viewport.  A row is an index into a 256-byte COLORMAP table.
+const LightLevels = 16
+const LightSegShift = 4
+const NumColorMaps = 32
+const MaxLightZ = 128
+const LightZShift = 20
+const MaxLightScale = 48
+const LightScaleShift = 12
+const DoomScreenWidth = 320
+const DistanceMap = 2
+const PlaneLightTableOffset = LightLevels * MaxLightScale
+const LightTableBytes = PlaneLightTableOffset + LightLevels * MaxLightZ
+
+func clamp(value int, low int, high int) int {
+    if value < low { return low }
+    if value > high { return high }
+    return value
+}
+
+// LightBand is R_DrawPlanes's `(lightlevel >> LIGHTSEGSHIFT) + extralight`,
+// clamped before indexing zlight/scalelight.
+func LightBand(sectorLight int, extraLight int) int {
+    return clamp((sectorLight >> LightSegShift) + extraLight, 0, LightLevels - 1)
+}
+
+func lightStartMap(band int) int {
+    return ((LightLevels - 1 - band) * 2) * NumColorMaps / LightLevels
+}
+
+// PlaneDistanceIndex is R_MapPlane's unsigned distance lookup.  Plane
+// distances are non-negative in normal rendering; a negative input retains C's
+// unsigned conversion result and therefore selects the farthest row.
+func PlaneDistanceIndex(distance int) int {
+    if distance < 0 { return MaxLightZ - 1 }
+    return clamp(distance >> LightZShift, 0, MaxLightZ - 1)
+}
+
+// PlaneLightRow selects the COLORMAP row for one flat span.  It combines
+// R_DrawPlanes's light-band selection with R_InitLightTables' zlight formula.
+func PlaneLightRow(sectorLight int, extraLight int, distance int) int {
+    index := PlaneDistanceIndex(distance)
+    // The 16.16 quotient and the scale shift cancel exactly here.
+    // FRACUNIT squared equals 1 << (LightZShift + LightScaleShift).
+    scale := (DoomScreenWidth / 2) / (index + 1)
+    return clamp(lightStartMap(LightBand(sectorLight, extraLight)) - scale / DistanceMap, 0, NumColorMaps - 1)
+}
+
+// WallScaleIndex is R_RenderSegLoop's unsigned rw_scale lookup.  It accepts
+// the fixed-point scale emitted by ScaleFromAngle/ScaleWallSpan.
+func WallScaleIndex(scale int) int {
+    if scale < 0 { return MaxLightScale - 1 }
+    return clamp(scale >> LightScaleShift, 0, MaxLightScale - 1)
+}
+
+// WallLightRow selects the COLORMAP row for one wall column. viewWidth and
+// detailShift are exactly the values set by R_ExecuteSetViewSize.
+func WallLightRow(sectorLight int, extraLight int, scale int, viewWidth int, detailShift int) int {
+    if viewWidth <= 0 { return 0 }
+    index := WallScaleIndex(scale)
+    denominator := (viewWidth << detailShift) * DistanceMap
+    return clamp(lightStartMap(LightBand(sectorLight, extraLight)) - index * DoomScreenWidth / denominator, 0, NumColorMaps - 1)
+}

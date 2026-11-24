@@ -1,0 +1,247 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted from P_AimLineAttack, P_LineAttack and their traversers in p_map.c.
+
+package play
+
+import "engine"
+import "numeric"
+import "wad"
+
+const shotVerticalLimit = 100 * engine.FracUnit / 160
+const shotTwoSided = 4
+const gunAttackRange = 32 * 64 * engine.FracUnit
+const ActorNoBlood = 0x80000
+
+const ShotSpecial = 1
+const ShotPuff = 2
+const ShotBlood = 3
+const ShotSky = 4
+
+type LineAim struct {
+    Valid bit
+    Target int
+    Slope int
+}
+
+type ShotImpact struct {
+    X int
+    Y int
+    Z int
+    Line int
+    Target int
+    EffectActor int
+}
+
+type LineAttackStep struct {
+    Combat CombatStep
+    Done bit
+    Event int
+    SpecialLine int
+    Impact ShotImpact
+    Hit DamageRequest
+    path AttackTrace
+    index int
+    shooter int
+    shootZ int
+    distance int
+    slope int
+    amount int
+    pendingLine bit
+    stopped bit
+}
+
+func traceLineAttack(level wad.BspLevel, blocks wad.BlockMapInfo, world CombatWorld, actor MapActor,
+    heading bits<32>, distance int) AttackTrace {
+    units := distance >> 16
+    x := actor.X + units * engine.AngleCosine(heading)
+    y := actor.Y + units * engine.AngleSine(heading)
+    return TraceAttackPath(level, blocks, world, actor.X, actor.Y, x, y)
+}
+
+func shotHeight(actor MapActor) int { return actor.Z + (actor.Height >> 1) + 8 * engine.FracUnit }
+
+// The opening records height differences separately. Equal floor or ceiling
+// heights let that side of the vertical range pass without clipping.
+type ShotOpening struct {
+    Valid bit
+    Bottom int
+    Top int
+    FloorChanged bit
+    CeilingChanged bit
+}
+
+func shotOpening(level wad.BspLevel, line wad.CollisionLine) ShotOpening {
+    if !line.Valid || line.BackSector < 0 { return ShotOpening{} }
+    front := level.SectorHeightsAt(line.FrontSector)
+    back := level.SectorHeightsAt(line.BackSector)
+    bottom, top := front.Floor, front.Ceiling
+    if back.Floor > bottom { bottom = back.Floor }
+    if back.Ceiling < top { top = back.Ceiling }
+    return ShotOpening{Valid: true, Bottom: bottom, Top: top, FloorChanged: front.Floor != back.Floor,
+        CeilingChanged: front.Ceiling != back.Ceiling}
+}
+
+func AimLineAttack(level wad.BspLevel, blocks wad.BlockMapInfo, world CombatWorld, shooter int,
+    heading bits<32>, distance int) LineAim {
+    actor := world.Actors.ActorAt(shooter - 1)
+    if !actor.Valid || distance <= 0 { return LineAim{} }
+    path := traceLineAttack(level, blocks, world, actor.Physics.Body, heading, distance)
+    if !path.Valid { return LineAim{} }
+    shootZ := shotHeight(actor.Physics.Body)
+    bottom, top := -shotVerticalLimit, shotVerticalLimit
+    for index := range path.Count {
+        hit := path.Hits.At(index)
+        if hit.Fraction > engine.FracUnit { return LineAim{Valid: true} }
+        dist := cport.C_FixedMul(distance, hit.Fraction)
+        if hit.IsLine {
+            line := level.LineAt(hit.Index)
+            if !line.Valid { return LineAim{} }
+            if line.Flags & shotTwoSided == 0 { return LineAim{Valid: true} }
+            portal := shotOpening(level, line)
+            if !portal.Valid { return LineAim{} }
+            if portal.Bottom >= portal.Top { return LineAim{Valid: true} }
+            if portal.FloorChanged {
+                slope := cport.C_FixedDiv(portal.Bottom - shootZ, dist)
+                if slope > bottom { bottom = slope }
+            }
+            if portal.CeilingChanged {
+                slope := cport.C_FixedDiv(portal.Top - shootZ, dist)
+                if slope < top { top = slope }
+            }
+            if top <= bottom { return LineAim{Valid: true} }
+        } else {
+            target := world.Actors.ActorAt(hit.Index - 1)
+            body := target.Physics.Body
+            if target.Valid && hit.Index != shooter && body.Flags & ActorShootable != 0 {
+                targetTop := cport.C_FixedDiv(body.Z + body.Height - shootZ, dist)
+                targetBottom := cport.C_FixedDiv(body.Z - shootZ, dist)
+                if targetTop >= bottom && targetBottom <= top {
+                    if targetTop > top { targetTop = top }
+                    if targetBottom < bottom { targetBottom = bottom }
+                    return LineAim{Valid: true, Target: hit.Index, Slope: (targetTop + targetBottom) / 2}
+                }
+            }
+        }
+    }
+    return LineAim{Valid: true}
+}
+
+func shotPosition(step LineAttackStep, fraction int, backoff int) ShotImpact {
+    fraction = fraction - cport.C_FixedDiv(backoff * engine.FracUnit, step.distance)
+    ray := step.path.Ray
+    return ShotImpact{X: ray.X + cport.C_FixedMul(ray.DeltaX, fraction),
+        Y: ray.Y + cport.C_FixedMul(ray.DeltaY, fraction),
+        Z: step.shootZ + cport.C_FixedMul(step.slope, cport.C_FixedMul(fraction, step.distance)), Line: -1}
+}
+
+func spawnLineImpact(level wad.BspLevel, step LineAttackStep, blood bit, rules CombatRules) LineAttackStep {
+    impact := step.Impact
+    spawned := SpawnShotEffect(level, step.Combat.World, impact.X, impact.Y, impact.Z, blood, step.amount, step.distance, rules)
+    step.stopped, step.Done = true, true
+    if !spawned.Valid { step.Combat.Failed = true; return step }
+    step.Impact.EffectActor = spawned.Handle
+    step.Combat.World = spawned.World
+    step.Event = ShotPuff
+    if blood { step.Event = ShotBlood }
+    if impact.Target > 0 && step.amount != 0 {
+        step.Hit = DamageRequest{Target: impact.Target, Inflictor: step.shooter, Source: step.shooter, Amount: step.amount}
+        step.Combat = DamageMobj(level, spawned.World, step.Hit, rules)
+        step.Done = step.Combat.State.Action == 0
+    }
+    return step
+}
+
+func shootPastLine(level wad.BspLevel, step LineAttackStep, line wad.CollisionLine, hit wad.PathIntercept) LineAttackStep {
+    if line.Flags & shotTwoSided != 0 {
+        portal := shotOpening(level, line)
+        if !portal.Valid { step.Combat.Failed = true; return step }
+        distance := cport.C_FixedMul(step.distance, hit.Fraction)
+        blocked := portal.FloorChanged && cport.C_FixedDiv(portal.Bottom - step.shootZ, distance) > step.slope ||
+            portal.CeilingChanged && cport.C_FixedDiv(portal.Top - step.shootZ, distance) < step.slope
+        if !blocked { return step }
+    }
+    step.Impact = shotPosition(step, hit.Fraction, 4)
+    step.Impact.Line = hit.Index
+    if level.SectorHasSkyCeiling(line.FrontSector) &&
+        (step.Impact.Z > level.SectorHeightsAt(line.FrontSector).Ceiling || level.SectorHasSkyCeiling(line.BackSector)) {
+        step.Event, step.stopped, step.Done = ShotSky, true, true
+    }
+    return step
+}
+
+func BeginLineAttack(level wad.BspLevel, blocks wad.BlockMapInfo, world CombatWorld, shooter int,
+    heading bits<32>, distance int, slope int, amount int, rules CombatRules) LineAttackStep {
+    step := LineAttackStep{Combat: CombatStep{World: world}, shooter: shooter, distance: distance,
+        slope: slope, amount: amount}
+    actor := world.Actors.ActorAt(shooter - 1)
+    if !actor.Valid || distance <= 0 { step.Combat.Failed = true; return step }
+    step.Combat.World.AttackRange = distance
+    step.shootZ = shotHeight(actor.Physics.Body)
+    step.path = traceLineAttack(level, blocks, world, actor.Physics.Body, heading, distance)
+    if !step.path.Valid { step.Combat.Failed = true; return step }
+    return ResumeLineAttack(level, step, rules)
+}
+
+// P_BulletSlope supplies the slope, while P_GunShot uses the original
+// actor heading for the horizontal shot. Damage draws precede spread.
+func BeginGunShot(level wad.BspLevel, blocks wad.BlockMapInfo, world CombatWorld, shooter int,
+    slope int, accurate bit, rules CombatRules) LineAttackStep {
+    actor := world.Actors.ActorAt(shooter - 1)
+    if !actor.Valid { return LineAttackStep{Combat: CombatStep{World: world, Failed: true}} }
+    heading := actor.Physics.Angle
+    roll := PRandom(world.Random)
+    amount := 5 * (int(roll.Value) % 3 + 1)
+    world.Random = roll.State
+    if !accurate {
+        left := PRandom(world.Random)
+        right := PRandom(left.State)
+        world.Random = right.State
+        heading = heading + bits<32>((int(left.Value) - int(right.Value)) << 18)
+    }
+    return BeginLineAttack(level, blocks, world, shooter, heading, gunAttackRange, slope, amount, rules)
+}
+
+// Apply a ShotSpecial event to the level before resuming at the same
+// linedef. Its updated opening determines whether this shot continues.
+func ResumeLineAttack(level wad.BspLevel, step LineAttackStep, rules CombatRules) LineAttackStep {
+    if step.Done || step.Combat.Failed { return step }
+    step.Event, step.Impact, step.Hit = 0, ShotImpact{Line: -1}, DamageRequest{}
+    if step.stopped {
+        step.Combat = ResumeMobjCombat(level, step.Combat, rules)
+        step.Done = step.Combat.State.Action == 0
+        return step
+    }
+    for range step.path.Count - step.index {
+        hit := step.path.Hits.At(step.index)
+        if hit.Fraction > engine.FracUnit { step.Done = true; return step }
+        if hit.IsLine {
+            line := level.LineAt(hit.Index)
+            if !line.Valid { step.Combat.Failed = true; return step }
+            if line.Action != 0 && !step.pendingLine {
+                step.Event, step.SpecialLine, step.pendingLine = ShotSpecial, hit.Index, true
+                return step
+            }
+            step.pendingLine = false
+            step = shootPastLine(level, step, line, hit)
+            if step.Combat.Failed || step.Done { return step }
+            if step.Impact.Line >= 0 { return spawnLineImpact(level, step, false, rules) }
+        } else {
+            actor := step.Combat.World.Actors.ActorAt(hit.Index - 1)
+            body := actor.Physics.Body
+            if actor.Valid && hit.Index != step.shooter && body.Flags & ActorShootable != 0 {
+                dist := cport.C_FixedMul(step.distance, hit.Fraction)
+                top := cport.C_FixedDiv(body.Z + body.Height - step.shootZ, dist)
+                bottom := cport.C_FixedDiv(body.Z - step.shootZ, dist)
+                if top >= step.slope && bottom <= step.slope {
+                    step.Impact = shotPosition(step, hit.Fraction, 10)
+                    step.Impact.Target = hit.Index
+                    return spawnLineImpact(level, step, body.Flags & ActorNoBlood == 0, rules)
+                }
+            }
+        }
+        step.index = step.index + 1
+    }
+    step.Done = true
+    return step
+}

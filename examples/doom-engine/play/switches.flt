@@ -1,0 +1,98 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted from linuxdoom-1.10 p_switch.c and p_spec.c.
+
+package play
+
+import "wad"
+
+const ButtonTics = 35
+const MaxButtons = 16
+
+type switchSide struct {
+    Present int
+    Names [3]wad.LumpName
+}
+
+type SwitchTextures struct {
+    Count int
+    sides PagedSlots<switchSide>
+}
+
+type ButtonTimer struct {
+    Tics int
+    Line int
+    Side int
+    Tier int
+    Original wad.LumpName
+}
+
+type LevelSwitches struct {
+    Textures SwitchTextures
+    Buttons [MaxButtons]ButtonTimer
+    ButtonCount int
+    ButtonOverflow bit
+    Revision int
+}
+
+// Overrides belong to the shared SIDEDEFS record, across lines and segs.
+func (textures SwitchTextures) MaterialAt(side int, original wad.SideMaterial) wad.SideMaterial {
+    patch := textures.sides.At(side)
+    if patch.Present & (1 << wad.SwitchTop) != 0 { original.Upper = patch.Names[wad.SwitchTop] }
+    if patch.Present & (1 << wad.SwitchMiddle) != 0 { original.Middle = patch.Names[wad.SwitchMiddle] }
+    if patch.Present & (1 << wad.SwitchBottom) != 0 { original.Lower = patch.Names[wad.SwitchBottom] }
+    return original
+}
+
+func (state LevelSwitches) setTexture(side int, tier int, name wad.LumpName) LevelSwitches {
+    patch := state.Textures.sides.At(side)
+    mask := 1 << tier
+    if patch.Present & mask == 0 {
+        patch.Present = patch.Present | mask
+        state.Textures.Count = state.Textures.Count + 1
+    } else {
+        prior := patch.Names[tier]
+        if prior.Low == name.Low && prior.High == name.High { return state }
+    }
+    patch.Names[tier] = name
+    state.Textures.sides = state.Textures.sides.With(side, patch)
+    state.Revision = state.Revision + 1
+    return state
+}
+
+func (state LevelSwitches) ChangeTexture(line int, side int, matched wad.SwitchTextureMatch, repeat bit) LevelSwitches {
+    if state.ButtonOverflow || !matched.Valid || side < 0 { return state }
+    if matched.Tier < wad.SwitchTop || matched.Tier > wad.SwitchBottom { return state }
+    state = state.setTexture(side, matched.Tier, matched.Replacement)
+    if !repeat { return state }
+    free := -1
+    for i := range MaxButtons {
+        button := state.Buttons[i]
+        // P_StartButton preserves the original restore target and countdown
+        // when P_ChangeSwitchTexture flips an already active button.
+        if button.Tics > 0 && button.Line == line { return state }
+        if free < 0 && button.Tics == 0 { free = i }
+    }
+    if free < 0 {
+        state.ButtonOverflow = true
+        return state
+    }
+    state.Buttons[free] = ButtonTimer{Tics: ButtonTics, Line: line, Side: side, Tier: matched.Tier, Original: matched.Original}
+    state.ButtonCount = state.ButtonCount + 1
+    return state
+}
+
+func (state LevelSwitches) TickButtons() LevelSwitches {
+    if state.ButtonCount == 0 || state.ButtonOverflow { return state }
+    for i := range MaxButtons {
+        button := state.Buttons[i]
+        if button.Tics > 1 {
+            state.Buttons[i].Tics = button.Tics - 1
+        } else if button.Tics == 1 {
+            state = state.setTexture(button.Side, button.Tier, button.Original)
+            state.Buttons[i] = ButtonTimer{}
+            state.ButtonCount = state.ButtonCount - 1
+        }
+    }
+    return state
+}

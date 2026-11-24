@@ -1,0 +1,145 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Deferred middle textures from linuxdoom-1.10/r_segs.c and r_things.c.
+
+package walls
+
+import "engine"
+import "numeric"
+import "sprites"
+import "wad"
+
+type MaskedWall struct {
+    Run WallTextureRun
+    Tier WallTier
+    Shade WadShading
+    Light int
+    ExtraLight int
+    Clips [engine.MaxViewWidth]bits<32>
+    Closed bit
+}
+
+type MaskedPassResult struct {
+    Phase int
+    FuzzVisible bit
+}
+
+func drawCompositeMask(raster PostRaster, texture wad.TextureColumn, x int, clip engine.ColumnSpan) {
+    first := (raster.TopScreen + engine.FracUnit - 1) >> 16
+    end := (raster.TopScreen + texture.Height * raster.Scale + engine.FracUnit - 1) >> 16
+    if first < clip.First { first = clip.First }
+    if end > clip.End { end = clip.End }
+    fraction := raster.Mid + (first - raster.Center) * raster.Inverse
+    for offset := range end - first {
+        row := fraction >> 16
+        if row >= 0 && row < texture.Height && texture.Covered[row >> 5][row & 31] {
+            source := bits<8>(texture.PackedPixels[row >> 2] >> ((row & 3) << 3))
+            mapped := int(raster.Shade.ColorMaps.File[raster.LightBase + int(source)])
+            raster.Shade.DrawMappedPixel(mapped, x, first + offset)
+        }
+        fraction = fraction + raster.Inverse
+    }
+}
+
+func (wall MaskedWall) DrawMask(first int, end int, drawn [engine.CoverageWords]bits<32>) [engine.CoverageWords]bits<32> {
+    if wall.Closed || !wall.Shade.Valid || !wall.Tier.Texture.Valid { return drawn }
+    run := wall.Run
+    if first < run.Bounds.First { first = run.Bounds.First }
+    if end > run.Bounds.End { end = run.Bounds.End }
+    if first >= end { return drawn }
+    var columns wad.TextureColumns
+    var lightRows bytes
+    var lightBase int
+    prepared := false
+    center := run.Height / 2
+    for offset := range end - first {
+        x := first + offset
+        word, bitIndex := x / 32, x % 32
+        if !drawn[word][bitIndex] {
+            drawn[word] = drawn[word] | (bits<32>(1) << bitIndex)
+            clip := clipRange(wall.Clips[x], run.Height)
+            scale := run.Scale.First + (x - run.Bounds.First) * run.Scale.Step
+            if clip.First < clip.End && scale > 0 {
+                if !prepared {
+                    columns = wad.PrepareTextureColumns(wall.Tier.Texture)
+                    lightRows, lightBase = wall.Shade.WallLightTable(wall.Light, wall.ExtraLight)
+                    prepared = true
+                }
+                row := wall.Shade.FixedRow
+                if row == 0 {
+                    if lightBase >= 0 {
+                        index := int(bits<32>(scale) >> engine.LightScaleShift)
+                        if index >= engine.MaxLightScale { index = engine.MaxLightScale - 1 }
+                        row = int(lightRows[lightBase + index])
+                    } else { row = engine.WallLightRow(wall.Light, wall.ExtraLight, scale, run.Width, wall.Shade.DetailShift) }
+                }
+                raster := PostRaster{Scale: scale, TopScreen: (center << 16) - cport.C_FixedMul(wall.Tier.Middle, scale),
+                    Mid: wall.Tier.Middle, Inverse: int(bits<32>(0xffffffff) / bits<32>(scale)), Center: center,
+                    LightBase: wall.Shade.ColorMaps.Offset + row * wad.ColorMapBytes, Shade: wall.Shade}
+                column := run.Columns[x]
+                var post wad.PostSource
+                if columns.Sheet.Valid {
+                    post = wad.TextureSheetPostSource(columns.Sheet, column & columns.Mask)
+                } else {
+                    texture := columns.ColumnAt(column)
+                    if texture.Valid && texture.Direct {
+                        post = wad.PatchPostSource(texture.DirectPatch, texture.DirectSourceColumn)
+                    } else if texture.Valid {
+                        // Overlapping patches use the bounded transparent composite cache.
+                        drawCompositeMask(raster, texture, x, clip)
+                    }
+                }
+                if post.Valid {
+                    raster.Patch = post.Patch
+                    drawPostColumn(raster, post.Offset, x, clip, 0)
+                }
+            }
+        }
+    }
+    return drawn
+}
+
+// Draw masked columns behind each sprite before drawing it, then finish the
+// remaining columns in reverse BSP order. A bitset replaces Doom's MAXSHORT
+// marker, so a column behind one sprite cannot be repainted over another.
+func DrawMaskedPass(coverage engine.ColumnCoverage, visible sprites.VisibleSprites, height int, shade WadShading,
+    phase int) MaskedPassResult {
+    if !shade.Valid { return MaskedPassResult{Phase: phase} }
+    fuzzy := false
+    var drawn engine.PagedSlots<[engine.CoverageWords]bits<32>>
+    visible = sprites.SortVisibleSprites(visible)
+    for i := range visible.Count {
+        sprite := visible.At(i)
+        handle := coverage.DrawSegments.LastMask
+        for range coverage.DrawSegments.MaskPageCount {
+            pageIndex := (handle - 1) / engine.DrawSegmentPageSize
+            page := coverage.DrawSegments.PageAt(pageIndex)
+            count, earlier := page.OverlappingMasks(sprite.Span)
+            base := pageIndex * engine.DrawSegmentPageSize
+            for range count {
+                index := handle - 1
+                segment := page.At(index - base)
+                if segment.Span.First < sprite.Span.End && segment.Span.End > sprite.Span.First &&
+                    !sprites.SegmentOccludesSprite(segment, sprite) {
+                    columns := segment.Mask.DrawMask(sprite.Span.First, sprite.Span.End, drawn.At(index))
+                    drawn = drawn.With(index, columns)
+                }
+                handle = segment.PreviousMask
+            }
+            handle = earlier
+        }
+        phase = DrawSpriteWithFuzz(sprite, height, sprites.ClipSprite(sprite, coverage, height), shade, phase)
+        fuzzy = fuzzy || sprite.Fuzzy
+    }
+    var empty [engine.CoverageWords]bits<32>
+    handle := coverage.DrawSegments.LastMask
+    for range coverage.DrawSegments.MaskCount {
+        index := handle - 1
+        segment := coverage.DrawSegments.At(index)
+        columns := empty
+        if visible.Count > 0 { columns = drawn.At(index) }
+        segment.Mask.DrawMask(segment.Span.First, segment.Span.End, columns)
+        handle = segment.PreviousMask
+    }
+    return MaskedPassResult{Phase: phase, FuzzVisible: fuzzy}
+}

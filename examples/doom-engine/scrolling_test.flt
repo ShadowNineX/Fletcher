@@ -1,0 +1,23 @@
+package main
+
+import "engine"
+import "play"
+
+test "line special 48 advances each shared sidedef contribution and wraps" {
+    scrolls := play.LineScrolls{}.WithSide(0).WithSide(30).WithSide(30).WithSide(120).WithSide(31)
+    assertEqual(scrolls.Count, 4)
+    assertEqual(scrolls.OffsetForSide(0), 0)
+    wrapped := [10]int{2147450880, -2147385344, -2147254272, -2147123200, -2146992128,
+        -2146861056, -2146729984, -2146598912, -2146467840, -2146336768}
+    for tic, expected := range wrapped {
+        assertEqual(scrolls.OffsetForSide(0), tic * engine.FracUnit)
+        assertEqual(2147450880 + scrolls.OffsetForSide(30), expected)
+        assertEqual(scrolls.OffsetForSide(31), 0)
+        assertEqual(scrolls.OffsetForSide(90), 0)
+        assertEqual(scrolls.OffsetForSide(120), tic * engine.FracUnit)
+        scrolls = scrolls.Advance()
+    }
+    atWrap := play.LineScrolls{}.WithSide(30)
+    atWrap.Distance = 2147418112
+    assertEqual(atWrap.Advance().OffsetForSide(30), -2147483648)
+}

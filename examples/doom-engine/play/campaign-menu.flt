@@ -1,0 +1,118 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Campaign selection follows M_NewGame, M_Episode and M_ChooseSkill in linuxdoom-1.10/m_menu.c.
+
+package play
+
+import "wad"
+
+const CampaignMenuClosed = 0
+const CampaignMenuEpisode = 1
+const CampaignMenuSkill = 2
+const CampaignMenuNightmare = 3
+
+type CampaignMenu struct {
+    Stage int
+    Commercial bit
+    Episodes [4]int
+    Count int
+    Cursor int
+    markers [4]int
+    episodeRow int
+    skill int
+}
+
+type CampaignMenuInput struct {
+    Up bit
+    Down bit
+    Confirm bit
+    Back bit
+}
+
+type CampaignMenuStep struct {
+    Menu CampaignMenu
+    Changed bit
+    Start bit
+    Marker int
+    Skill int
+}
+
+func campaignStartMarker(mounts wad.Archives, name wad.LumpName) int {
+    marker := mounts.Find(name)
+    if !marker.Valid || marker.Size != 0 || marker.Entry < 0 { return -1 }
+    if !wad.LoadBspLevel(marker.File, marker.Entry).Valid { return -1 }
+    return marker.Entry
+}
+
+// D_DoomMain starts at episode one, map one. Use WAD name lookup so a later
+// copy of the opening level takes precedence over an earlier directory entry.
+func CampaignOpeningMarker(mounts wad.Archives, commercial bit) int {
+    if commercial { return campaignStartMarker(mounts, commercialMapName(0)) }
+    return campaignStartMarker(mounts, wad.LumpName{Low: 0x314d3145}) // E1M1.
+}
+
+func OpenCampaignMenu(mounts wad.Archives, commercial bit, currentSkill int) CampaignMenu {
+    if currentSkill < 0 || currentSkill > 4 { currentSkill = 2 }
+    menu := CampaignMenu{Commercial: commercial, skill: currentSkill}
+    if commercial {
+        marker := CampaignOpeningMarker(mounts, true)
+        if marker >= 0 {
+            menu.markers[0], menu.Episodes[0], menu.Count = marker, 1, 1
+            menu.Stage, menu.Cursor = CampaignMenuSkill, currentSkill
+        }
+        return menu
+    }
+    for row := range campaignEpisodeCount {
+        // E1M1 through E4M1, in episode order even for a sparse PWAD.
+        name := wad.LumpName{Low: 0x314d0045 | ((49 + row) << 8)}
+        marker := campaignStartMarker(mounts, name)
+        if marker >= 0 {
+            menu.markers[menu.Count], menu.Episodes[menu.Count] = marker, row + 1
+            menu.Count = menu.Count + 1
+        }
+    }
+    if menu.Count > 0 { menu.Stage = CampaignMenuEpisode }
+    return menu
+}
+
+func TickCampaignMenu(menu CampaignMenu, keys CampaignMenuInput) CampaignMenuStep {
+    step := CampaignMenuStep{Menu: menu, Marker: -1}
+    if menu.Stage == CampaignMenuClosed { return step }
+    if keys.Back {
+        switch menu.Stage {
+        case CampaignMenuNightmare:
+            menu.Stage, menu.Cursor = CampaignMenuSkill, menu.skill
+        case CampaignMenuSkill:
+            menu.skill = menu.Cursor
+            if menu.Commercial { menu.Stage = CampaignMenuClosed } else {
+                menu.Stage, menu.Cursor = CampaignMenuEpisode, menu.episodeRow
+            }
+        case CampaignMenuEpisode:
+            menu.Stage = CampaignMenuClosed
+        }
+    } else if keys.Confirm {
+        switch menu.Stage {
+        case CampaignMenuEpisode:
+            menu.episodeRow = menu.Cursor
+            menu.Stage, menu.Cursor = CampaignMenuSkill, menu.skill
+        case CampaignMenuSkill:
+            menu.skill = menu.Cursor
+            if menu.skill == 4 {
+                menu.Stage, menu.Cursor = CampaignMenuNightmare, 0
+            } else { menu.Stage = CampaignMenuClosed; step.Start = true }
+        case CampaignMenuNightmare:
+            if menu.Cursor == 0 { menu.Stage, menu.Cursor = CampaignMenuSkill, menu.skill } else {
+                menu.Stage, step.Start = CampaignMenuClosed, true
+            }
+        }
+        if step.Start { step.Marker, step.Skill = menu.markers[menu.episodeRow], menu.skill }
+    } else if keys.Up != keys.Down {
+        rows := menu.Count
+        if menu.Stage == CampaignMenuSkill { rows = 5 }
+        if menu.Stage == CampaignMenuNightmare { rows = 2 }
+        if rows < 2 { return step }
+        if keys.Up { menu.Cursor = (menu.Cursor + rows - 1) % rows } else { menu.Cursor = (menu.Cursor + 1) % rows }
+    } else { return step }
+    step.Menu, step.Changed = menu, true
+    return step
+}

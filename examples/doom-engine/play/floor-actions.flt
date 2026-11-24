@@ -1,0 +1,55 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Floor-only line specials from linuxdoom-1.10 p_spec.c and p_switch.c.
+
+package play
+
+import "wad"
+
+type FloorAction struct {
+    Mode int
+    Once bit
+}
+
+func walkFloorAction(special int) FloorAction {
+    switch special {
+    case 5, 91: return FloorAction{Mode: FloorRaise, Once: special == 5}
+    case 19, 83: return FloorAction{Mode: FloorLower, Once: special == 19}
+    case 30, 96: return FloorAction{Mode: FloorRaiseTexture, Once: special == 30}
+    case 36, 98: return FloorAction{Mode: FloorTurboLower, Once: special == 36}
+    case 37, 84: return FloorAction{Mode: FloorLowerChange, Once: special == 37}
+    case 38, 82: return FloorAction{Mode: FloorLowerLowest, Once: special == 38}
+    case 56, 94: return FloorAction{Mode: FloorRaiseCrush, Once: special == 56}
+    case 58, 92: return FloorAction{Mode: FloorRaise24, Once: special == 58}
+    case 59, 93: return FloorAction{Mode: FloorRaise24Change, Once: special == 59}
+    case 119, 128: return FloorAction{Mode: FloorRaiseNearest, Once: special == 119}
+    case 130, 129: return FloorAction{Mode: FloorRaiseTurbo, Once: special == 130}
+    }
+    return FloorAction{}
+}
+
+func useFloorAction(special int) FloorAction {
+    switch special {
+    case 18, 69: return FloorAction{Mode: FloorRaiseNearest, Once: special == 18}
+    case 23, 60: return FloorAction{Mode: FloorLowerLowest, Once: special == 23}
+    case 55, 65: return FloorAction{Mode: FloorRaiseCrush, Once: special == 55}
+    case 71, 70: return FloorAction{Mode: FloorTurboLower, Once: special == 71}
+    case 101, 64: return FloorAction{Mode: FloorRaise, Once: special == 101}
+    case 102, 45: return FloorAction{Mode: FloorLower, Once: special == 102}
+    case 131, 132: return FloorAction{Mode: FloorRaiseTurbo, Once: special == 131}
+    case 140: return FloorAction{Mode: FloorRaise512, Once: true}
+    }
+    return FloorAction{}
+}
+
+func activateFloorLine(level wad.BspLevel, state LevelSpecials, index int, line wad.CollisionLine,
+    action FloorAction, use bit) LevelSpecials {
+    started := startTaggedFloors(level, state, line, action.Mode)
+    state = started.State
+    if use {
+        if started.Started { state.Doors = changeLineSwitch(level, state.Doors, index, action.Once) }
+    } else if action.Once {
+        state.Doors = state.Doors.consumeLine(index)
+    }
+    return state
+}

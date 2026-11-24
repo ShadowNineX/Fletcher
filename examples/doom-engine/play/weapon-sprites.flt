@@ -1,0 +1,334 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Player weapon sprites and their actions from p_pspr.c and p_enemy.c.
+
+package play
+
+import "actorinfo"
+import "engine"
+import "numeric"
+
+const weaponSlide = 6 * engine.FracUnit
+const weaponBottom = 128 * engine.FracUnit
+const weaponTop = 32 * engine.FracUnit
+const weaponBfgCells = 40
+const noWeaponTransition = -1
+const maxWeaponSignals = 6
+
+const WeaponSignalSound = 1
+const WeaponSignalActorState = 2
+const WeaponSignalNoise = 3
+
+type WeaponOverlay struct {
+    State int
+    Tics int
+    X int
+    Y int
+}
+
+type WeaponView struct {
+    Weapon WeaponOverlay
+    Flash WeaponOverlay
+    AttackDown bit
+    Refire int
+    ExtraLight int
+}
+
+type WeaponInput struct {
+    Attack bit
+    LevelTime int
+    Bob int
+    Shareware bit
+    Commercial bit
+}
+
+type WeaponSignal struct {
+    Kind int
+    Value int
+}
+
+// Apply signals in order, then resolve Action if set. Feed the resulting
+// inventory, actor state and shared RNG back into ResumeWeaponAction.
+type WeaponStep struct {
+    Inventory PlayerInventory
+    View WeaponView
+    ActorState int
+    Random RandomState
+    Signals [maxWeaponSignals]WeaponSignal
+    SignalCount int
+    Action int
+    Done bit
+    Failed bit
+    command WeaponInput
+    tickFlash bit
+    alert bit
+    transition int
+}
+
+func weaponSignal(step WeaponStep, kind int, value int) WeaponStep {
+    if step.SignalCount >= maxWeaponSignals { step.Failed = true; return step }
+    step.Signals[step.SignalCount] = WeaponSignal{Kind: kind, Value: value}
+    step.SignalCount = step.SignalCount + 1
+    return step
+}
+
+func weaponActorState(step WeaponStep, state int) WeaponStep {
+    step.ActorState = state
+    return weaponSignal(step, WeaponSignalActorState, state)
+}
+
+func enterOverlay(overlay WeaponOverlay, state int, definition actorinfo.StateDef) WeaponOverlay {
+    overlay.State, overlay.Tics = state, definition.Tics
+    if definition.Misc1 != 0 { overlay.X, overlay.Y = definition.Misc1 << 16, definition.Misc2 << 16 }
+    return overlay
+}
+
+func setWeaponFlash(step WeaponStep, state int) WeaponStep {
+    for range actorinfo.ActorStateCount {
+        if state == ActorNullState { step.View.Flash.State = ActorNullState; return step }
+        info := actorinfo.StateAt(state)
+        if !info.Valid { step.Failed = true; return step }
+        step.View.Flash = enterOverlay(step.View.Flash, state, info)
+        switch info.Action {
+        case actorinfo.ActionLight0: step.View.ExtraLight = 0
+        case actorinfo.ActionLight1: step.View.ExtraLight = 1
+        case actorinfo.ActionLight2: step.View.ExtraLight = 2
+        case 0:
+        default: step.Failed = true; return step
+        }
+        if step.View.Flash.Tics != 0 { return step }
+        state = info.Next
+    }
+    step.Failed = true
+    return step
+}
+
+func chooseAmmoFallback(inventory PlayerInventory, command WeaponInput) int {
+    if inventory.Weapons[WeaponPlasma] && inventory.Ammo[AmmoCell] != 0 && !command.Shareware { return WeaponPlasma }
+    if inventory.Weapons[WeaponSuperShotgun] && inventory.Ammo[AmmoShell] > 2 && command.Commercial { return WeaponSuperShotgun }
+    if inventory.Weapons[WeaponChaingun] && inventory.Ammo[AmmoClip] != 0 { return WeaponChaingun }
+    if inventory.Weapons[WeaponShotgun] && inventory.Ammo[AmmoShell] != 0 { return WeaponShotgun }
+    if inventory.Ammo[AmmoClip] != 0 { return WeaponPistol }
+    if inventory.Weapons[WeaponChainsaw] { return WeaponChainsaw }
+    if inventory.Weapons[WeaponMissile] && inventory.Ammo[AmmoMissile] != 0 { return WeaponMissile }
+    if inventory.Weapons[WeaponBfg] && inventory.Ammo[AmmoCell] > weaponBfgCells && !command.Shareware { return WeaponBfg }
+    return WeaponFist
+}
+
+func weaponAttackCost(weapon int) int {
+    switch weapon {
+    case WeaponBfg: return weaponBfgCells
+    case WeaponSuperShotgun: return 2
+    default: return 1
+    }
+}
+
+func checkWeaponAmmo(step WeaponStep) WeaponStep {
+    weapon := step.Inventory.ReadyWeapon
+    info := actorinfo.WeaponAt(weapon)
+    if info.Ammo == AmmoNone || step.Inventory.Ammo[info.Ammo] >= weaponAttackCost(weapon) { return step }
+    step.Inventory.PendingWeapon = chooseAmmoFallback(step.Inventory, step.command)
+    step.transition = info.Down
+    return step
+}
+
+func fireWeapon(step WeaponStep) WeaponStep {
+    step = checkWeaponAmmo(step)
+    if step.transition != noWeaponTransition { return step }
+    step = weaponActorState(step, actorinfo.StatePlayerAttack1)
+    step.transition = actorinfo.WeaponAt(step.Inventory.ReadyWeapon).Attack
+    step.alert = true
+    return step
+}
+
+func bringUpWeapon(step WeaponStep) WeaponStep {
+    weapon := step.Inventory.PendingWeapon
+    if weapon == WeaponNoChange { weapon = step.Inventory.ReadyWeapon }
+    info := actorinfo.WeaponAt(weapon)
+    if !info.Valid { step.Failed = true; return step }
+    if weapon == WeaponChainsaw { step = weaponSignal(step, WeaponSignalSound, actorinfo.SoundSawUp) }
+    step.Inventory.PendingWeapon = WeaponNoChange
+    step.View.Weapon.Y = weaponBottom
+    step.transition = info.Up
+    return step
+}
+
+func lowerWeapon(step WeaponStep) WeaponStep {
+    step.View.Weapon.Y = step.View.Weapon.Y + weaponSlide
+    if step.View.Weapon.Y < weaponBottom { return step }
+    if step.Inventory.Dead { step.View.Weapon.Y = weaponBottom; return step }
+    if step.Inventory.Health == 0 { step.transition = ActorNullState; return step }
+    step.Inventory.ReadyWeapon = step.Inventory.PendingWeapon
+    return bringUpWeapon(step)
+}
+
+func readyWeapon(step WeaponStep, info actorinfo.WeaponDef) WeaponStep {
+    if step.ActorState == actorinfo.StatePlayerAttack1 || step.ActorState == actorinfo.StatePlayerAttack2 {
+        step = weaponActorState(step, actorinfo.StatePlayerReady)
+    }
+    weapon := step.Inventory.ReadyWeapon
+    if weapon == WeaponChainsaw && step.View.Weapon.State == actorinfo.StateChainsaw {
+        step = weaponSignal(step, WeaponSignalSound, actorinfo.SoundSawIdle)
+    }
+    if step.Inventory.PendingWeapon != WeaponNoChange || step.Inventory.Health == 0 { step.transition = info.Down; return step }
+    if step.command.Attack {
+        if !step.View.AttackDown || (weapon != WeaponMissile && weapon != WeaponBfg) {
+            step.View.AttackDown = true
+            return fireWeapon(step)
+        }
+    } else { step.View.AttackDown = false }
+    heading := bits<32>(128 * step.command.LevelTime) << engine.FineAngleShift
+    step.View.Weapon.X = engine.FracUnit + cport.C_FixedMul(step.command.Bob, engine.AngleCosine(heading))
+    step.View.Weapon.Y = weaponTop + cport.C_FixedMul(step.command.Bob, engine.AngleSine(heading & 0x7fffffff))
+    return step
+}
+
+func refireWeapon(step WeaponStep) WeaponStep {
+    if step.command.Attack && step.Inventory.PendingWeapon == WeaponNoChange && step.Inventory.Health != 0 {
+        step.View.Refire = step.View.Refire + 1
+        return fireWeapon(step)
+    }
+    step.View.Refire = 0
+    return checkWeaponAmmo(step)
+}
+
+func prepareWeaponAttack(step WeaponStep, info actorinfo.WeaponDef, action int) WeaponStep {
+    flash, sound := info.Flash, 0
+    switch action {
+    case actorinfo.ActionPunch, actorinfo.ActionSaw:
+        step.Action = action
+        return step
+    case actorinfo.ActionFirePistol, actorinfo.ActionFireCGun: sound = actorinfo.SoundPistol
+    case actorinfo.ActionFireShotgun: sound = actorinfo.SoundShotgun
+    case actorinfo.ActionFireShotgun2: sound = actorinfo.SoundSuperShotgun
+    }
+    if sound != 0 { step = weaponSignal(step, WeaponSignalSound, sound) }
+    if action == actorinfo.ActionFireCGun && step.Inventory.Ammo[info.Ammo] == 0 { return step }
+    if sound != 0 { step = weaponActorState(step, actorinfo.StatePlayerAttack2) }
+    ammo := info.Ammo
+    step.Inventory.Ammo[ammo] = step.Inventory.Ammo[ammo] - weaponAttackCost(step.Inventory.ReadyWeapon)
+    switch action {
+    case actorinfo.ActionFireCGun:
+        flash = flash + step.View.Weapon.State - actorinfo.StateChaingun1
+    case actorinfo.ActionFirePlasma:
+        draw := PRandom(step.Random)
+        step.Random, flash = draw.State, flash + int(draw.Value & 1)
+    case actorinfo.ActionFireMissile, actorinfo.ActionFireBFG:
+        step.Action = action
+        return step
+    }
+    step = setWeaponFlash(step, flash)
+    step.Action = action
+    return step
+}
+
+func runWeaponAction(step WeaponStep, action int) WeaponStep {
+    info := actorinfo.WeaponAt(step.Inventory.ReadyWeapon)
+    if !info.Valid { step.Failed = true; return step }
+    switch action {
+    case 0: return step
+    case actorinfo.ActionWeaponReady: return readyWeapon(step, info)
+    case actorinfo.ActionLower: return lowerWeapon(step)
+    case actorinfo.ActionRaise:
+        step.View.Weapon.Y = step.View.Weapon.Y - weaponSlide
+        if step.View.Weapon.Y <= weaponTop { step.View.Weapon.Y, step.transition = weaponTop, info.Ready }
+    case actorinfo.ActionReFire: return refireWeapon(step)
+    case actorinfo.ActionCheckReload: return checkWeaponAmmo(step)
+    case actorinfo.ActionGunFlash:
+        step = weaponActorState(step, actorinfo.StatePlayerAttack2)
+        return setWeaponFlash(step, info.Flash)
+    case actorinfo.ActionOpenShotgun2: return weaponSignal(step, WeaponSignalSound, actorinfo.SoundShotgunOpen)
+    case actorinfo.ActionLoadShotgun2: return weaponSignal(step, WeaponSignalSound, actorinfo.SoundShotgunLoad)
+    case actorinfo.ActionCloseShotgun2:
+        step = weaponSignal(step, WeaponSignalSound, actorinfo.SoundShotgunClose)
+        return refireWeapon(step)
+    case actorinfo.ActionBFGsound: return weaponSignal(step, WeaponSignalSound, actorinfo.SoundBfg)
+    case actorinfo.ActionPunch, actorinfo.ActionSaw, actorinfo.ActionFirePistol, actorinfo.ActionFireCGun,
+        actorinfo.ActionFireShotgun, actorinfo.ActionFireShotgun2, actorinfo.ActionFirePlasma, actorinfo.ActionFireMissile, actorinfo.ActionFireBFG:
+        return prepareWeaponAttack(step, info, action)
+    default: step.Failed = true
+    }
+    return step
+}
+
+func finishWeaponStep(step WeaponStep) WeaponStep {
+    if step.alert {
+        step = weaponSignal(step, WeaponSignalNoise, 0)
+        step.alert = false
+    }
+    if step.tickFlash {
+        flash := step.View.Flash
+        if flash.State != ActorNullState && flash.Tics != -1 {
+            flash.Tics = flash.Tics - 1
+            step.View.Flash = flash
+            if flash.Tics == 0 { step = setWeaponFlash(step, actorinfo.StateAt(flash.State).Next) }
+        }
+        step.View.Flash.X, step.View.Flash.Y = step.View.Weapon.X, step.View.Weapon.Y
+    }
+    step.Done = !step.Failed
+    return step
+}
+
+// State-changing actions install their own successor. The fired action can
+// suspend before noise propagation and before the flash's same-tic update.
+func enterWeaponState(step WeaponStep, state int) WeaponStep {
+    for range actorinfo.ActorStateCount {
+        if state == ActorNullState {
+            step.View.Weapon.State = ActorNullState
+            return finishWeaponStep(step)
+        }
+        info := actorinfo.StateAt(state)
+        if !info.Valid { step.Failed = true; return step }
+        step.View.Weapon = enterOverlay(step.View.Weapon, state, info)
+        step.transition = noWeaponTransition
+        step = runWeaponAction(step, info.Action)
+        if step.Failed || step.Action != 0 { return step }
+        if step.transition != noWeaponTransition {
+            state = step.transition
+        } else {
+            if step.View.Weapon.Tics != 0 { return finishWeaponStep(step) }
+            state = info.Next
+        }
+    }
+    step.Failed = true
+    return step
+}
+
+func SetupWeaponSprites(inventory PlayerInventory, view WeaponView, actorState int, random RandomState) WeaponStep {
+    view.Weapon.State, view.Flash.State = ActorNullState, ActorNullState
+    inventory.PendingWeapon = inventory.ReadyWeapon
+    step := bringUpWeapon(WeaponStep{Inventory: inventory, View: view, ActorState: actorState, Random: random})
+    if step.Failed { return step }
+    return enterWeaponState(step, step.transition)
+}
+
+func DropPlayerWeapon(inventory PlayerInventory, view WeaponView, actorState int, random RandomState) WeaponStep {
+    info := actorinfo.WeaponAt(inventory.ReadyWeapon)
+    step := WeaponStep{Inventory: inventory, View: view, ActorState: actorState, Random: random, Failed: !info.Valid}
+    if step.Failed { return step }
+    return enterWeaponState(step, info.Down)
+}
+
+func BeginWeaponTick(inventory PlayerInventory, view WeaponView, actorState int, random RandomState, command WeaponInput) WeaponStep {
+    step := WeaponStep{Inventory: inventory, View: view, ActorState: actorState, Random: random, command: command, tickFlash: true}
+    overlay := view.Weapon
+    if overlay.State != ActorNullState && overlay.Tics != -1 {
+        step.View.Weapon.Tics = overlay.Tics - 1
+        if step.View.Weapon.Tics == 0 {
+            info := actorinfo.StateAt(overlay.State)
+            if !info.Valid { step.Failed = true; return step }
+            return enterWeaponState(step, info.Next)
+        }
+    }
+    return finishWeaponStep(step)
+}
+
+func ResumeWeaponAction(step WeaponStep) WeaponStep {
+    if step.Action == 0 || step.Failed { return step }
+    step.Action, step.SignalCount = 0, 0
+    overlay := step.View.Weapon
+    if overlay.State != ActorNullState && overlay.Tics == 0 {
+        return enterWeaponState(step, actorinfo.StateAt(overlay.State).Next)
+    }
+    return finishWeaponStep(step)
+}

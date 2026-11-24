@@ -1,0 +1,256 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Actor-aware P_CrossSpecialLine dispatch from linuxdoom-1.10/p_spec.c.
+
+package play
+
+import "actorinfo"
+import "wad"
+
+type WalkoverMetadata struct {
+    Base wad.BspLevel
+    View WeaponView
+    Heard SoundTargets
+    Brain BrainState
+    FirstActive int
+    MapActors int
+    GameTic int
+    Rules CombatRules
+    RespawnMonsters bit
+    Cues bits<8>
+    LastSound int
+    WeaponSound int
+    Changed bit
+}
+
+// Pure geometry callers leave the snapshot empty. The preview supplies and
+// replaces it whenever a synchronous action returns to a crossing or mover.
+type WalkoverContext interface {
+    Read() WalkoverMetadata
+}
+
+type WalkoverState struct {
+    Level wad.BspLevel
+    Specials LevelSpecials
+    World CombatWorld
+    Callback WalkoverContext
+    Teleported bit
+    TeleportTried bit
+    EyeZ int
+    DamageSound int
+    Failed bit
+    Count int
+    Crossings PagedSlots<SpecialCrossing>
+}
+
+type WalkoverTelefrag interface {
+    OnTelefrag(state WalkoverState, event CombatStep, rules CombatRules) WalkoverState
+}
+
+// A resumable P_CrossSpecialLine batch. Teleports can suspend on a combat
+// state action, allowing hosts to render or dispatch it before continuing.
+type ActorCrossingStep struct {
+    State WalkoverState
+    Event CombatStep
+    Pending bit
+    Done bit
+    handle int
+    oldX int
+    oldY int
+    position MapPositionCheck
+    remaining int
+    warp LineTeleportStep
+    warpActive bit
+    warpLine int
+    warpOnce bit
+}
+
+func (state WalkoverState) syncThinkerOrder() WalkoverState {
+    state.Specials = state.Specials.WithActorOrder(state.World.Actors)
+    state.World.Actors = state.World.Actors.WithSectorOrder(state.Specials)
+    return state
+}
+
+type DefaultWalkoverTelefrag struct {}
+
+func (handler DefaultWalkoverTelefrag) OnTelefrag(state WalkoverState, event CombatStep, rules CombatRules) WalkoverState {
+    actor := state.World.Actors.ActorAt(event.ActorHandle - 1)
+    switch event.State.Action {
+    case actorinfo.ActionFall:
+        actor.Physics.Body.Flags = actor.Physics.Body.Flags & ~bits<32>(ActorSolid)
+        state.World.Actors = state.World.Actors.WithActor(event.ActorHandle, actor)
+    case actorinfo.ActionPain, actorinfo.ActionScream, actorinfo.ActionXScream, actorinfo.ActionPlayerScream:
+        commercial := state.Level.MapName.Low & 0xffffff == 0x50414d
+        sound, _, random := ActorActionSound(actor, event.ActorHandle, event.State.Action, commercial, state.World.Random)
+        state.World.Random = random
+        if sound != 0 { state.DamageSound = sound }
+    case actorinfo.ActionBossDeath, actorinfo.ActionKeenDie, actorinfo.ActionBrainDie:
+        special := ApplyBossSpecial(state.Level, state.Specials, state.World, event.ActorHandle, event.State.Action)
+        state.World, state.Specials = special.World, special.State
+        state.Level = state.Specials.ApplyTo(state.Level)
+    }
+    return state
+}
+
+func ignoresWalkover(kind int) bit {
+    switch kind {
+    case actorinfo.ActorRocket, actorinfo.ActorPlasma, actorinfo.ActorBfg,
+        actorinfo.ActorTroopShot, actorinfo.ActorHeadShot, actorinfo.ActorBruiserShot:
+        return true
+    }
+    return false
+}
+
+func beginActorLine(blocks wad.BlockMapInfo, step ActorCrossingStep, crossing SpecialCrossing,
+    rules CombatRules) ActorCrossingStep {
+    state := step.State
+    actor := state.World.Actors.ActorAt(step.handle - 1)
+    if !actor.Valid || (!actor.Physics.Body.Player && ignoresWalkover(actor.Kind)) { return step }
+    line := state.Level.LineAt(crossing.Line)
+    if !line.Valid || line.Action == 0 { return step }
+    state = state.syncThinkerOrder()
+    step.State = state
+    if (line.Action == 125 || line.Action == 126) && actor.Physics.Body.Player { return step }
+    switch line.Action {
+    case 39, 97, 125, 126:
+        once := line.Action == 39 || line.Action == 125
+        step.warp = BeginLineTeleport(state.Level, blocks, state.World, step.handle, line.Tag, crossing.OldSide, rules)
+        step.State.TeleportTried = state.TeleportTried || step.warp.Destination != 0
+        step.warpLine, step.warpOnce = crossing.Line, once
+        step.warpActive = true
+        return step
+    }
+
+    state.Specials.Lighting.Random = state.World.Random
+    if actor.Physics.Body.Player {
+        state.Specials = CrossLevelSpecial(state.Level, state.Specials, crossing.Line)
+    } else {
+        state.Specials = CrossMonsterLine(state.Level, state.Specials, crossing.Line)
+    }
+    state.Level = state.Specials.ApplyTo(state.Level)
+    state.World.Random = state.Specials.Lighting.Random
+    step.State = state.syncThinkerOrder()
+    return step
+}
+
+func advanceCrossingTeleport(step ActorCrossingStep, rules CombatRules) ActorCrossingStep {
+    for range ThinkerIterationLimit {
+        state, warp := step.State, step.warp
+        state.World = warp.Combat.World
+        if warp.Combat.Failed {
+            state.Failed = true
+            step.State, step.Done = state, true
+            return step
+        }
+        if warp.Combat.Feedback.Sound != 0 && warp.Combat.Feedback.Sound != actorinfo.SoundTeleport {
+            state.DamageSound = warp.Combat.Feedback.Sound
+        }
+        if warp.Done {
+            if step.warpOnce {
+                // One-shot specials clear after EV_Teleport returns, even
+                // when the crossing is backward or the landing is blocked.
+                state.Specials.Doors = state.Specials.Doors.consumeLine(step.warpLine)
+                state.Level = state.Specials.ApplyTo(state.Level)
+            }
+            state.Specials.Lighting.Random = state.World.Random
+            if warp.Teleported { state.Teleported, state.EyeZ = true, warp.EyeZ }
+            step.State, step.warpActive = state.syncThinkerOrder(), false
+            return step
+        }
+        // Publish each fog sound at its source before resuming the teleport.
+        if warp.Combat.State.Action != 0 || warp.Combat.Feedback.LowerWeapon != 0 || warp.Combat.Feedback.Sound != 0 {
+            state = state.syncThinkerOrder()
+            step.Event = warp.Combat
+            step.Event.World = state.World
+            step.State, step.Pending = state, true
+            return step
+        }
+        step.State = state
+        step.warp = ResumeLineTeleport(state.Level, warp, rules)
+    }
+    step.State.Failed, step.Done = true, true
+    return step
+}
+
+func advanceActorCrossing(blocks wad.BlockMapInfo, step ActorCrossingStep, rules CombatRules) ActorCrossingStep {
+    if step.warpActive {
+        step = advanceCrossingTeleport(step, rules)
+        if step.Pending || step.Done { return step }
+        // P_TeleportMove resets numspechit before scanning the landing, even
+        // if the scan subsequently prevents the move.
+        if step.State.TeleportTried { step.Done = true; return step }
+    }
+    for range step.remaining {
+        step.remaining = step.remaining - 1
+        index := step.position.Specials.At(step.remaining)
+        line := step.State.Level.LineAt(index)
+        if line.Valid && line.Action != 0 {
+            oldSide := wad.PointOnCollisionLineSide(line, step.oldX, step.oldY)
+            body := step.State.World.Actors.ActorAt(step.handle - 1).Physics.Body
+            if oldSide != wad.PointOnCollisionLineSide(line, body.X, body.Y) {
+                crossing := SpecialCrossing{Line: index, OldSide: oldSide}
+                step.State.Crossings = step.State.Crossings.With(step.State.Count, crossing)
+                step.State.Count = step.State.Count + 1
+                step = beginActorLine(blocks, step, crossing, rules)
+                if step.warpActive {
+                    step = advanceCrossingTeleport(step, rules)
+                    if step.Pending || step.Done { return step }
+                }
+                if step.State.Failed || step.State.TeleportTried { step.Done = true; return step }
+            }
+        }
+    }
+    step.Done = true
+    return step
+}
+
+func BeginActorCrossing(blocks wad.BlockMapInfo, state WalkoverState, handle int, oldX int, oldY int,
+    position MapPositionCheck, rules CombatRules) ActorCrossingStep {
+    step := ActorCrossingStep{State: state, handle: handle, oldX: oldX, oldY: oldY, position: position,
+        remaining: position.SpecialCount}
+    actor := state.World.Actors.ActorAt(handle - 1)
+    if state.Failed || actor.Physics.Body.Flags & (MoveNoClip | MoveTeleport) != 0 {
+        step.Done = true
+        return step
+    }
+    return advanceActorCrossing(blocks, step, rules)
+}
+
+// The caller returns its updated State after processing Event. The crossing
+// retains its own linedef cursor and the suspended teleport's scan.
+func ResumeActorCrossing(blocks wad.BlockMapInfo, step ActorCrossingStep, rules CombatRules) ActorCrossingStep {
+    if step.Done { return step }
+    if step.State.Failed { step.Done, step.Pending = true, false; return step }
+    if step.Pending {
+        step.Pending = false
+        step.State = step.State.syncThinkerOrder()
+        step.warp.Combat.World = step.State.World
+        step.warp = ResumeLineTeleport(step.State.Level, step.warp, rules)
+    }
+    return advanceActorCrossing(blocks, step, rules)
+}
+
+func finishActorCrossing(blocks wad.BlockMapInfo, step ActorCrossingStep,
+    rules CombatRules, actions WalkoverTelefrag) WalkoverState {
+    for range ThinkerIterationLimit {
+        if step.Done { return step.State }
+        if !step.Pending { step.State.Failed = true; return step.State }
+        step.State = actions.OnTelefrag(step.State, step.Event, rules)
+        step = ResumeActorCrossing(blocks, step, rules)
+    }
+    if !step.Done { step.State.Failed = true }
+    return step.State
+}
+
+func CrossActorLine(blocks wad.BlockMapInfo, state WalkoverState, handle int, crossing SpecialCrossing,
+    rules CombatRules, actions WalkoverTelefrag) WalkoverState {
+    step := beginActorLine(blocks, ActorCrossingStep{State: state, handle: handle}, crossing, rules)
+    step = advanceActorCrossing(blocks, step, rules)
+    return finishActorCrossing(blocks, step, rules, actions)
+}
+
+func CrossActorMove(blocks wad.BlockMapInfo, state WalkoverState, handle int, oldX int, oldY int,
+    position MapPositionCheck, rules CombatRules, actions WalkoverTelefrag) WalkoverState {
+    step := BeginActorCrossing(blocks, state, handle, oldX, oldY, position, rules)
+    return finishActorCrossing(blocks, step, rules, actions)
+}

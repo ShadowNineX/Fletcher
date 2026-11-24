@@ -1,0 +1,134 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted from getsfx, addsfx, I_SetChannels, and I_UpdateSound in
+// linuxdoom-1.10/i_sound.c.
+
+package audio
+
+import "wad"
+
+const MixerChannels = 8
+const MixerFrames = 512
+const DmxHeaderSize = 8
+const DoomSampleRate = 11025
+const NeutralSample = 128
+
+// I_SetChannels computes int(pow(2.0, (pitch - 128) / 64.0) * 65536.0).
+// These frozen values were generated from that exact expression so mixing is
+// deterministic on targets that do not expose floating point.
+const pitchSteps = [256]int{
+    16384, 16562, 16742, 16925, 17109, 17295, 17484, 17674, 17866, 18061, 18258, 18456, 18657, 18861, 19066, 19274, 19483, 19696, 19910, 20127, 20346, 20568, 20792, 21018, 21247, 21478, 21712, 21949, 22188, 22429, 22673, 22920,
+    23170, 23422, 23677, 23935, 24196, 24459, 24726, 24995, 25267, 25542, 25820, 26102, 26386, 26673, 26964, 27257, 27554, 27854, 28157, 28464, 28774, 29087, 29404, 29724, 30048, 30375, 30706, 31040, 31378, 31720, 32065, 32415,
+    32768, 33124, 33485, 33850, 34218, 34591, 34968, 35348, 35733, 36122, 36516, 36913, 37315, 37722, 38132, 38548, 38967, 39392, 39821, 40254, 40693, 41136, 41584, 42037, 42494, 42957, 43425, 43898, 44376, 44859, 45347, 45841,
+    46340, 46845, 47355, 47871, 48392, 48919, 49452, 49990, 50535, 51085, 51641, 52204, 52772, 53347, 53928, 54515, 55108, 55709, 56315, 56928, 57548, 58175, 58809, 59449, 60096, 60751, 61412, 62081, 62757, 63440, 64131, 64830,
+    65536, 66249, 66971, 67700, 68437, 69182, 69936, 70697, 71467, 72245, 73032, 73827, 74631, 75444, 76265, 77096, 77935, 78784, 79642, 80509, 81386, 82272, 83168, 84074, 84989, 85915, 86850, 87796, 88752, 89718, 90695, 91683,
+    92681, 93691, 94711, 95742, 96785, 97839, 98904, 99981, 101070, 102170, 103283, 104408, 105545, 106694, 107856, 109030, 110217, 111418, 112631, 113857, 115097, 116351, 117618, 118898, 120193, 121502, 122825, 124162, 125514, 126881, 128263, 129660,
+    131072, 132499, 133942, 135400, 136875, 138365, 139872, 141395, 142935, 144491, 146064, 147655, 149263, 150888, 152531, 154192, 155871, 157569, 159284, 161019, 162772, 164545, 166337, 168148, 169979, 171830, 173701, 175592, 177504, 179437, 181391, 183367,
+    185363, 187382, 189422, 191485, 193570, 195678, 197809, 199963, 202140, 204341, 206566, 208816, 211090, 213388, 215712, 218061, 220435, 222836, 225262, 227715, 230195, 232702, 235236, 237797, 240387, 243004, 245650, 248325, 251029, 253763, 256526, 259320,
+}
+
+type SoundSample struct {
+    Valid bit
+    Lump wad.LumpRef
+    Length int
+    PaddedLength int
+    Rate int
+}
+
+type Voice struct {
+    Active bit
+    Sample SoundSample
+    Position int
+    Step int
+    LeftVolume int
+    RightVolume int
+}
+
+type Mixer struct {
+    Voices [MixerChannels]Voice
+}
+
+type StereoFrame struct {
+    Left int
+    Right int
+    Mixer Mixer
+}
+
+func minimum(a int, b int) int {
+    if a < b { return a }
+    return b
+}
+
+func maximum(a int, b int) int {
+    if a > b { return a }
+    return b
+}
+
+func soundLumpValid(lump wad.LumpRef) bit {
+    return lump.Valid && lump.Offset >= 0 && lump.Size >= 0 && lump.Offset <= len(lump.File) &&
+        lump.Size <= len(lump.File) - lump.Offset
+}
+
+// LoadSoundSample reads the 8-byte Doom DMX header. The Linux backend uses
+// the lump's physical payload length, while the header count is only used for
+// validation so replacement WADs retain its historical playback behavior.
+func LoadSoundSample(lump wad.LumpRef) SoundSample {
+    if !soundLumpValid(lump) || lump.Size <= DmxHeaderSize { return SoundSample{} }
+    header := lump.Offset
+    rate, declared := wad.U16(lump.File, header + 2), wad.LE32(lump.File, header + 4)
+    length := lump.Size - DmxHeaderSize
+    if wad.U16(lump.File, header) != 3 || rate <= 0 || declared < 0 || declared > length {
+        return SoundSample{}
+    }
+    padded := ((length + MixerFrames - 1) / MixerFrames) * MixerFrames
+    return SoundSample{Valid: true, Lump: lump, Length: length, PaddedLength: padded, Rate: rate}
+}
+
+func sampleByte(sample SoundSample, index int) int {
+    if index < 0 || index >= sample.PaddedLength { return NeutralSample }
+    if index >= sample.Length { return NeutralSample }
+    return int(sample.Lump.File[sample.Lump.Offset + DmxHeaderSize + index])
+}
+
+func pitchStep(pitch int) int {
+    return pitchSteps[minimum(255, maximum(0, pitch))]
+}
+
+// StartVoice follows addsfx's quadratic 1..256 stereo separation transform.
+func StartVoice(sample SoundSample, volume int, separation int, pitch int) Voice {
+    if !sample.Valid { return Voice{} }
+    volume, separation = minimum(127, maximum(0, volume)), minimum(255, maximum(0, separation))
+    leftSeparation := separation + 1
+    left := volume - (volume * leftSeparation * leftSeparation >> 16)
+    rightSeparation := leftSeparation - 257
+    right := volume - (volume * rightSeparation * rightSeparation >> 16)
+    return Voice{Active: true, Sample: sample, Step: pitchStep(pitch), LeftVolume: left, RightVolume: right}
+}
+
+func mixVolume(volume int, sample int) int {
+    return volume * (sample - NeutralSample) * 256 / 127
+}
+
+func clampStereo(value int) int {
+    if value > 32767 { return 32767 }
+    if value < -32768 { return -32768 }
+    return value
+}
+
+// MixFrame advances each voice once. Repeating it 512 times is I_UpdateSound's
+// 512-sample Linux backend buffer. A voice stops after its neutral padding.
+func MixFrame(mixer Mixer) StereoFrame {
+    left, right := 0, 0
+    for index := range MixerChannels {
+        voice := mixer.Voices[index]
+        if voice.Active {
+            sampleIndex := voice.Position >> 16
+            value := sampleByte(voice.Sample, sampleIndex)
+            left, right = left + mixVolume(voice.LeftVolume, value), right + mixVolume(voice.RightVolume, value)
+            voice.Position = voice.Position + voice.Step
+            if voice.Position >> 16 >= voice.Sample.PaddedLength { voice.Active = false }
+            mixer.Voices[index] = voice
+        }
+    }
+    return StereoFrame{Left: clampStereo(left), Right: clampStereo(right), Mixer: mixer}
+}

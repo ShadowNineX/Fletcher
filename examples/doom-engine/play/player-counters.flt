@@ -1,0 +1,39 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// The live player counter and colormap updates from linuxdoom-1.10/p_user.c.
+
+package play
+
+const inversePlayerColormap = 32
+const powerBlinkTics = 4 * 32
+
+func TickLivePlayerCounters(world CombatWorld, handle int) CombatWorld {
+    actor := world.Actors.ActorAt(handle - 1)
+    slot := combatPlayer(actor)
+    if slot < 0 { return world }
+    player := world.Players[slot]
+    if player.Powers[PowerStrength] != 0 { player.Powers[PowerStrength] = player.Powers[PowerStrength] + 1 }
+    if player.Powers[PowerInvulnerability] != 0 { player.Powers[PowerInvulnerability] = player.Powers[PowerInvulnerability] - 1 }
+    if player.Powers[PowerInvisibility] != 0 {
+        player.Powers[PowerInvisibility] = player.Powers[PowerInvisibility] - 1
+        if player.Powers[PowerInvisibility] == 0 {
+            actor.Physics.Body.Flags = actor.Physics.Body.Flags & ~bits<32>(ActorShadow)
+            world.Actors = world.Actors.WithActor(handle, actor)
+        }
+    }
+    if player.Powers[PowerInfrared] != 0 { player.Powers[PowerInfrared] = player.Powers[PowerInfrared] - 1 }
+    if player.Powers[PowerIronFeet] != 0 { player.Powers[PowerIronFeet] = player.Powers[PowerIronFeet] - 1 }
+    if player.DamageCount != 0 { player.DamageCount = player.DamageCount - 1 }
+    if player.BonusCount != 0 { player.BonusCount = player.BonusCount - 1 }
+
+    player.FixedColormap = 0
+    if player.Powers[PowerInvulnerability] != 0 {
+        tics := player.Powers[PowerInvulnerability]
+        if tics > powerBlinkTics || tics & 8 != 0 { player.FixedColormap = inversePlayerColormap }
+    } else {
+        tics := player.Powers[PowerInfrared]
+        if tics > powerBlinkTics || tics & 8 != 0 { player.FixedColormap = 1 }
+    }
+    world.Players[slot] = player
+    return world
+}

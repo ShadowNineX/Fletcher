@@ -1,0 +1,110 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Sound start order and pitch variation follow linuxdoom-1.10/s_sound.c.
+
+package audio
+
+import "play"
+import "wad"
+
+type SoundScene struct {
+    Mixer Mixer
+    Slots [MixerChannels]SoundSlot
+    Sounds [MixerChannels]int
+}
+
+type SoundRequest struct {
+    Id int
+    Origin int
+    Position SoundPoint
+}
+
+type SoundListener struct {
+    Origin int
+    Position SoundPoint
+    Volume int
+    MapNumber int
+}
+
+type SoundStart struct {
+    Scene SoundScene
+    Random play.RandomState
+    Slot int
+    Parameters SoundParameters
+    Pitch int
+}
+
+type SoundPitch struct {
+    Value int
+    Random play.RandomState
+}
+
+func varyPitch(id int, pitch int, random play.RandomState) SoundPitch {
+    if id == SoundItemUp || id == SoundTink { return SoundPitch{Value: pitch, Random: random} }
+    roll := play.MRandom(random)
+    if id >= SoundSawUp && id <= SoundSawHit {
+        pitch = pitch + 8 - int(roll.Value & 15)
+    } else {
+        pitch = pitch + 16 - int(roll.Value & 31)
+    }
+    if pitch < 0 { pitch = 0 }
+    if pitch > 255 { pitch = 255 }
+    return SoundPitch{Value: pitch, Random: roll.State}
+}
+
+func (scene SoundScene) withoutVoice(slot int) SoundScene {
+    scene.Mixer.Voices[slot] = Voice{}
+    scene.Slots[slot] = SoundSlot{}
+    scene.Sounds[slot] = 0
+    return scene
+}
+
+// A global sound has origin zero. The original stop pass can replace a
+// global sound as well as a prior sound from the same actor or sector.
+func (scene SoundScene) StopSound(origin int) SoundScene {
+    for i := range MixerChannels {
+        if scene.Mixer.Voices[i].Active && scene.Slots[i].Origin == origin { return scene.withoutVoice(i) }
+    }
+    return scene
+}
+
+func (scene SoundScene) stopDuplicate(id int) SoundScene {
+    for i := range MixerChannels {
+        if scene.Mixer.Voices[i].Active && scene.Sounds[i] == id { return scene.withoutVoice(i) }
+    }
+    return scene
+}
+
+func StartSound(scene SoundScene, mounts wad.Archives, listener SoundListener, request SoundRequest, random play.RandomState) SoundStart {
+    result := SoundStart{Scene: scene, Random: random, Slot: -1}
+    effect := SoundEffectAt(request.Id)
+    if !effect.Valid || listener.Volume < 0 || listener.Volume > 127 { return result }
+    volume := listener.Volume + effect.VolumeAdjustment
+    if request.Id == SoundChaingun && volume < 1 { return result }
+    if volume > listener.Volume { volume = listener.Volume }
+    parameters := SoundParameters{Audible: true, Volume: volume, Separation: CenterSeparation}
+    if request.Origin != 0 && request.Origin != listener.Origin {
+        parameters = AdjustSound(listener.Position, request.Position, listener.MapNumber, listener.Volume)
+        if listener.Position.X == request.Position.X && listener.Position.Y == request.Position.Y {
+            parameters.Separation = CenterSeparation
+        }
+    }
+    if !parameters.Audible { return result }
+    pitch := varyPitch(request.Id, effect.Pitch, random)
+    result.Random, result.Parameters, result.Pitch = pitch.Random, parameters, pitch.Value
+
+    // Reuse finished voices and stop the old sound on the same origin before
+    // asking the priority allocator for a slot.
+    for i := range MixerChannels { scene.Slots[i].Active = scene.Mixer.Voices[i].Active }
+    scene = scene.StopSound(request.Origin)
+    slot := SelectSoundSlot(scene.Slots, request.Origin, effect.Priority)
+    if slot < 0 { result.Scene = scene; return result }
+    sample := LoadSoundEffect(mounts, effect)
+    if !sample.Valid { return result }
+    if effect.ExclusiveVoice { scene = scene.stopDuplicate(request.Id) }
+    scene.Mixer.Voices[slot] = StartVoice(sample, parameters.Volume, parameters.Separation, pitch.Value)
+    scene.Slots[slot] = SoundSlot{Active: true, Origin: request.Origin, Priority: effect.Priority}
+    scene.Sounds[slot] = request.Id
+    result.Scene, result.Slot = scene, slot
+    return result
+}

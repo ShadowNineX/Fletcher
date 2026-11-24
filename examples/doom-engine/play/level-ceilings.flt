@@ -1,0 +1,202 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Ceiling ownership, stasis and line specials from linuxdoom-1.10.
+
+package play
+
+import "wad"
+
+const MaxTrackedCeilings = 30
+const CeilingStop = -1
+
+type SectorCeiling struct {
+    Sector int
+    Tag int
+    Order int
+    Tracked bit
+    Motion CeilingState
+    trackedSlot int
+}
+
+func (entry SectorCeiling) sectorIndex() int { return entry.Sector }
+func (entry SectorCeiling) registrationOrder() int { return entry.Order }
+
+// All ceilings are thinkers. The separate native 30-slot registry controls
+// stasis and removal, and never promotes an existing untracked thinker.
+type LevelCeilings struct {
+    Count int
+    TrackedCount int
+    tracked [MaxTrackedCeilings]int
+    thinkers sectorThinkerList<SectorCeiling>
+}
+
+func (ceilings LevelCeilings) FindSector(sector int) int { return ceilings.thinkers.findSector(sector) }
+func (ceilings LevelCeilings) EntryAt(handle int) SectorCeiling { return ceilings.thinkers.slotAt(handle).Entry }
+
+func (ceilings LevelCeilings) WithMotion(handle int, motion CeilingState) LevelCeilings {
+    entry := ceilings.EntryAt(handle)
+    entry.Motion = motion
+    ceilings.thinkers = ceilings.thinkers.withEntry(handle, entry)
+    return ceilings
+}
+
+func (ceilings LevelCeilings) withHeight(sector int, height int) LevelCeilings {
+    handle := ceilings.FindSector(sector)
+    for range ceilings.Count {
+        if handle == 0 { return ceilings }
+        slot := ceilings.thinkers.slotAt(handle)
+        if slot.Entry.Motion.Height != height {
+            slot.Entry.Motion.Height = height
+            ceilings.thinkers = ceilings.thinkers.withEntry(handle, slot.Entry)
+        }
+        handle = slot.OlderInSector
+    }
+    return ceilings
+}
+
+func (ceilings LevelCeilings) firstFreeTrackedSlot() int {
+    for i := range MaxTrackedCeilings {
+        if ceilings.tracked[i] == 0 { return i }
+    }
+    return MaxTrackedCeilings
+}
+
+func (ceilings LevelCeilings) Append(entry SectorCeiling) LevelCeilings {
+    entry.Tracked = ceilings.TrackedCount < MaxTrackedCeilings
+    entry.trackedSlot = 0
+    if entry.Tracked {
+        entry.trackedSlot = ceilings.firstFreeTrackedSlot() + 1
+        ceilings.TrackedCount = ceilings.TrackedCount + 1
+    }
+    ceilings.thinkers = ceilings.thinkers.append(entry)
+    if entry.Tracked {
+        ceilings.tracked[entry.trackedSlot - 1] = ceilings.thinkers.last
+    }
+    ceilings.Count = ceilings.Count + 1
+    return ceilings
+}
+
+func (ceilings LevelCeilings) remove(handle int) LevelCeilings {
+    entry := ceilings.EntryAt(handle)
+    ceilings.tracked[entry.trackedSlot - 1] = 0
+    ceilings.TrackedCount = ceilings.TrackedCount - 1
+    ceilings.Count = ceilings.Count - 1
+    ceilings.thinkers = ceilings.thinkers.remove(handle)
+    return ceilings
+}
+
+func (ceilings LevelCeilings) stop(tag int) LevelCeilings {
+    if ceilings.TrackedCount == 0 { return ceilings }
+    for i := range MaxTrackedCeilings {
+        handle := ceilings.tracked[i]
+        if handle > 0 {
+            entry := ceilings.EntryAt(handle)
+            if entry.Tag == tag && entry.Motion.Direction != 0 {
+                entry.Motion.OldDirection = entry.Motion.Direction
+                entry.Motion.Direction = 0
+                ceilings = ceilings.WithMotion(handle, entry.Motion)
+            }
+        }
+    }
+    return ceilings
+}
+
+func (ceilings LevelCeilings) resume(tag int) LevelCeilings {
+    if ceilings.TrackedCount == 0 { return ceilings }
+    for i := range MaxTrackedCeilings {
+        handle := ceilings.tracked[i]
+        if handle > 0 {
+            entry := ceilings.EntryAt(handle)
+            if entry.Tag == tag && entry.Motion.Direction == 0 {
+                entry.Motion.Direction = entry.Motion.OldDirection
+                ceilings = ceilings.WithMotion(handle, entry.Motion)
+            }
+        }
+    }
+    return ceilings
+}
+
+func highestNeighborCeiling(level wad.BspLevel, sector int) int {
+    highest := 0
+    for i := range level.Lines.Count {
+        neighbor := neighboringSector(level.LineAt(i), sector)
+        if neighbor >= 0 {
+            height := level.SectorHeightsAt(neighbor).Ceiling
+            if height > highest { highest = height }
+        }
+    }
+    return highest
+}
+
+type TaggedCeilingStart struct {
+    State LevelSpecials
+    Started bit
+}
+
+func startTaggedCeilings(level wad.BspLevel, state LevelSpecials, tag int, mode int) TaggedCeilingStart {
+    if mode == CeilingCrushAndRaise || mode == CeilingFastCrushAndRaise || mode == CeilingSilentCrushAndRaise {
+        state.Ceilings = state.Ceilings.resume(tag)
+    }
+    started := false
+    for sector := range level.Sectors.Count {
+        if level.SectorTag(sector) == tag && !state.MoverOccupied(sector) {
+            heights := level.SectorHeightsAt(sector)
+            highest := 0
+            if mode == CeilingRaiseHighest { highest = highestNeighborCeiling(level, sector) }
+            motion := StartCeiling(mode, heights.Ceiling, heights.Floor, highest)
+            entry := SectorCeiling{Sector: sector, Tag: tag, Order: state.Doors.NextMover, Motion: motion}
+            state.Ceilings = state.Ceilings.Append(entry)
+            state.Doors.NextMover = state.Doors.NextMover + 1
+            started = true
+        }
+    }
+    // EV_DoCeiling reports new allocations. Resuming alone does not turn a switch.
+    return TaggedCeilingStart{State: state, Started: started}
+}
+
+type CeilingAction struct {
+    Mode int
+    Once bit
+}
+
+func useCeilingAction(special int) CeilingAction {
+    switch special {
+    case 41, 43: return CeilingAction{Mode: CeilingLowerToFloor, Once: special == 41}
+    case 49: return CeilingAction{Mode: CeilingCrushAndRaise, Once: true}
+    }
+    return CeilingAction{}
+}
+
+func walkCeilingAction(special int) CeilingAction {
+    switch special {
+    case 6, 77: return CeilingAction{Mode: CeilingFastCrushAndRaise, Once: special == 6}
+    case 25, 73: return CeilingAction{Mode: CeilingCrushAndRaise, Once: special == 25}
+    case 40: return CeilingAction{Mode: CeilingRaiseHighest, Once: true}
+    case 44, 72: return CeilingAction{Mode: CeilingLowerAndCrush, Once: special == 44}
+    case 57, 74: return CeilingAction{Mode: CeilingStop, Once: special == 57}
+    case 141: return CeilingAction{Mode: CeilingSilentCrushAndRaise, Once: true}
+    }
+    return CeilingAction{}
+}
+
+func activateCeilingLine(level wad.BspLevel, state LevelSpecials, index int, line wad.CollisionLine,
+    action CeilingAction, use bit) LevelSpecials {
+    started := false
+    if action.Mode == CeilingStop {
+        state.Ceilings = state.Ceilings.stop(line.Tag)
+    } else {
+        activated := startTaggedCeilings(level, state, line.Tag, action.Mode)
+        state, started = activated.State, activated.Started
+        if line.Action == 40 {
+            // The ceiling claims specialdata first, so the floor attempt
+            // normally skips the same tagged sector.
+            state = startTaggedFloors(level, state, line, FloorLowerLowest).State
+        }
+    }
+    if use {
+        if started { state.Doors = changeLineSwitch(level, state.Doors, index, action.Once) }
+    } else if action.Once {
+        state.Doors = state.Doors.consumeLine(index)
+    }
+    return state
+}

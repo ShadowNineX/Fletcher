@@ -1,0 +1,39 @@
+package main
+
+import "play"
+
+type ScriptSink struct {}
+
+func (sink ScriptSink) Think(handle int, payload int) play.ThinkerAction {
+    switch payload {
+    case 10:
+        return play.ThinkerAction{Update: true, Payload: 11, Remove: true, RemoveHandle: 2, Append: true, AppendPayload: 40}
+    case 20:
+        return play.ThinkerAction{Update: true, Payload: 21, Remove: true, RemoveHandle: handle}
+    case 40:
+        return play.ThinkerAction{Update: true, Payload: 41}
+    default:
+        return play.ThinkerAction{Update: true, Payload: payload + 1}
+    }
+}
+
+map "Doom thinker parity" {
+    tick {
+        if currentTick() == 0 {
+            state := play.InitThinkers()
+            first := play.AddThinker(state, 10)
+            state = first.State
+            second := play.AddThinker(state, 20)
+            state = second.State
+            third := play.AddThinker(state, 30)
+            state = third.State
+            state = play.RunThinkers(state, ScriptSink{})
+            log(first.Handle, second.Handle, third.Handle, state.RunCount, state.RunOrder[0], state.RunOrder[1], state.RunOrder[2],
+                state.Count, state.Head, state.Tail, state.Slots[0].Payload, state.Slots[1].Removed, state.Slots[2].Active,
+                state.Slots[3].Payload, state.Failed)
+            state = play.RunThinkers(state, ScriptSink{})
+            log(state.RunCount, state.RunOrder[0], state.RunOrder[1], state.Count, state.Head, state.Tail,
+                state.Slots[0].Payload, state.Slots[1].Active, state.Slots[3].Payload, state.Failed)
+        }
+    }
+}

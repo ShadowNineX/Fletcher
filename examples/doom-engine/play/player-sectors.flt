@@ -1,0 +1,100 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// P_PlayerInSpecialSector from linuxdoom-1.10/p_spec.c.
+
+package play
+
+import "wad"
+
+// Classic SIDEDEFS address sectors through an unsigned 16-bit index.
+const sectorSpecialWords = 65536 / 32
+
+type ClearedSectorSpecials struct {
+    Words [sectorSpecialWords]bits<32>
+    Count int
+}
+
+func (cleared ClearedSectorSpecials) Contains(sector int) bit {
+    if cleared.Count == 0 || sector < 0 || sector >= sectorSpecialWords * 32 { return false }
+    return cleared.Words[sector >> 5] & (bits<32>(1) << (sector & 31)) != 0
+}
+
+func (state LevelSpecials) clearSectorSpecial(sector int) LevelSpecials {
+    if sector < 0 || sector >= sectorSpecialWords * 32 { return state }
+    if !state.Floors.ClearedSpecials.Contains(sector) {
+        state.Floors.ClearedSpecials.Words[sector >> 5] = state.Floors.ClearedSpecials.Words[sector >> 5] | (bits<32>(1) << (sector & 31))
+        state.Floors.ClearedSpecials.Count = state.Floors.ClearedSpecials.Count + 1
+    }
+    surface := state.Floors.surfaceAt(sector)
+    if surface.Changed && surface.Special != 0 {
+        surface.Special = 0
+        state.Floors = state.Floors.withSurface(sector, surface)
+        state.Floors.Revision = state.Floors.Revision + 1
+    }
+    return state
+}
+
+func (state LevelSpecials) baseSectorSpecial(level wad.BspLevel, sector int) int {
+    if state.Floors.ClearedSpecials.Contains(sector) { return 0 }
+    special := level.SectorSpecial(sector)
+    // P_SpawnSpecials consumes timed-door setup specials as it installs their
+    // thinkers. They cannot survive as live sector effects or be copied by a
+    // later floor transfer.
+    if special == 10 || special == 14 { return 0 }
+    if special == 0 { return 0 }
+    return state.Lighting.Lights.SectorSpecialAt(sector, special)
+}
+
+func (state LevelSpecials) playerSectorSpecial(level wad.BspLevel, sector int) int {
+    surface := state.Floors.surfaceAt(sector)
+    if surface.Changed { return surface.Special }
+    return state.baseSectorSpecial(level, sector)
+}
+
+type PlayerSectorStep struct {
+    State LevelSpecials
+    Combat CombatStep
+}
+
+func TickPlayerSector(level wad.BspLevel, state LevelSpecials, world CombatWorld, handle int, levelTime int,
+    rules CombatRules) PlayerSectorStep {
+    result := PlayerSectorStep{State: state, Combat: CombatStep{World: world}}
+    actor := world.Actors.ActorAt(handle - 1)
+    slot, sector := combatPlayer(actor), actor.Sector
+    if slot < 0 || sector < 0 || sector >= level.Sectors.Count || world.Players[slot].Dead { return result }
+    special := state.playerSectorSpecial(level, sector)
+    if special == 0 || actor.Physics.Body.Z != level.SectorHeightsAt(sector).Floor { return result }
+    inventory := world.Players[slot]
+    protected := inventory.Powers[PowerIronFeet] != 0
+    amount := 0
+    switch special {
+    case 5:
+        if !protected { amount = 10 }
+    case 7:
+        if !protected { amount = 5 }
+    case 4, 16:
+        if protected {
+            // The suit check draws even between the 32-tic damage pulses.
+            roll := PRandom(world.Random)
+            world.Random = roll.State
+            protected = roll.Value >= 5
+        }
+        if !protected { amount = 20 }
+    case 9:
+        world.Players[slot].SecretCount = inventory.SecretCount + 1
+        state = state.clearSectorSpecial(sector)
+    case 11:
+        world.Players[slot].Cheats = inventory.Cheats & ~bits<32>(CheatGodMode)
+        amount = 20
+    }
+
+    result.Combat.World = world
+    if amount != 0 && levelTime & 31 == 0 {
+        result.Combat = DamageMobj(state.ApplyTo(level), world, DamageRequest{Target: handle, Amount: amount}, rules)
+    }
+    if special == 11 && !result.Combat.Failed && result.Combat.World.Players[slot].Health <= 10 {
+        state = requestLevelExit(level, state, false)
+    }
+    result.State = state
+    return result
+}

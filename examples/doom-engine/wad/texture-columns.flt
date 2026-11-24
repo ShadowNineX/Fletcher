@@ -1,0 +1,240 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted on 2026-11-21 from R_GenerateLookup, R_GenerateComposite,
+// R_GetColumn, and R_DrawColumnInCache in linuxdoom-1.10/r_data.c.
+
+package wad
+
+const TextureColumnRows = 128
+const texturePixelWords = TextureColumnRows / 4
+const textureCoverageWords = TextureColumnRows / 32
+const cachedTexturePatches = 64
+
+// TextureColumn is prepared once for a logical wall texture column. Direct
+// columns retain their patch source. Composite columns own opaque samples;
+// Covered prevents transparent holes from exposing uninitialized cache bytes.
+type TextureColumn struct {
+    PackedPixels [texturePixelWords]bits<32>
+    Covered [textureCoverageWords]bits<32>
+    Height int
+    DirectPatch LumpRef
+    DirectSourceColumn int
+    DirectOffset int
+    Direct bit
+    DirectRaw bit
+    Valid bit
+}
+
+type TextureSheet struct {
+    Patch LumpRef
+    OriginX int
+    Width int
+    Height int
+    Valid bit
+}
+
+type texturePatch struct {
+    Lump LumpRef
+    X int
+    Y int
+    Width int
+}
+
+// A wall run reuses the same patch directory entries for every column.
+// Definitions larger than the cache still resolve their patches on demand.
+type TextureColumns struct {
+    texture TextureDef
+    Sheet TextureSheet
+    Mask int
+    patches [cachedTexturePatches]texturePatch
+    cached bit
+}
+
+// TextureColumnWidthMask is the original largest lower power-of-two mask.
+func TextureColumnWidthMask(texture TextureDef) int {
+    if !texture.Valid || texture.Width <= 0 { return 0 }
+    power := 1
+    for range 14 {
+        if power * 2 > texture.Width { return power - 1 }
+        power = power * 2
+    }
+    return power - 1
+}
+
+// drawPatchColumn parses one patch column once and copies opaque posts. Its
+// clipped-negative-origin source indexing deliberately matches
+// R_DrawColumnInCache's historical behavior.
+func drawPatchColumn(cache TextureColumn, source texturePatch, column int) TextureColumn {
+    patch, width := source.Lump, source.Width
+    if width <= 0 { return TextureColumn{} }
+    file := patch.File
+    if column < 0 || column >= width { return cache }
+    relative := LE32(file, patch.Offset + PatchHeaderSize + column * 4)
+    directoryEnd := PatchHeaderSize + width * 4
+    if relative < directoryEnd || relative >= patch.Size { return TextureColumn{} }
+    cursor, end := patch.Offset + relative, patch.Offset + patch.Size
+    for range patch.Size / 4 + 1 {
+        if cursor >= end { return TextureColumn{} }
+        top := int(file[cursor])
+        if top == 255 { return cache }
+        if cursor > end - 4 { return TextureColumn{} }
+        length := int(file[cursor + 1])
+        if length > end - cursor - 4 { return TextureColumn{} }
+        position, count := source.Y + top, length
+        if position < 0 { count, position = count + position, 0 }
+        if position + count > cache.Height { count = cache.Height - position }
+        if count > 0 {
+            prefix := (4 - (position & 3)) & 3
+            if prefix > count { prefix = count }
+            words := (count - prefix) >> 2
+            middle := words << 2
+            // Partial words preserve any samples from an earlier patch.
+            for edge := range count - middle {
+                offset := edge
+                if edge >= prefix { offset = offset + middle }
+                row := position + offset
+                word := row >> 2
+                shift := (row & 3) << 3
+                clear := ~(bits<32>(255) << shift)
+                cache.PackedPixels[word] = (cache.PackedPixels[word] & clear) | (bits<32>(file[cursor + 3 + offset]) << shift)
+                cache.Covered[row >> 5] = cache.Covered[row >> 5] | (bits<32>(1) << (row & 31))
+            }
+            for block := range words {
+                offset := prefix + (block << 2)
+                row := position + offset
+                cache.PackedPixels[row >> 2] = bits<32>(LE32(file, cursor + 3 + offset))
+                cache.Covered[row >> 5] = cache.Covered[row >> 5] | (bits<32>(15) << (row & 31))
+            }
+        }
+        cursor = cursor + length + 4
+    }
+    return TextureColumn{}
+}
+
+// R_GenerateLookup points past the post header on the single-patch path.
+// It does not apply the texture's patch Y origin. Only borrow a raw slice
+// when the first post contains every row the caller will sample.
+func directRawOffset(patch LumpRef, column int, height int) int {
+    if !patch.Valid || column < 0 || patch.Size < PatchHeaderSize { return -1 }
+    width := signed16(U16(patch.File, patch.Offset))
+    if column >= width { return -1 }
+    relative := LE32(patch.File, patch.Offset + PatchHeaderSize + column * 4)
+    directoryEnd := PatchHeaderSize + width * 4
+    if relative < directoryEnd || relative >= patch.Size { return -1 }
+    cursor := patch.Offset + relative
+    if cursor > patch.Offset + patch.Size - 4 || int(patch.File[cursor]) != 0 { return -1 }
+    length := int(patch.File[cursor + 1])
+    if length < height || length >= patch.Offset + patch.Size - cursor - 4 ||
+        int(patch.File[cursor + length + 4]) != 255 { return -1 }
+    return cursor + 3
+}
+
+func DirectTextureSheet(texture TextureDef) TextureSheet {
+    if !texture.Valid || texture.PatchCount != 1 { return TextureSheet{} }
+    patchEntry := texture.Offset + TextureHeaderSize
+    patch := patchLump(texture.Mounts, texture.PNames, signed16(U16(texture.File, patchEntry + 4)))
+    width := patchWidth(patch)
+    if width <= 0 { return TextureSheet{} }
+    height := texture.Height
+    if height > TextureColumnRows { height = TextureColumnRows }
+    return TextureSheet{Patch: patch, OriginX: signed16(U16(texture.File, patchEntry)),
+        Width: width, Height: height, Valid: true}
+}
+
+func prepareDirectColumn(patch LumpRef, sourceColumn int, height int) TextureColumn {
+    offset := directRawOffset(patch, sourceColumn, height)
+    if offset < 0 {
+        checked := patchPixel(patch, sourceColumn, 0, 0, height)
+        if !checked.Valid { return TextureColumn{} }
+    }
+    return TextureColumn{Height: height, Valid: true, Direct: true, DirectPatch: patch,
+        DirectSourceColumn: sourceColumn, DirectOffset: offset, DirectRaw: offset >= 0}
+}
+
+// The caller has already applied the texture width mask. Resolve the patch
+// once per texture, then address its columns directly from that lump.
+func PrepareSheetColumn(sheet TextureSheet, wrapped int) TextureColumn {
+    sourceColumn := wrapped - sheet.OriginX
+    if !sheet.Valid || sourceColumn < 0 || sourceColumn >= sheet.Width { return TextureColumn{} }
+    return prepareDirectColumn(sheet.Patch, sourceColumn, sheet.Height)
+}
+
+func patchWidth(patch LumpRef) int {
+    if !patch.Valid || patch.Size < PatchHeaderSize { return -1 }
+    width, height := signed16(U16(patch.File, patch.Offset)), signed16(U16(patch.File, patch.Offset + 2))
+    if width <= 0 || height <= 0 || PatchHeaderSize + width * 4 > patch.Size { return -1 }
+    return width
+}
+
+func texturePatchAt(texture TextureDef, index int) texturePatch {
+    entry, file := texture.Offset + TextureHeaderSize + index * TexturePatchSize, texture.File
+    patch := patchLump(texture.Mounts, texture.PNames, signed16(U16(file, entry + 4)))
+    return texturePatch{Lump: patch, X: signed16(U16(file, entry)), Y: signed16(U16(file, entry + 2)), Width: patchWidth(patch)}
+}
+
+func PrepareTextureColumns(texture TextureDef) TextureColumns {
+    source := TextureColumns{texture: texture, Mask: TextureColumnWidthMask(texture), Sheet: DirectTextureSheet(texture)}
+    if texture.Valid && texture.PatchCount > 1 && texture.PatchCount <= cachedTexturePatches {
+        for index := range texture.PatchCount { source.patches[index] = texturePatchAt(texture, index) }
+        source.cached = true
+    }
+    return source
+}
+
+func (source TextureColumns) patchAt(index int) texturePatch {
+    if source.cached { return source.patches[index] }
+    return texturePatchAt(source.texture, index)
+}
+
+// PrepareTextureColumn performs R_GenerateLookup's width-mask and patch count
+// work for a resolved TextureDef. It returns a direct source for one patch, or
+// a bounded 128-row later-patch-wins composite for overlapping patches.
+func PrepareTextureColumn(texture TextureDef, column int) TextureColumn {
+    source := TextureColumns{texture: texture, Mask: TextureColumnWidthMask(texture), Sheet: DirectTextureSheet(texture)}
+    return source.ColumnAt(column)
+}
+
+func (source TextureColumns) ColumnAt(column int) TextureColumn {
+    if !source.texture.Valid { return TextureColumn{} }
+    wrapped := column & source.Mask
+    patchCount := source.texture.PatchCount
+    if patchCount == 1 { return PrepareSheetColumn(source.Sheet, wrapped) }
+    height := source.texture.Height
+    if height > TextureColumnRows { height = TextureColumnRows }
+    matches, lastColumn := 0, 0
+    var lastPatch LumpRef
+    for index := range patchCount {
+        patch := source.patchAt(index)
+        column := wrapped - patch.X
+        if patch.Width < 0 { return TextureColumn{} }
+        if column >= 0 && column < patch.Width {
+            matches = matches + 1
+            lastPatch, lastColumn = patch.Lump, column
+        }
+    }
+    if matches == 0 { return TextureColumn{} }
+    if matches == 1 { return prepareDirectColumn(lastPatch, lastColumn, height) }
+    cache := TextureColumn{Height: height, Valid: true}
+    for index := range patchCount {
+        patch := source.patchAt(index)
+        column := wrapped - patch.X
+        if column >= 0 && column < patch.Width {
+            cache = drawPatchColumn(cache, patch, column)
+            if !cache.Valid { return TextureColumn{} }
+        }
+    }
+    return cache
+}
+
+// TextureColumnPixel returns an opaque palette index or Covered=false for a
+// transparent hole. DirectRaw callers may instead read DirectPatch.File at
+// DirectOffset + row for their renderer's hot path.
+func TextureColumnPixel(column TextureColumn, row int) TexturePixel {
+    if !column.Valid || row < 0 || row >= column.Height { return TexturePixel{} }
+    if column.Direct {
+        if column.DirectRaw { return TexturePixel{Value: column.DirectPatch.File[column.DirectOffset + row], Covered: true, Valid: true} }
+        return patchPixel(column.DirectPatch, column.DirectSourceColumn, row, 0, column.Height)
+    }
+    value := bits<8>(column.PackedPixels[row >> 2] >> ((row & 3) << 3))
+    return TexturePixel{Value: value, Covered: column.Covered[row >> 5][row & 31], Valid: true}
+}

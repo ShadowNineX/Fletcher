@@ -1,0 +1,101 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// P_TeleportMove and PIT_StompThing from linuxdoom-1.10/p_map.c.
+
+package play
+
+import "wad"
+
+const teleportScanBatch = 16
+
+type TeleportMoveStep struct {
+    Combat CombatStep
+    Hit DamageRequest
+    Done bit
+    Allowed bit
+    handle int
+    x int
+    y int
+    bossStomp bit
+    scan ThingScan
+    struck int
+}
+
+func BeginTeleportMove(level wad.BspLevel, blocks wad.BlockMapInfo, world CombatWorld, handle int,
+    x int, y int, mapNumber int, rules CombatRules) TeleportMoveStep {
+    step := TeleportMoveStep{Combat: CombatStep{World: world}, handle: handle, x: x, y: y}
+    actor := world.Actors.ActorAt(handle - 1)
+    sector := level.SectorAtPoint(x, y)
+    if !actor.Valid || !sector.Valid || !blocks.Valid { step.Combat.Failed = true; return step }
+    body := actor.Physics.Body
+    step.bossStomp = mapNumber == 30
+    step.Combat.World.Position = PositionQuery{Thing: handle, X: x, Y: y,
+        Floor: sector.Heights.Floor, Ceiling: sector.Heights.Ceiling, CeilingLine: -1}
+    // The native teleport scan runs even when the mover is noclip.
+    body.Flags = body.Flags & ~bits<32>(MoveNoClip)
+    step.scan = BeginThingScan(blocks, body, x, y)
+    return ResumeTeleportMove(level, step, rules)
+}
+
+func finishTeleportMove(level wad.BspLevel, step TeleportMoveStep) TeleportMoveStep {
+    world := step.Combat.World
+    actor := world.Actors.ActorAt(step.handle - 1)
+    actor.Physics.Body.X, actor.Physics.Body.Y = step.x, step.y
+    actor.Physics.Body.Floor, actor.Physics.Body.Ceiling = world.Position.Floor, world.Position.Ceiling
+    linked := world.Links.SetActorPosition(level, step.handle, actor)
+    if !linked.Valid { step.Combat.Failed = true; return step }
+    step.Combat.World.Actors = world.Actors.WithActor(step.handle, linked.Actor)
+    step.Combat.World.Links = linked.Links
+    step.Combat.ActorHandle = step.handle
+    step.Done, step.Allowed = true, true
+    return step
+}
+
+func ResumeTeleportMove(level wad.BspLevel, step TeleportMoveStep, rules CombatRules) TeleportMoveStep {
+    if step.Done || step.Combat.Failed { return step }
+    step.Hit = DamageRequest{}
+    if step.Combat.State.Action != 0 {
+        step.Combat = ResumeMobjCombat(level, step.Combat, rules)
+        return step
+    }
+    step.Combat.Feedback = CombatFeedback{}
+    world := step.Combat.World
+    scan := step.scan
+    if step.struck != 0 {
+        if world.Actors.ActorAt(step.struck - 1).Valid { scan.Candidate = world.Links.BlockNext(step.struck) }
+        step.struck = 0
+    }
+    // Keep the original scan bounds and read the current position query on
+    // each resume. A telefrag's state action may have checked another move.
+    query := world.Position
+    mover := world.Actors.ActorAt(query.Thing - 1).Physics.Body
+    for range teleportScanBatch {
+        if scan.Done || scan.Column > scan.Right { return finishTeleportMove(level, step) }
+        if !scan.ReadCell {
+            scan.Candidate = world.Links.BlockFirst(scan.Column, scan.Row)
+            scan.ReadCell = true
+        }
+        if scan.Candidate == 0 {
+            scan.Row = scan.Row + 1
+            if scan.Row > scan.Top { scan.Column, scan.Row = scan.Column + 1, scan.Bottom }
+            scan.ReadCell = false
+        } else {
+            handle := scan.Candidate
+            scan.Candidate = world.Links.BlockNext(handle)
+            target := world.Actors.ActorAt(handle - 1)
+            body := target.Physics.Body
+            reach := mover.Radius + body.Radius
+            dx, dy := body.X - query.X, body.Y - query.Y
+            if target.Valid && handle != query.Thing && body.Flags & ActorShootable != 0 &&
+                dx > -reach && dx < reach && dy > -reach && dy < reach {
+                if !mover.Player && !step.bossStomp { step.Done = true; return step }
+                step.struck, step.scan = handle, scan
+                step.Hit = DamageRequest{Target: handle, Source: query.Thing, Inflictor: query.Thing, Amount: 10000}
+                step.Combat = DamageMobj(level, world, step.Hit, rules)
+                return step
+            }
+        }
+    }
+    step.scan = scan
+    return step
+}

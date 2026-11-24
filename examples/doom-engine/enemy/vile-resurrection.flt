@@ -1,0 +1,114 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// PIT_VileCheck and A_VileChase from linuxdoom-1.10/p_enemy.c.
+
+package enemy
+
+import "actorinfo"
+import "engine"
+import "play"
+import "wad"
+
+const vileSearchReach = 64 * engine.FracUnit
+
+type VileResurrection struct {
+    World play.CombatWorld
+    Raised bit
+    Failed bit
+    Corpse int
+    Feedback play.CombatFeedback
+}
+
+func corpseInReach(corpse play.LevelActor, x int, y int) bit {
+    if !corpse.Valid || corpse.Physics.Body.Flags & play.MoveCorpse == 0 || corpse.Tics != -1 { return false }
+    info := actorinfo.KindAt(corpse.Kind)
+    reach := info.Radius + actorinfo.KindAt(actorinfo.ActorVile).Radius
+    dx, dy := corpse.Physics.Body.X - x, corpse.Physics.Body.Y - y
+    return info.RaiseState != play.ActorNullState && dx >= -reach && dx <= reach && dy >= -reach && dy <= reach
+}
+
+func checkVileCorpse(level wad.BspLevel, blocks wad.BlockMapInfo, world play.CombatWorld, handle int,
+    corpse play.LevelActor) play.MapPositionCheck {
+    corpse.Physics.Body.Height = corpse.Physics.Body.Height << 2
+    body := corpse.Physics.Body
+    position := play.BeginMapPositionCheck(level, blocks, body, body.X, body.Y)
+    if !position.Valid { return position }
+    scan := play.BeginThingScan(blocks, body, body.X, body.Y)
+    contact := play.ScanThingContacts(scan, world.Actors, world.Links, corpse, handle, world.Random)
+    // A raisable corpse never touches pickups, charges or hits as a missile.
+    if !contact.Scan.Done || contact.Contact.Action != 0 { return play.MapPositionCheck{} }
+    position.Clear = !contact.Scan.Blocked
+    // PIT_VileCheck uses P_CheckPosition, so opening heights only inform the
+    // position result. No movement or standing-height check follows.
+    return play.FinishMapPositionCheck(level, blocks, body, body.X, body.Y, position)
+}
+
+func raiseVileCorpse(world play.CombatWorld, handle int, corpseHandle int) VileResurrection {
+    vile := world.Actors.ActorAt(handle - 1)
+    oldTarget := vile.Target
+    vile.Target = corpseHandle
+    world.Actors = world.Actors.WithActor(handle, vile)
+    world = FaceTarget(world, handle)
+    vile = world.Actors.ActorAt(handle - 1)
+    vile.Target = oldTarget
+    healed := play.SetMobjState(vile, actorinfo.StateVileHeal1)
+
+    corpse := world.Actors.ActorAt(corpseHandle - 1)
+    info := actorinfo.KindAt(corpse.Kind)
+    raised := play.SetMobjState(corpse, info.RaiseState)
+    if healed.Failed || raised.Failed || healed.Action != 0 || raised.Action != 0 {
+        return VileResurrection{World: world, Failed: true}
+    }
+    corpse = raised.Actor
+    corpse.Physics.Body.Height = corpse.Physics.Body.Height << 2
+    corpse.Physics.Body.Flags, corpse.Health, corpse.Target = info.Flags, info.SpawnHealth, 0
+    world.Actors = world.Actors.WithActor(handle, healed.Actor).WithActor(corpseHandle, corpse)
+    return VileResurrection{World: world, Raised: true, Corpse: corpseHandle,
+        Feedback: play.CombatFeedback{Sound: actorinfo.SoundSlop, SoundOrigin: corpseHandle}}
+}
+
+func scanVileCell(level wad.BspLevel, blocks wad.BlockMapInfo, world play.CombatWorld, handle int, candidate int,
+    x int, y int) VileResurrection {
+    for range world.Actors.Count {
+        if candidate == 0 { return VileResurrection{World: world} }
+        corpse := world.Actors.ActorAt(candidate - 1)
+        if corpseInReach(corpse, x, y) {
+            corpse.Physics.MomentumX, corpse.Physics.MomentumY = 0, 0
+            world.Actors = world.Actors.WithActor(candidate, corpse)
+            fit := checkVileCorpse(level, blocks, world, candidate, corpse)
+            if !fit.Valid { return VileResurrection{World: world, Failed: true} }
+            world = world.WithPositionCheck(candidate, corpse.Physics.Body.X, corpse.Physics.Body.Y, fit)
+            if fit.Clear { return raiseVileCorpse(world, handle, candidate) }
+        }
+        candidate = world.Links.BlockNext(candidate)
+    }
+    return VileResurrection{World: world}
+}
+
+func TryVileResurrection(level wad.BspLevel, blocks wad.BlockMapInfo, world play.CombatWorld, handle int) VileResurrection {
+    vile := world.Actors.ActorAt(handle - 1)
+    direction := vile.MoveDirection
+    if !blocks.Valid || !vile.Valid || direction < ChaseEast || direction > ChaseSouthEast {
+        return VileResurrection{World: world}
+    }
+
+    speed := actorinfo.KindAt(vile.Kind).Speed
+    x, y := vile.Physics.Body.X + speed * walkX[direction], vile.Physics.Body.Y + speed * walkY[direction]
+    left, right := (x - vileSearchReach - blocks.OriginX) >> wad.MapBlockShift, (x + vileSearchReach - blocks.OriginX) >> wad.MapBlockShift
+    bottom, top := (y - vileSearchReach - blocks.OriginY) >> wad.MapBlockShift, (y + vileSearchReach - blocks.OriginY) >> wad.MapBlockShift
+    if left < 0 { left = 0 }
+    if bottom < 0 { bottom = 0 }
+    if right >= blocks.Width { right = blocks.Width - 1 }
+    if top >= blocks.Height { top = blocks.Height - 1 }
+    if left > right || bottom > top { return VileResurrection{World: world} }
+
+    for column := range right - left + 1 {
+        for row := range top - bottom + 1 {
+            candidate := world.Links.BlockFirst(left + column, bottom + row)
+            result := scanVileCell(level, blocks, world, handle, candidate, x, y)
+            if result.Raised || result.Failed { return result }
+            world = result.World
+        }
+    }
+    return VileResurrection{World: world}
+}

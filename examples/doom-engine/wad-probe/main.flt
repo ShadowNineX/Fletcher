@@ -1,0 +1,20 @@
+package main
+
+const Wad = readFile("DOOM.WAD")
+const IsIWad = Wad[0] == 73 && Wad[1] == 87 && Wad[2] == 65 && Wad[3] == 68
+const IsPWad = Wad[0] == 80 && Wad[1] == 87 && Wad[2] == 65 && Wad[3] == 68
+const LumpCount = int(Wad[4]) | (int(Wad[5]) << 8) | (int(Wad[6]) << 16) | (int(Wad[7]) << 24)
+const DirectoryOffset = int(Wad[8]) | (int(Wad[9]) << 8) | (int(Wad[10]) << 16) | (int(Wad[11]) << 24)
+
+map "WAD Header Probe" {
+    register reported bit = false
+    tick {
+        if !reported {
+            kind := "Unknown signature"
+            if IsIWad { kind = "IWAD" }
+            if IsPWad { kind = "PWAD" }
+            log(kind, len(Wad), LumpCount, DirectoryOffset)
+            next reported = true
+        }
+    }
+}

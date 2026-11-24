@@ -1,0 +1,116 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// MUS stream layout adapted from Chocolate Doom's mus2mid.c.
+
+package audio
+
+import "wad"
+
+const MusHeaderSize = 16
+const MusRelease = 0
+const MusNoteOn = 1
+const MusPitch = 2
+const MusSystem = 3
+const MusController = 4
+const MusEnd = 6
+
+// MusCursor only contains offsets into Lump.File.  OpenMus validates all
+// header-derived offsets first, so ReadMusEvent never reads outside the lump.
+type MusCursor struct {
+    Valid bit
+    Lump wad.LumpRef
+    Position int
+    End int
+}
+
+type MusEvent struct {
+    Valid bit
+    Kind int
+    Channel int
+    Data1 int
+    // Data2 is -1 when a note-on inherits its channel's earlier velocity.
+    Data2 int
+    Delay int
+    Cursor MusCursor
+}
+
+func musLumpValid(lump wad.LumpRef) bit {
+    return lump.Valid && lump.Offset >= 0 && lump.Size >= 0 && lump.Offset <= len(lump.File) &&
+        lump.Size <= len(lump.File) - lump.Offset
+}
+
+func musRange(cursor MusCursor, count int) bit {
+    return cursor.Valid && count >= 0 && cursor.Position >= 0 && cursor.Position <= cursor.End &&
+        count <= cursor.End - cursor.Position
+}
+
+// OpenMus accepts the original MUS descriptor: a fixed 16-byte header, then
+// an instrument table, followed by exactly scoreLength bytes of score data.
+func OpenMus(lump wad.LumpRef) MusCursor {
+    if !musLumpValid(lump) || lump.Size < MusHeaderSize { return MusCursor{} }
+    base := lump.Offset
+    if wad.LE32(lump.File, base) != 0x1a53554d { return MusCursor{} } // "MUS\x1a"
+    scoreLength, scoreOffset := wad.U16(lump.File, base + 4), wad.U16(lump.File, base + 6)
+    instruments := wad.U16(lump.File, base + 12)
+    tableEnd := MusHeaderSize + instruments * 2
+    if instruments > (lump.Size - MusHeaderSize) / 2 || scoreOffset < tableEnd || scoreOffset > lump.Size ||
+        scoreLength > lump.Size - scoreOffset { return MusCursor{} }
+    start := base + scoreOffset
+    return MusCursor{Valid: true, Lump: lump, Position: start, End: start + scoreLength}
+}
+
+func invalidMusEvent() MusEvent { return MusEvent{Data2: -1} }
+
+// ReadMusEvent reads one original MUS event.  The group-ending bit stores the
+// following base-128 delay on that event; score-end has no payload or delay.
+func ReadMusEvent(cursor MusCursor) MusEvent {
+    if !musRange(cursor, 1) { return invalidMusEvent() }
+    descriptor := int(cursor.Lump.File[cursor.Position])
+    cursor.Position = cursor.Position + 1
+    kind, channel := (descriptor >> 4) & 7, descriptor & 15
+    event := MusEvent{Valid: true, Kind: kind, Channel: channel, Data2: -1, Cursor: cursor}
+    if kind == MusEnd { return event }
+    if kind == MusRelease || kind == MusPitch || kind == MusSystem {
+        if !musRange(cursor, 1) { return invalidMusEvent() }
+        event.Data1 = int(cursor.Lump.File[cursor.Position])
+        cursor.Position = cursor.Position + 1
+        if kind == MusRelease { event.Data1 = event.Data1 & 127 }
+    } else if kind == MusNoteOn {
+        if !musRange(cursor, 1) { return invalidMusEvent() }
+        note := int(cursor.Lump.File[cursor.Position])
+        cursor.Position = cursor.Position + 1
+        event.Data1 = note & 127
+        if note & 128 != 0 {
+            if !musRange(cursor, 1) { return invalidMusEvent() }
+            event.Data2 = int(cursor.Lump.File[cursor.Position])
+            cursor.Position = cursor.Position + 1
+        }
+    } else if kind == MusController {
+        if !musRange(cursor, 2) { return invalidMusEvent() }
+        event.Data1, event.Data2 = int(cursor.Lump.File[cursor.Position]), int(cursor.Lump.File[cursor.Position + 1])
+        cursor.Position = cursor.Position + 2
+    } else {
+        return invalidMusEvent()
+    }
+    if descriptor & 128 == 0 {
+        event.Cursor = cursor
+        return event
+    }
+    delay, done := 0, false
+    // Five bytes can encode every non-negative signed Fletcher int.  The
+    // checked multiply avoids wrapping a hostile replacement WAD's delay.
+    for i := range 5 {
+        if !done {
+            if !musRange(cursor, 1) { return invalidMusEvent() }
+            byteValue := int(cursor.Lump.File[cursor.Position])
+            cursor.Position = cursor.Position + 1
+            payload := byteValue & 127
+            if delay > (2147483647 - payload) / 128 { return invalidMusEvent() }
+            delay = delay * 128 + payload
+            if byteValue & 128 == 0 { done = true }
+        }
+    }
+    if !done { return invalidMusEvent() }
+    event.Delay, event.Cursor = delay, cursor
+    return event
+}

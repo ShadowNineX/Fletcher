@@ -1,0 +1,81 @@
+package main
+
+import "engine"
+import "play"
+
+const Unit = engine.FracUnit
+
+test "gravity starts with a double downward impulse" {
+    actor := play.ActorPhysics{Body: play.MapActor{Z: 20 * Unit, Ceiling: 128 * Unit, Height: 56 * Unit}}
+    first := play.MoveVertically(actor, play.FloatTarget{}).Actor
+    assertEqual(first.Body.Z, 20 * Unit)
+    assertEqual(first.MomentumZ, -2 * Unit)
+    second := play.MoveVertically(first, play.FloatTarget{}).Actor
+    assertEqual(second.Body.Z, 18 * Unit)
+    assertEqual(second.MomentumZ, -3 * Unit)
+}
+
+test "step-up smooths the view without delaying floor contact" {
+    actor := play.ActorPhysics{Body: play.MapActor{Floor: 24 * Unit, Ceiling: 128 * Unit, Height: 56 * Unit, Player: true},
+        ViewHeight: play.NormalViewHeight}
+    moved := play.MoveVertically(actor, play.FloatTarget{})
+    assertEqual(moved.Actor.Body.Z, 24 * Unit)
+    assertEqual(moved.Actor.ViewHeight, 17 * Unit)
+    assertEqual(moved.Actor.ViewHeightDelta, 3 * Unit)
+    assert(!moved.HardLanding)
+}
+
+test "hard landings dip the view, and an exact threshold does not" {
+    actor := play.ActorPhysics{Body: play.MapActor{Z: 8 * Unit, Ceiling: 128 * Unit, Height: 56 * Unit, Player: true},
+        MomentumZ: -9 * Unit, ViewHeight: play.NormalViewHeight}
+    moved := play.MoveVertically(actor, play.FloatTarget{})
+    assert(moved.HardLanding)
+    assertEqual(moved.Actor.Body.Z, 0)
+    assertEqual(moved.Actor.MomentumZ, 0)
+    assertEqual(moved.Actor.ViewHeightDelta, (-9 * Unit) >> 3)
+    actor.MomentumZ = -8 * Unit
+    assert(!play.MoveVertically(actor, play.FloatTarget{}).HardLanding)
+}
+
+test "floaters change height only while close enough to a target" {
+    actor := play.ActorPhysics{Body: play.MapActor{Z: 50 * Unit, Ceiling: 128 * Unit, Height: 56 * Unit,
+        Flags: play.MoveNoGravity | play.MoveFloat}}
+    target := play.FloatTarget{Valid: true, Z: 56 * Unit}
+    assertEqual(play.MoveVertically(actor, target).Actor.Body.Z, 54 * Unit)
+    target.X = 102 * Unit
+    assertEqual(play.MoveVertically(actor, target).Actor.Body.Z, 50 * Unit)
+    target.X, target.Z = 0, 0
+    assertEqual(play.MoveVertically(actor, target).Actor.Body.Z, 46 * Unit)
+}
+
+test "vertical missile impact emits an explosion unless noclip is set" {
+    actor := play.ActorPhysics{Body: play.MapActor{Z: 2 * Unit, Ceiling: 128 * Unit, Height: 8 * Unit,
+        Flags: play.MoveMissile | play.MoveNoGravity}, MomentumX: Unit, MomentumZ: -3 * Unit}
+    moved := play.MoveVertically(actor, play.FloatTarget{})
+    assertEqual(moved.Event, play.MotionExplodeMissile)
+    assertEqual(moved.Actor.MomentumX, 0)
+    assert(moved.Actor.Body.Flags & play.MoveMissile == 0)
+    actor.Body.Flags = actor.Body.Flags | play.MoveNoClip
+    moved = play.MoveVertically(actor, play.FloatTarget{})
+    assertEqual(moved.Event, play.MotionNone)
+    assertEqual(moved.Actor.MomentumX, Unit)
+}
+
+test "tic commands turn the player and apply fixed-point thrust on the ground" {
+    actor := play.ActorPhysics{Body: play.MapActor{Player: true}}
+    forward := play.ApplyPlayerMoveCommand(actor, play.PlayerMoveCommand{Forward: 50})
+    assertEqual([2]int{forward.MomentumX, forward.MomentumY}, [2]int{102398, 39})
+    actor.Body.Z = Unit
+    airborne := play.ApplyPlayerMoveCommand(actor, play.PlayerMoveCommand{Forward: 50, Side: 10, Turn: -16384})
+    assertEqual(airborne.Angle, bits<32>(0xc0000000))
+    assertEqual([2]int{airborne.MomentumX, airborne.MomentumY}, [2]int{0, 0})
+}
+
+test "view bob uses Doom's speed cap and the live view maintains ceiling clearance" {
+    actor := play.ActorPhysics{Body: play.MapActor{Ceiling: 40 * Unit, Player: true}, ViewHeight: play.NormalViewHeight,
+        MomentumX: 30 * Unit, MomentumY: 30 * Unit}
+    view := play.CalculatePlayerView(actor, 4, true, false)
+    assertEqual(view.Bob, 16 * Unit)
+    assertEqual(view.Z, 36 * Unit)
+    assertEqual(play.CalculatePlayerView(actor, 4, true, true).Z, play.NormalViewHeight)
+}

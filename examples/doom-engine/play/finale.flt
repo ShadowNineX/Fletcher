@@ -1,0 +1,107 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Finale timing and events from linuxdoom-1.10/f_finale.c.
+
+package play
+
+import "actorinfo"
+
+const FinaleInactive = 0
+const FinaleStory = 1
+const FinaleArt = 2
+const FinaleCastStage = 3
+const finaleTextSpeed = 3
+const finaleTextWait = 250
+const finaleEpisodeTextLengths = [4]int{440, 466, 492, 503}
+const finaleMusicBunny = 30
+const finaleMusicVictory = 31
+const finaleMusicCast = 63
+const finaleMusicStory = 65
+
+type FinaleState struct {
+    Route CampaignRoute
+    Stage int
+    Tics int
+    TextLength int
+    TextWait int
+    Reveal int
+    Scroll int
+    EndFrame int
+    Cast FinaleCast
+    Sound int
+    Music int
+    Changed bit
+    Wipe bit
+    Advance bit
+}
+
+func StartFinale(route CampaignRoute, textLength int) FinaleState {
+    if !route.Valid || route.Finale == 0 { return FinaleState{} }
+    duration := textLength
+    if duration == 0 && !route.Commercial && route.Episode >= 0 && route.Episode < 4 {
+        duration = finaleEpisodeTextLengths[route.Episode]
+    }
+    music := finaleMusicVictory
+    if route.Commercial { music = finaleMusicStory }
+    return FinaleState{Route: route, Stage: FinaleStory, TextLength: textLength,
+        TextWait: duration * finaleTextSpeed + finaleTextWait, Scroll: 320, EndFrame: -1, Music: music, Changed: true}
+}
+
+func tickBunnyArt(state FinaleState) FinaleState {
+    scroll := 320 - (state.Tics - 230) / 2
+    if scroll < 0 { scroll = 0 }
+    if scroll > 320 { scroll = 320 }
+    frame := -1
+    if state.Tics >= 1130 { frame = 0 }
+    if state.Tics >= 1180 { frame = (state.Tics - 1180) / 5 }
+    if frame > 6 { frame = 6 }
+    if frame > 0 && frame > state.EndFrame { state.Sound = actorinfo.SoundPistol }
+    state.Changed = scroll != state.Scroll || frame != state.EndFrame
+    state.Scroll, state.EndFrame = scroll, frame
+    return state
+}
+
+// The responder sees fresh key-down events before G_BuildTiccmd and F_Ticker
+// get the buttons that remain held in the game command state.
+func TickFinale(state FinaleState, buttons bit, castPressed bit) FinaleState {
+    state.Changed, state.Wipe, state.Advance, state.Sound, state.Music = false, false, false, 0, 0
+    if state.Stage == FinaleInactive { return state }
+    cast := state.Cast
+    if state.Stage == FinaleCastStage && castPressed {
+        cast = RespondFinaleCast(cast)
+        state.Sound = cast.Sound
+    }
+    if state.Route.Commercial && state.Tics > 50 && buttons {
+        if state.Route.Finale == CampaignCast {
+            state.Stage = FinaleCastStage
+            cast = StartFinaleCast()
+            state.Music = finaleMusicCast
+            state.Changed, state.Wipe = true, true
+        } else {
+            state.Tics = state.Tics + 1
+            state.Stage, state.Advance = FinaleInactive, true
+            return state
+        }
+    }
+    state.Tics = state.Tics + 1
+    switch state.Stage {
+    case FinaleCastStage:
+        cast = TickFinaleCast(cast)
+        if cast.Sound != 0 { state.Sound = cast.Sound }
+        state.Changed = state.Changed || cast.State != state.Cast.State || cast.Index != state.Cast.Index
+        state.Cast = cast
+    case FinaleStory:
+        if !state.Route.Commercial && state.Tics > state.TextWait {
+            state.Stage, state.Tics, state.Changed, state.Wipe = FinaleArt, 0, true, true
+            if state.Route.Episode == 2 { state.Music = finaleMusicBunny }
+            return state
+        }
+        reveal := 0
+        if state.Tics > 10 { reveal = (state.Tics - 10) / finaleTextSpeed }
+        if reveal > state.TextLength { reveal = state.TextLength }
+        state.Changed, state.Reveal = reveal != state.Reveal, reveal
+    case FinaleArt:
+        if state.Route.Episode == 2 { return tickBunnyArt(state) }
+    }
+    return state
+}

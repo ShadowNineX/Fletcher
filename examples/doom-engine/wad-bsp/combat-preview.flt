@@ -1,0 +1,350 @@
+package main
+
+import "actorinfo"
+import "enemy"
+import "play"
+import "wad"
+
+const previewCombatSkill = 2
+const previewFastMonsters = false
+const previewRespawnMonsters = false
+
+type PreviewHearing struct {
+    Graph play.SoundGraph
+    Targets play.SoundTargets
+}
+
+type PreviewCombat struct {
+    World play.CombatWorld
+    View play.WeaponView
+    Specials play.LevelSpecials
+    Level wad.BspLevel
+    Base wad.BspLevel
+    Hearing PreviewHearing
+    Brain enemy.BrainState
+    FirstActive int
+    MapActors int
+    GameTic int
+    Rules play.CombatRules
+    RespawnMonsters bit
+    Cues bits<8>
+    LastSound int
+    WeaponSound int
+    Changed bit
+    Failed bit
+}
+
+func readPreviewCombat(base wad.BspLevel, frame PreviewTick, actors play.MapActors, view play.WeaponView,
+    firstActive int, mapActors int, hearing PreviewHearing, brain enemy.BrainState, rules play.CombatRules,
+    respawnMonsters bit) PreviewCombat {
+    var players [wad.VanillaPlayers]play.PlayerInventory
+    players[0] = frame.Contacts.Inventory
+    specials := frame.Specials.WithActorOrder(actors)
+    actors = actors.WithSectorOrder(specials)
+    return PreviewCombat{World: play.CombatWorld{Actors: actors, Links: frame.Contacts.Links,
+        Players: players, Random: frame.Specials.Lighting.Random}, View: view,
+        Specials: specials, Level: frame.Level, Base: base, Hearing: hearing,
+        FirstActive: firstActive, MapActors: mapActors, Brain: brain, Rules: rules, RespawnMonsters: respawnMonsters}
+}
+
+func needsMapThinker(actor play.LevelActor) bit {
+    return actor.Valid && !actor.Physics.Body.Player &&
+        (actor.Damaged || enemy.HasMonsterThinker(actor) || actor.NeedsMobjMotion())
+}
+
+func firstActiveMapThinker(actors play.MapActors, first int, mapActors int) int {
+    limit := mapActors
+    if first > 0 { limit = first - 1 }
+    for index := range limit {
+        if needsMapThinker(actors.ActorAt(index)) { return index + 1 }
+    }
+    return first
+}
+
+func initialPreviewThinker(actors play.MapActors) int {
+    return firstActiveMapThinker(actors, 0, actors.Count)
+}
+
+func lowerPreviewWeapon(scene PreviewCombat) PreviewCombat {
+    player := scene.World.Actors.ActorAt(scene.World.Actors.PlayerActors[0] - 1)
+    dropped := play.DropPlayerWeapon(scene.World.Players[0], scene.View, player.State, scene.World.Random)
+    scene.View, scene.Failed = dropped.View, dropped.Failed
+    return scene
+}
+
+func cuePreviewActorSound(scene PreviewCombat, sound int, origin int) PreviewCombat {
+    cue := previewActorCue(scene.Level, scene.World.Actors, sound, origin)
+    if cue != 0 {
+        scene.LastSound = sound
+        if cue == cueWeapon { scene.WeaponSound = sound }
+        scene.Cues = scene.Cues | cue
+    }
+    return scene
+}
+
+func firstObservedMapActor(actors play.MapActors, handle int, mapActors int, first int) int {
+    if handle <= mapActors && (first == 0 || handle < first) {
+        actor := actors.ActorAt(handle - 1)
+        if actor.Damaged && !actor.Physics.Body.Player { return handle }
+    }
+    return first
+}
+
+func observePreviewCombat(scene PreviewCombat, event play.CombatStep) PreviewCombat {
+    scene.Changed = scene.Changed || event.World.Actors.Count != scene.World.Actors.Count
+    scene.World = event.World
+    scene.Failed = event.Failed
+    if scene.Failed { return scene }
+    if event.Feedback.Sound != 0 {
+        scene = cuePreviewActorSound(scene, event.Feedback.Sound, event.Feedback.SoundOrigin)
+    }
+    handle := event.ActorHandle
+    if handle > 0 {
+        scene.Changed = true
+        scene.FirstActive = firstObservedMapActor(scene.World.Actors, handle, scene.MapActors, scene.FirstActive)
+    }
+    if event.Feedback.LowerWeapon == 1 { return lowerPreviewWeapon(scene) }
+    return scene
+}
+
+func previewActorStateAction(scene PreviewCombat, handle int, action int) PreviewCombat {
+    actor := scene.World.Actors.ActorAt(handle - 1)
+    switch action {
+    case actorinfo.ActionFall:
+        actor.Physics.Body.Flags = actor.Physics.Body.Flags & ~bits<32>(play.ActorSolid)
+        scene.World.Actors = scene.World.Actors.WithActor(handle, actor)
+    case actorinfo.ActionPain, actorinfo.ActionScream, actorinfo.ActionXScream, actorinfo.ActionPlayerScream:
+        commercial := scene.Level.MapName.Low & 0xffffff == 0x50414d
+        sound, origin, random := play.ActorActionSound(actor, handle, action, commercial, scene.World.Random)
+        scene.World.Random = random
+        scene = cuePreviewActorSound(scene, sound, origin)
+    case actorinfo.ActionBossDeath, actorinfo.ActionKeenDie, actorinfo.ActionBrainDie:
+        special := play.ApplyBossSpecial(scene.Level, scene.Specials, scene.World, handle, action)
+        scene.World, scene.Specials = special.World, special.State
+        scene.Level = scene.Specials.ApplyTo(scene.Base)
+    }
+    return scene
+}
+
+func finishPreviewMobjCombat(scene PreviewCombat, blocks wad.BlockMapInfo, event play.CombatStep, rules play.CombatRules) PreviewCombat {
+    for range actorinfo.ActorStateCount {
+        scene = dispatchPreviewCombat(scene, blocks, event, rules)
+        if scene.Failed || event.State.Action == 0 { return scene }
+        event.World = scene.World
+        event = play.ResumeMobjCombat(scene.Level, event, rules)
+    }
+    scene.Failed = true
+    return scene
+}
+
+const numberedWeaponCount = play.WeaponCount - 1
+
+// G_BuildTiccmd selects the lowest numbered key sampled on this tic.
+func previewWeaponNumber(keys [numberedWeaponCount]bit) int {
+    for weapon := range numberedWeaponCount {
+        if keys[weapon] { return weapon }
+    }
+    return play.WeaponNoChange
+}
+
+func cyclePreviewWeapon(inventory play.PlayerInventory, commercial bit, shareware bit) play.PlayerInventory {
+    first := inventory.PendingWeapon
+    if first == play.WeaponNoChange { first = inventory.ReadyWeapon }
+    for offset := range play.WeaponCount {
+        candidate := (first + offset + 1) % play.WeaponCount
+        if inventory.Weapons[candidate] && (candidate != play.WeaponSuperShotgun || commercial) &&
+            (!shareware || (candidate != play.WeaponPlasma && candidate != play.WeaponBfg)) {
+            if candidate != inventory.ReadyWeapon { inventory.PendingWeapon = candidate }
+            return inventory
+        }
+    }
+    return inventory
+}
+
+func tickPreviewWeapon(base wad.BspLevel, scene PreviewCombat, blocks wad.BlockMapInfo, attack bit, cycle bit,
+    levelTime int, bob int, commercial bit, shareware bit) PreviewCombat {
+    command := play.WeaponInput{Attack: attack && !scene.World.Players[0].Dead, LevelTime: levelTime,
+        Bob: bob, Commercial: commercial, Shareware: shareware}
+    if cycle && !scene.World.Players[0].Dead {
+        scene.World.Players[0] = cyclePreviewWeapon(scene.World.Players[0], commercial, shareware)
+    }
+    rules := scene.Rules
+    weapon := play.BeginPlayerWeaponTick(scene.Level, blocks, scene.World, scene.World.Actors.PlayerActors[0], scene.View, command, rules)
+    for range play.ThinkerIterationLimit {
+        scene.View = weapon.View
+        scene = dispatchPreviewCombat(scene, blocks, weapon.Combat, rules)
+        if scene.Failed || weapon.Done { return scene }
+        if weapon.Noise {
+            source := scene.World.Actors.PlayerActors[0]
+            player := scene.World.Actors.ActorAt(source - 1)
+            if !scene.Hearing.Graph.Valid { scene.Hearing.Graph = play.BuildSoundGraph(base) }
+            scene.Hearing.Targets = play.NoiseAlert(scene.Level, scene.Hearing.Graph, scene.Hearing.Targets, player.Sector, source)
+        }
+        if weapon.SpecialLine >= 0 {
+            scene.Specials = scene.Specials.WithActorOrder(scene.World.Actors)
+            scene.Specials.Lighting.Random = scene.World.Random
+            scene.Specials = play.ShootLevelSpecial(scene.Level, scene.Specials, weapon.SpecialLine, true)
+            if scene.Specials.LimitExceeded() { scene.Failed = true; return scene }
+            scene.World.Actors = scene.World.Actors.WithSectorOrder(scene.Specials)
+            scene.Level = scene.Specials.ApplyTo(base)
+            scene.World.Random = scene.Specials.Lighting.Random
+        }
+        weapon.Combat.World, weapon.View = scene.World, scene.View
+        weapon = play.ResumePlayerWeaponTick(scene.Level, blocks, weapon, rules)
+    }
+    scene.Failed = true
+    return scene
+}
+
+func tickPreviewActor(scene PreviewCombat, blocks wad.BlockMapInfo, handle int, levelTime int) PreviewCombat {
+    before := scene.World.Actors.ActorAt(handle - 1)
+    // With neither XY nor Z movement, P_MobjThinker only decrements this
+    // positive timer. At one tic the state can run an action or remove the actor.
+    if before.Valid && before.Tics > 1 && !before.Physics.Body.Player &&
+        before.Physics.Body.Flags & (play.ActorPickup | play.MoveSkullFly) == 0 &&
+        before.Physics.MomentumX == 0 && before.Physics.MomentumY == 0 && before.Physics.MomentumZ == 0 &&
+        before.Physics.Body.Z == before.Physics.Body.Floor {
+        before.Tics = before.Tics - 1
+        scene.World.Actors = scene.World.Actors.WithActor(handle, before)
+        scene.Changed, scene.Failed = true, false
+        scene.FirstActive = firstObservedMapActor(scene.World.Actors, handle, scene.MapActors, scene.FirstActive)
+        return scene
+    }
+    rules := scene.Rules
+    step := play.BeginMobjTick(scene.Level, blocks, scene.World, handle, levelTime, scene.RespawnMonsters, rules)
+    for range actorinfo.ActorStateCount {
+        scene = dispatchPreviewCombat(scene, blocks, step.Combat, rules)
+        if scene.Failed { return scene }
+        if step.MovePosition.SpecialCount > 0 {
+            cross := play.CrossActorMove(blocks, previewWalkoverState(scene),
+                handle, step.OldX, step.OldY, step.MovePosition, rules, PreviewWalkoverTelefrag{Blocks: blocks})
+            scene = resumePreviewWalkover(scene, cross)
+            if scene.Failed { return scene }
+            if cross.Teleported { scene = afterPreviewTeleport(scene) }
+        }
+        if step.Done {
+            if step.Respawn {
+                respawn := play.RespawnNightmareActor(scene.Level, blocks, scene.World, handle, rules)
+                scene.World, scene.Failed = respawn.World, respawn.Failed
+                if scene.Failed { return scene }
+                if respawn.Respawned {
+                    scene.Changed = true
+                    scene = cuePreviewActorSound(scene, actorinfo.SoundTeleport, respawn.OldFog)
+                    scene = cuePreviewActorSound(scene, actorinfo.SoundTeleport, respawn.NewFog)
+                }
+            }
+            actor := scene.World.Actors.ActorAt(handle - 1)
+            oldBody, body := before.Physics.Body, actor.Physics.Body
+            scene.Changed = scene.Changed || actor.Valid != before.Valid || actor.Sprite != before.Sprite ||
+                actor.Frame != before.Frame || actor.Physics.Angle != before.Physics.Angle ||
+                body.X != oldBody.X || body.Y != oldBody.Y || body.Z != oldBody.Z
+            return scene
+        }
+        step.Combat.World = scene.World
+        step = play.ResumeMobjTick(scene.Level, blocks, step, rules)
+    }
+    scene.Failed = true
+    return scene
+}
+
+type PreviewMapActorStep struct {
+    Combat PreviewCombat
+    PassiveCursor int
+    Changed bit
+    SpriteChanged bit
+    LinksChanged bit
+}
+
+func tickPreviewMapActors(step PreviewMapActorStep, blocks wad.BlockMapInfo, levelTime int, passive play.PassiveActors,
+    start int, before int) PreviewMapActorStep {
+    if start >= before { return step }
+    scene := step.Combat
+    frame := play.PassiveActorFrame{Actors: scene.World.Actors, Links: scene.World.Links, Cursor: step.PassiveCursor,
+        Changed: step.Changed, SpriteChanged: step.SpriteChanged, LinksChanged: step.LinksChanged}
+    first := scene.FirstActive
+    if first > 0 {
+        if first < start { first = start }
+        for offset := range before - first {
+            handle := first + offset
+            actor := scene.World.Actors.ActorAt(handle - 1)
+            if needsMapThinker(actor) {
+                if frame.Cursor < passive.Count && passive.HandleAt(frame.Cursor) < handle {
+                    frame.Actors, frame.Links = scene.World.Actors, scene.World.Links
+                    frame = frame.TickBefore(passive, handle)
+                    if frame.Failed { scene.Failed = true; return PreviewMapActorStep{Combat: scene} }
+                    scene.World.Actors, scene.World.Links = frame.Actors, frame.Links
+                }
+                if frame.Cursor < passive.Count && passive.HandleAt(frame.Cursor) == handle { frame.Cursor = frame.Cursor + 1 }
+                scene = tickPreviewActor(scene, blocks, handle, levelTime)
+                if scene.Failed { return PreviewMapActorStep{Combat: scene} }
+            }
+        }
+    }
+    if frame.Cursor < passive.Count {
+        frame.Actors, frame.Links = scene.World.Actors, scene.World.Links
+        frame = frame.TickBefore(passive, before)
+        scene.World.Actors, scene.World.Links = frame.Actors, frame.Links
+        scene.Failed = frame.Failed
+    }
+    return PreviewMapActorStep{Combat: scene, PassiveCursor: frame.Cursor,
+        Changed: frame.Changed, SpriteChanged: frame.SpriteChanged, LinksChanged: frame.LinksChanged}
+}
+
+type PreviewDynamicStep struct {
+    Combat PreviewCombat
+    MoverChanged bit
+    ActorsChanged bit
+    PickupSound int
+    PickupMessage int
+    Sounds play.MoverSounds
+}
+
+func tickPreviewDynamicThinkers(scene PreviewCombat, blocks wad.BlockMapInfo, levelTime int) PreviewDynamicStep {
+    var cursor play.SectorThinkerCursor
+    playerHandle := scene.World.Actors.PlayerActors[0]
+    moverFrame := play.MoverFrame{Valid: true}
+    previous := 0
+    for range play.ThinkerIterationLimit {
+        if scene.Failed || scene.Specials.LimitExceeded() {
+            scene.Failed = true
+            return PreviewDynamicStep{Combat: scene}
+        }
+        // The predecessor stays linked even if its own callback removed it.
+        // Re-read its successor so an append after the tail runs in this tic.
+        handle := scene.World.Actors.TransientFirst()
+        if previous != 0 { handle = scene.World.Actors.TransientNext(previous) }
+        sector := scene.Specials.NextSectorThinker(cursor)
+        if !sector.Valid && handle == 0 {
+            scene.Specials.Lighting.Random = scene.World.Random
+            return PreviewDynamicStep{Combat: scene, MoverChanged: moverFrame.Changed, ActorsChanged: moverFrame.ActorsChanged,
+                PickupSound: moverFrame.PickupSound, PickupMessage: moverFrame.PickupMessage, Sounds: moverFrame.Sounds}
+        }
+        if handle > 0 && (!sector.Valid || scene.World.Actors.TransientOrder(handle) < sector.Order) {
+            if scene.World.Actors.ActorAt(handle - 1).Valid {
+                scene.World.Actors = scene.World.Actors.WithSectorOrder(scene.Specials)
+                scene = tickPreviewActor(scene, blocks, handle, levelTime)
+                scene.Specials = scene.Specials.WithActorOrder(scene.World.Actors)
+                previous = handle
+            } else {
+                scene.World.Actors = scene.World.Actors.ReleaseTransient(previous, handle)
+            }
+        } else {
+            moverFrame.World, moverFrame.State = scene.World, scene.Specials
+            moverFrame.Callback = previewCallbackContext(scene)
+            moverFrame.Player = scene.World.Actors.ActorAt(playerHandle - 1).Physics.Body
+            moverFrame.DamageSound = 0
+            moverFrame = play.TickSectorThinkerWithActors(scene.Base, blocks, moverFrame, sector, playerHandle, levelTime,
+                scene.Rules, PreviewWalkoverTelefrag{Blocks: blocks})
+            scene.World, scene.Specials, scene.Failed = moverFrame.World, moverFrame.State, !moverFrame.Valid
+            scene.Level = scene.Specials.ApplyTo(scene.Base)
+            scene = resumePreviewCallback(scene, moverFrame.Callback)
+            if moverFrame.ActorsChanged {
+                scene.Changed = true
+                scene.FirstActive = firstActiveMapThinker(scene.World.Actors, scene.FirstActive, scene.MapActors)
+            }
+            cursor = sector.Next
+        }
+    }
+    scene.Failed = true
+    return PreviewDynamicStep{Combat: scene}
+}

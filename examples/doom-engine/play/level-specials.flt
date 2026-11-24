@@ -1,0 +1,198 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Line specials and exits from linuxdoom-1.10 p_spec.c, p_switch.c, and g_game.c.
+
+package play
+
+import "actorinfo"
+import "wad"
+
+const lineSecret = 32
+
+type LevelSpecials struct {
+    Doors LevelDoors
+    Lighting LevelLightStep
+    Floors LevelFloors
+    Ceilings LevelCeilings
+    ExitRequested bit
+    SecretExit bit
+}
+
+func (state LevelSpecials) LimitExceeded() bit {
+    return state.Floors.PlatformOverflow || state.Doors.Switches.ButtonOverflow
+}
+
+func (state LevelSpecials) WithActorOrder(actors MapActors) LevelSpecials {
+    if actors.NextThinkerOrder > state.Doors.NextMover { state.Doors.NextMover = actors.NextThinkerOrder }
+    return state
+}
+
+type MonsterLineUse struct {
+    State LevelSpecials
+    Used bit
+}
+
+func UseMonsterLine(level wad.BspLevel, state LevelSpecials, index int) MonsterLineUse {
+    use := UseActorLine(level, state, index, false, false, PlayerInventory{})
+    return MonsterLineUse{State: use.State, Used: use.Used}
+}
+
+func CrossMonsterLine(level wad.BspLevel, state LevelSpecials, index int) LevelSpecials {
+    action := level.LineAt(index).Action
+    if action == 4 || action == 10 || action == 88 { return CrossLevelSpecial(level, state, index) }
+    return state
+}
+
+func UseLevelSpecial(level wad.BspLevel, blocks wad.BlockMapInfo, state LevelSpecials, actor ActorPhysics) LevelSpecials {
+    return UseLevelSpecialWithInventory(level, blocks, state, actor, PlayerInventory{}).State
+}
+
+type ActorLineUse struct {
+    State LevelSpecials
+    Used bit
+    MissingKey bit
+    Key int
+    TaggedLock bit
+    Sound int
+}
+
+func UseLevelSpecialWithInventory(level wad.BspLevel, blocks wad.BlockMapInfo, state LevelSpecials, actor ActorPhysics,
+    inventory PlayerInventory) ActorLineUse {
+    hit := FindUseLine(level, blocks, actor.Body.X, actor.Body.Y, actor.Angle)
+    if hit.Blocked { return ActorLineUse{State: state, Sound: actorinfo.SoundNoWay} }
+    if !hit.Valid || !hit.Found { return ActorLineUse{State: state} }
+    return UseActorLine(level, state, hit.Index, hit.Back, actor.Body.Player, inventory)
+}
+
+func UseActorLine(level wad.BspLevel, state LevelSpecials, index int, back bit, player bit, inventory PlayerInventory) ActorLineUse {
+    result := ActorLineUse{State: state}
+    if state.LimitExceeded() { return result }
+    line := level.LineAt(index)
+    if !line.Valid || line.Action == 0 || (back && line.Action != 124) { return result }
+    if !player {
+        if line.Flags & lineSecret != 0 { return result }
+        switch line.Action {
+        case 1:
+            result.State.Doors = useDoorLine(level, state.Doors, state.Floors, state.Ceilings, index, line, false)
+            result.Used = true
+        case 32, 33, 34:
+            // P_UseSpecialLine reports success. EV_VerticalDoor returns
+            // without opening because the caller has no player inventory.
+            result.Used = true
+        }
+        return result
+    }
+    key := requiredDoorKey(line.Action)
+    if key >= 0 && !(inventory.Cards[key] || inventory.Cards[key + CardBlueSkull]) {
+        return ActorLineUse{State: state, Used: true, MissingKey: true, Key: key,
+            TaggedLock: switchDoorAction(line.Action).Valid, Sound: actorinfo.SoundOof}
+    }
+    result.State = usePlayerLine(level, state, index, line)
+    result.Used = true
+    return result
+}
+
+func usePlayerLine(level wad.BspLevel, state LevelSpecials, index int, line wad.CollisionLine) LevelSpecials {
+    if line.Action == 11 || line.Action == 51 {
+        state.Doors = changeLineSwitch(level, state.Doors, index, true)
+        return requestLevelExit(level, state, line.Action == 51)
+    }
+    if line.Action == 138 || line.Action == 139 {
+        brightness := 255
+        if line.Action == 139 { brightness = 35 }
+        state = activateTaggedLights(level, state, line.Tag, brightness)
+        state.Doors = changeLineSwitch(level, state.Doors, index, false)
+        return state
+    }
+    if line.Action == 7 || line.Action == 9 || line.Action == 127 {
+        return activateShapedFloor(level, state, index, line, true)
+    }
+    floor := useFloorAction(line.Action)
+    if floor.Mode != 0 { return activateFloorLine(level, state, index, line, floor, true) }
+    ceiling := useCeilingAction(line.Action)
+    if ceiling.Mode != 0 { return activateCeilingLine(level, state, index, line, ceiling, true) }
+    platform := usePlatformAction(line.Action)
+    if platform.Mode != 0 { return activatePlatformLine(level, state, index, line, platform, true) }
+    state.Doors = useDoorLine(level, state.Doors, state.Floors, state.Ceilings, index, line, true)
+    return state
+}
+
+// G_SecretExitLevel falls back to an ordinary exit in commercial WADs
+// without the MAP31 lump, even if the exit linedef itself is secret.
+func requestLevelExit(level wad.BspLevel, state LevelSpecials, secret bit) LevelSpecials {
+    if secret && commercialBossMap(level.MapName) {
+        map31 := wad.LumpName{Low: 0x3350414d, High: 0x31}
+        secret = wad.OpenArchive(level.File).Find(map31).Found
+    }
+    state.ExitRequested, state.SecretExit = true, secret
+    return state
+}
+
+type WalkLightAction struct {
+    Valid bit
+    Once bit
+    Target int
+}
+
+func walkLightAction(action int) WalkLightAction {
+    switch action {
+    case 12, 80: return WalkLightAction{Valid: true, Once: action == 12, Target: 0}
+    case 13, 81: return WalkLightAction{Valid: true, Once: action == 13, Target: 255}
+    case 35, 79: return WalkLightAction{Valid: true, Once: action == 35, Target: 35}
+    case 17: return WalkLightAction{Valid: true, Once: true, Target: LightStartStrobe}
+    case 104: return WalkLightAction{Valid: true, Once: true, Target: LightNeighborsDarkest}
+    }
+    return WalkLightAction{}
+}
+
+// The player path invokes this for each accepted crossing, in P_TryMove order.
+func CrossLevelSpecial(level wad.BspLevel, state LevelSpecials, index int) LevelSpecials {
+    if state.LimitExceeded() { return state }
+    line := level.LineAt(index)
+    if !line.Valid { return state }
+    if line.Action == 52 || line.Action == 124 { return requestLevelExit(level, state, line.Action == 124) }
+    if line.Action == 8 || line.Action == 100 { return activateShapedFloor(level, state, index, line, false) }
+    floor := walkFloorAction(line.Action)
+    if floor.Mode != 0 { return activateFloorLine(level, state, index, line, floor, false) }
+    ceiling := walkCeilingAction(line.Action)
+    if ceiling.Mode != 0 { return activateCeilingLine(level, state, index, line, ceiling, false) }
+    platform := walkPlatformAction(line.Action)
+    if platform.Mode != 0 { return activatePlatformLine(level, state, index, line, platform, false) }
+    action := walkLightAction(line.Action)
+    if !action.Valid {
+        state.Doors = crossDoorLine(level, state.Doors, state.Floors, state.Ceilings, index, line)
+        return state
+    }
+    previousLights := state.Lighting.Lights.Count
+    state = activateTaggedLights(level, state, line.Tag, action.Target)
+    if action.Target == LightStartStrobe {
+        for i := range state.Lighting.Lights.Count - previousLights {
+            sector := state.Lighting.Lights.EntryAt(previousLights + i).Sector
+            state = state.clearSectorSpecial(sector)
+        }
+    }
+    if action.Once { state.Doors = state.Doors.consumeLine(index) }
+    return state
+}
+
+// Dispatch a shoot trigger when the ray reaches the linedef.
+// Unlike use switches, impact switches change even when every sector is busy.
+func ShootLevelSpecial(level wad.BspLevel, state LevelSpecials, index int, player bit) LevelSpecials {
+    if state.LimitExceeded() { return state }
+    line := level.LineAt(index)
+    if !line.Valid || (!player && line.Action != 46) { return state }
+    switch line.Action {
+    case 24, 47:
+        if line.Action == 24 {
+            state = startTaggedFloors(level, state, line, FloorRaise).State
+        } else {
+            state = startTaggedPlatforms(level, state, line, PlatformAction{Mode: PlatformRaiseNearestAndChange}).State
+            if state.Floors.PlatformOverflow { return state }
+        }
+        state.Doors = changeLineSwitch(level, state.Doors, index, true)
+    case 46:
+        state.Doors = startTaggedDoors(level, state.Doors, state.Floors, state.Ceilings, line.Tag, DoorOpen).Doors
+        state.Doors = changeLineSwitch(level, state.Doors, index, false)
+    }
+    return state
+}

@@ -1,0 +1,97 @@
+package engine
+
+// A page is immutable once boxed. Updating one slot copies only its page
+// and the directory pages leading to it, leaving older snapshots readable.
+type slotPageRef<T> interface {
+    At(index int) T
+    With(index int, value T) slotPage<T>
+}
+
+type slotPage<T> struct {
+    entries [32]T
+}
+
+func (page slotPage<T>) At(index int) T { return page.entries[index] }
+
+func (page slotPage<T>) With(index int, value T) slotPage<T> {
+    page.entries[index] = value
+    return page
+}
+
+type slotBlock<T> struct {
+    populated bit
+    page slotPageRef<T>
+}
+
+func (block slotBlock<T>) At(index int) T {
+    if block.populated { return block.page.At(index) }
+    var empty T
+    return empty
+}
+
+func (block slotBlock<T>) With(index int, value T) slotBlock<T> {
+    if block.populated {
+        block.page = block.page.With(index, value)
+    } else {
+        block.page = slotPage<T>{}.With(index, value)
+    }
+    block.populated = true
+    return block
+}
+
+type slotPair<T> = slotBlock<slotBlock<T>>
+type slotQuad<T> = slotPair<slotPair<T>>
+type slotDirectory<T> = slotQuad<slotPair<slotBlock<T>>>
+
+// All nonnegative Fletcher ints address a slot. The separate first page
+// and two-level directory keep small mover lists and sound batches cheap.
+type PagedSlots<T> struct {
+    first slotBlock<T>
+    nearby slotPair<T>
+    directory slotDirectory<T>
+}
+
+func (slots PagedSlots<T>) At(index int) T {
+    if index < 0 {
+        var empty T
+        return empty
+    }
+    if index < 32 { return slots.first.At(index) }
+    if index < 1024 { return slots.nearby.At(index >> 5).At(index & 31) }
+    upper := slots.directory.At(index >> 30).At((index >> 25) & 31).At((index >> 20) & 31)
+    lower := upper.At((index >> 15) & 31).At((index >> 10) & 31).At((index >> 5) & 31)
+    return lower.At(index & 31)
+}
+
+func (slots PagedSlots<T>) With(index int, value T) PagedSlots<T> {
+    if index < 0 { return slots }
+    if index < 32 {
+        slots.first = slots.first.With(index, value)
+        return slots
+    }
+    if index < 1024 {
+        page := index >> 5
+        slots.nearby = slots.nearby.With(page, slots.nearby.At(page).With(index & 31, value))
+        return slots
+    }
+
+    high := index >> 30
+    highMiddle := (index >> 25) & 31
+    upper := (index >> 20) & 31
+    middle := (index >> 15) & 31
+    lower := (index >> 10) & 31
+    page := (index >> 5) & 31
+    level5 := slots.directory.At(high)
+    level4 := level5.At(highMiddle)
+    level3 := level4.At(upper)
+    level2 := level3.At(middle)
+    level1 := level2.At(lower)
+    leaf := level1.At(page).With(index & 31, value)
+    level1 = level1.With(page, leaf)
+    level2 = level2.With(lower, level1)
+    level3 = level3.With(middle, level2)
+    level4 = level4.With(upper, level3)
+    level5 = level5.With(highMiddle, level4)
+    slots.directory = slots.directory.With(high, level5)
+    return slots
+}

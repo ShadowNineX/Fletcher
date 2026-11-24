@@ -1,0 +1,40 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Connect the original Doom melt clock to the solid-screen framebuffer.
+
+package main
+
+import "play"
+
+const wipeBandCount = (Width + 1) / 2
+
+type PreviewWipe struct {
+    Melt play.MeltState
+    Before string
+    After string
+}
+
+type PreviewWipeStart struct {
+    Wipe PreviewWipe
+    Random play.RandomState
+}
+
+func advancePreviewWipe(wipe PreviewWipe) PreviewWipe {
+    melt := play.TickMelt(wipe.Melt, 1)
+    var offsets [wipeBandCount]int
+    for pair := range wipeBandCount {
+        // Sample Doom's paired columns and project their boundaries to the
+        // configured display. Both sizes consume the original 320 RNG bytes.
+        row := melt.Rows[pair * (intermissionWidth / 2) / wipeBandCount]
+        if row > 0 { offsets[pair] = intermissionPixelEdge(row, intermissionHeight, Height) }
+    }
+    revealScreen(wipe.Before, wipe.After, offsets, 2)
+    if !melt.Active { return PreviewWipe{} }
+    wipe.Melt = melt
+    return wipe
+}
+
+func beginPreviewWipe(random play.RandomState) PreviewWipeStart {
+    start := play.StartMelt(intermissionWidth, intermissionHeight, random)
+    wipe := PreviewWipe{Melt: start.State, Before: captureScreen(true), After: captureScreen(false)}
+    return PreviewWipeStart{Wipe: advancePreviewWipe(wipe), Random: start.Random}
+}

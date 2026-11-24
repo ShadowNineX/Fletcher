@@ -1,0 +1,102 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted on 2026-11-21 from linuxdoom-1.10/p_setup.c, p_maputl.c, and p_sight.c.
+
+package wad
+
+// MAPBLOCKSHIFT is FRACBITS + 7: a BLOCKMAP cell covers 128 map units.
+const MapBlockShift = 23
+
+type BlockMapInfo struct {
+    Valid bit
+    OriginX int
+    OriginY int
+    Width int
+    Height int
+    DirectoryEnd int
+}
+
+type BlockCell struct {
+    Valid bit
+    X int
+    Y int
+}
+
+func lumpBytesInFile(file bytes, lump Lump) bit {
+    return lump.Valid && lump.Offset >= 0 && lump.Count >= 0 && lump.Offset <= len(file) - lump.Count
+}
+
+// LoadBlockMap validates the fixed-size header and directory. The variable
+// lists remain individually bounded when read, because a malformed list need
+// not have a terminator before the end of the lump.
+func LoadBlockMap(level BspLevel) BlockMapInfo {
+    lump := level.BlockMap
+    if !lumpBytesInFile(level.File, lump) || lump.Count < 8 || lump.Count & 1 != 0 { return BlockMapInfo{} }
+    words := lump.Count / 2
+    width, height := U16(level.File, lump.Offset + 4), U16(level.File, lump.Offset + 6)
+    if width <= 0 || height <= 0 || width > (words - 4) / height { return BlockMapInfo{} }
+    directoryEnd := 4 + width * height
+    for cell := range width * height {
+        start := U16(level.File, lump.Offset + 8 + cell * 2)
+        if start < directoryEnd || start >= words { return BlockMapInfo{} }
+    }
+    return BlockMapInfo{
+        Valid: true,
+        OriginX: signed16(U16(level.File, lump.Offset)) << 16,
+        OriginY: signed16(U16(level.File, lump.Offset + 2)) << 16,
+        Width: width,
+        Height: height,
+        DirectoryEnd: directoryEnd,
+    }
+}
+
+// BlockCellAt converts a fixed-point world coordinate to a validated block.
+func BlockCellAt(blockMap BlockMapInfo, worldX int, worldY int) BlockCell {
+    if !blockMap.Valid { return BlockCell{} }
+    x, y := (worldX - blockMap.OriginX) >> MapBlockShift, (worldY - blockMap.OriginY) >> MapBlockShift
+    if x < 0 || y < 0 || x >= blockMap.Width || y >= blockMap.Height { return BlockCell{} }
+    return BlockCell{Valid: true, X: x, Y: y}
+}
+
+// BlockLineListStart returns a byte offset relative to BLOCKMAP. It is -1
+// for invalid cells or malformed source data.
+func BlockLineListStart(level BspLevel, blockMap BlockMapInfo, cell BlockCell) int {
+    lump := level.BlockMap
+    if !blockMap.Valid || !cell.Valid || cell.X < 0 || cell.Y < 0 || cell.X >= blockMap.Width || cell.Y >= blockMap.Height ||
+        !lumpBytesInFile(level.File, lump) { return -1 }
+    index := cell.Y * blockMap.Width + cell.X
+    directory := 8 + index * 2
+    if directory < 8 || directory > lump.Count - 2 { return -1 }
+    start := U16(level.File, lump.Offset + directory) * 2
+    if start < blockMap.DirectoryEnd * 2 || start > lump.Count - 2 { return -1 }
+    return start
+}
+
+// BlockLineAt returns the raw unsigned 16-bit list entry. The original Doom
+// iterator processes the initial zero too (as linedef zero); only 0xffff is
+// the terminator. Callers enumerate from zero until this returns -1.
+func BlockLineAt(level BspLevel, blockMap BlockMapInfo, listStart int, entry int) int {
+    lump := level.BlockMap
+    if !blockMap.Valid || !lumpBytesInFile(level.File, lump) || entry < 0 || listStart < blockMap.DirectoryEnd * 2 ||
+        listStart & 1 != 0 || listStart > lump.Count - 2 { return -1 }
+    if entry > (lump.Count - listStart - 2) / 2 { return -1 }
+    offset := listStart + entry * 2
+    line := U16(level.File, lump.Offset + offset)
+    if line == 0xffff { return -1 }
+    return line
+}
+
+// RejectsSight is the REJECT matrix test from P_CheckSight. A missing or
+// malformed optional REJECT lump never rejects sight.
+func RejectsSight(level BspLevel, firstSector int, secondSector int) bit {
+    reject := level.Reject
+    sectors := level.Sectors.Count
+    if !lumpBytesInFile(level.File, reject) || sectors <= 0 || firstSector < 0 || secondSector < 0 ||
+        firstSector >= sectors || secondSector >= sectors { return false }
+    // Check before multiplying the sector count. Imported files fit within
+    // the compiler's byte limit, but an invalid sector count can overflow.
+    if sectors > (reject.Count * 8) / sectors { return false }
+    pair := firstSector * sectors + secondSector
+    byte := pair >> 3
+    return level.File[reject.Offset + byte] & (bits<8>(1) << (pair & 7)) != 0
+}

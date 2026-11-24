@@ -1,0 +1,23 @@
+package maze
+
+const Scale = 1024
+const Size = 10
+const radius = Scale / 5
+
+// Zero is empty. The other values select wall materials.
+func Cell(x int, y int) int {
+    if x <= 0 || y <= 0 || x >= Size - 1 || y >= Size - 1 { return 1 }
+    if (y == 3 && x >= 4 && x <= 6) || (x == 6 && y == 7) { return 2 }
+    if (y == 6 && x >= 3 && x <= 5) || (y == 2 && (x == 2 || x == 3 || x == 7)) { return 3 }
+    return 0
+}
+
+// Sample the corners of the player's footprint to keep it away from walls.
+func Walkable(x int, y int) bit {
+    left := (x - radius) / Scale
+    right := (x + radius) / Scale
+    top := (y - radius) / Scale
+    bottom := (y + radius) / Scale
+    return Cell(left, top) == 0 && Cell(right, top) == 0 &&
+        Cell(left, bottom) == 0 && Cell(right, bottom) == 0
+}

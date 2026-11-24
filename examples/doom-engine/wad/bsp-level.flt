@@ -1,0 +1,366 @@
+package wad
+
+import "engine"
+
+const ThingSize = 10
+const SideSize = 30
+const SegSize = 12
+const SubsectorSize = 4
+const NodeSize = 28
+const SectorSize = 26
+
+type LevelChanges interface {
+    ReadHeights(sector int, original engine.SectorHeights) engine.SectorHeights
+    ReadLineAction(line int, original int) int
+    ReadSectorSpecial(sector int, original int) int
+    ReadSideMaterial(side int, original SideMaterial) SideMaterial
+    ReadFloorName(sector int, original LumpName) LumpName
+}
+
+type BspLevel struct {
+    File bytes
+    MapName LumpName
+    Valid bit
+    Things Lump
+    Lines Lump
+    Sides Lump
+    Vertices Lump
+    Segs Lump
+    Subsectors Lump
+    Nodes Lump
+    Sectors Lump
+    Reject Lump
+    BlockMap Lump
+    Modified bit
+    Changes LevelChanges
+}
+
+type WallSegment struct {
+    Valid bit
+    First engine.Vertex
+    Last engine.Vertex
+    Direction bits<32>
+    RecordOffset int
+    SideOffset int
+    LineOffset int
+    FrontSector int
+    BackSector int
+    Front engine.SectorHeights
+    Back engine.SectorHeights
+    TwoSided bit
+    FrontSky bit
+    SharedSky bit
+    MarkCeiling bit
+    MarkFloor bit
+    Light int
+    BackLight int
+}
+
+type segmentReferences struct {
+    Valid bit
+    Offset int
+    FirstVertex int
+    LastVertex int
+    LineOffset int
+    SideOffset int
+    FrontSector int
+    BackSector int
+}
+
+type PlayerStart struct {
+    Valid bit
+    X int
+    Y int
+    Heading bits<32>
+}
+
+type SideMaterial struct {
+    Middle LumpName
+    Upper LumpName
+    Lower LumpName
+    OffsetU int
+    OffsetV int
+    PegTop bit
+    PegBottom bit
+}
+
+func LoadMountedLevel(mounts Archives, name LumpName) BspLevel {
+    marker := mounts.Find(name)
+    if !marker.Valid || marker.Entry < 0 || marker.Size != 0 { return BspLevel{} }
+    return LoadBspLevel(marker.File, marker.Entry)
+}
+
+func LoadBspLevel(file bytes, marker int) BspLevel {
+    var level BspLevel
+    count := DirectoryCount(file)
+    if count < 9 { return level }
+    directory := LE32(file, 8)
+    if marker < directory || (marker - directory) % DirectoryEntrySize != 0 { return level }
+    index := (marker - directory) / DirectoryEntrySize
+    if index > count - 9 || !classicMarker(file, directory, count, index) { return level }
+    if !nameIs(file, marker + 80, 0x53474553, 0) ||
+        !nameIs(file, marker + 96, 0x43455353, 0x53524f54) ||
+        !nameIs(file, marker + 112, 0x45444f4e, 0x53) ||
+        !nameIs(file, marker + 128, 0x54434553, 0x53524f) { return level }
+
+    level = BspLevel{
+        File: file,
+        MapName: lumpNameAt(file, marker + 8),
+        Things: loadLump(file, marker + 16, ThingSize),
+        Lines: loadLump(file, marker + 32, LineSize),
+        Sides: loadLump(file, marker + 48, SideSize),
+        Vertices: loadLump(file, marker + 64, VertexSize),
+        Segs: loadLump(file, marker + 80, SegSize),
+        Subsectors: loadLump(file, marker + 96, SubsectorSize),
+        Nodes: loadLump(file, marker + 112, NodeSize),
+        Sectors: loadLump(file, marker + 128, SectorSize),
+    }
+    if index + 9 < count && nameIs(file, marker + 144, 0x454a4552, 0x5443) { // REJECT
+        level.Reject = loadLump(file, marker + 144, 1)
+    }
+    if index + 10 < count && nameIs(file, marker + 160, 0x434f4c42, 0x50414d4b) { // BLOCKMAP
+        level.BlockMap = loadLump(file, marker + 160, 1)
+    }
+    level.Valid = level.Things.Count > 0 && level.Lines.Count > 0 && level.Sides.Count > 0 &&
+        level.Vertices.Count > 0 && level.Segs.Count > 0 && level.Subsectors.Count > 0 &&
+        level.Nodes.Valid && level.Sectors.Count > 0
+    return level
+}
+
+func (level BspLevel) NodeCount() int { return level.Nodes.Count }
+func (level BspLevel) SubsectorCount() int { return level.Subsectors.Count }
+
+// The BSP topology check only needs the two unsigned child references.
+func (level BspLevel) NodeChildrenAt(index int) [2]int {
+    packed := LE32(level.File, level.Nodes.Offset + index * NodeSize + 24)
+    return [2]int{packed & 0xffff, int(bits<32>(packed) >> 16)}
+}
+
+func (level BspLevel) NodeAt(index int) engine.Node {
+    offset := level.Nodes.Offset + index * NodeSize
+    file := level.File
+    return engine.DecodeNodeWords(LE32(file, offset), LE32(file, offset + 4), LE32(file, offset + 8),
+        LE32(file, offset + 12), LE32(file, offset + 16), LE32(file, offset + 20), LE32(file, offset + 24))
+}
+
+func (level BspLevel) PartitionAt(index int) engine.BspPartition {
+    offset := level.Nodes.Offset + index * NodeSize
+    file := level.File
+    return engine.DecodeBspPartition(LE32(file, offset), LE32(file, offset + 4), LE32(file, offset + 24))
+}
+
+func (level BspLevel) ChildBoundsAt(index int, side int) engine.Box {
+    offset := level.Nodes.Offset + index * NodeSize + 8 + side * 8
+    return engine.DecodeBoxWords(LE32(level.File, offset), LE32(level.File, offset + 4))
+}
+
+func (level BspLevel) ChildAt(index int, side int) int {
+    return U16(level.File, level.Nodes.Offset + index * NodeSize + 24 + side * 2)
+}
+
+func (level BspLevel) SubsectorAt(index int) engine.Subsector {
+    offset := level.Subsectors.Offset + index * SubsectorSize
+    return engine.DecodeSubsectorWord(LE32(level.File, offset))
+}
+
+func sectorAt(file bytes, offset int) engine.SectorHeights {
+    return engine.SectorHeights{Floor: U16(file, offset) << 16, Ceiling: U16(file, offset + 2) << 16}
+}
+
+func (level BspLevel) WithChanges(changes LevelChanges) BspLevel {
+    level.Modified, level.Changes = true, changes
+    return level
+}
+
+func (level BspLevel) SectorHeightsAt(sector int) engine.SectorHeights {
+    if sector < 0 || sector >= level.Sectors.Count || !recordLumpInFile(level.File, level.Sectors, SectorSize) {
+        return engine.SectorHeights{}
+    }
+    return level.sectorHeightsAtOffset(level.Sectors.Offset + sector * SectorSize)
+}
+
+func (level BspLevel) sectorHeightsAtOffset(offset int) engine.SectorHeights {
+    base := sectorAt(level.File, offset)
+    if level.Modified { return level.Changes.ReadHeights(sectorId(level, offset), base) }
+    return base
+}
+
+func sideOffset(level BspLevel, line int, side int) int {
+    index := U16(level.File, line + 10 + side * 2)
+    if index >= level.Sides.Count { return -1 }
+    return level.Sides.Offset + index * SideSize
+}
+
+func sideSector(level BspLevel, offset int) int {
+    if offset < 0 { return -1 }
+    sector := U16(level.File, offset + 28)
+    if sector >= level.Sectors.Count { return -1 }
+    return level.Sectors.Offset + sector * SectorSize
+}
+
+func nameChanged(file bytes, a int, b int) bit {
+    return LE32(file, a) != LE32(file, b) || LE32(file, a + 4) != LE32(file, b + 4)
+}
+
+func (level BspLevel) floorNameAtOffset(offset int) LumpName {
+    name := lumpNameAt(level.File, offset + 4)
+    if level.Modified { return level.Changes.ReadFloorName(sectorId(level, offset), name) }
+    return name
+}
+
+func (level BspLevel) FloorNameAt(sector int) LumpName {
+    if sector < 0 || sector >= level.Sectors.Count || !recordLumpInFile(level.File, level.Sectors, SectorSize) {
+        return LumpName{}
+    }
+    return level.floorNameAtOffset(level.Sectors.Offset + sector * SectorSize)
+}
+
+func (level BspLevel) floorNameChanged(a int, b int) bit {
+    if !level.Modified { return nameChanged(level.File, a + 4, b + 4) }
+    left, right := level.floorNameAtOffset(a), level.floorNameAtOffset(b)
+    return left.Low != right.Low || left.High != right.High
+}
+
+func (level BspLevel) segmentReferences(index int) segmentReferences {
+    if index < 0 || index >= level.Segs.Count { return segmentReferences{} }
+    file := level.File
+    offset := level.Segs.Offset + index * SegSize
+    vertices, def := LE32(file, offset), LE32(file, offset + 6)
+    a, b := vertices & 0xffff, int(bits<32>(vertices) >> 16)
+    line, side := def & 0xffff, int(bits<32>(def) >> 16)
+    if a >= level.Vertices.Count || b >= level.Vertices.Count || line >= level.Lines.Count || side > 1 {
+        return segmentReferences{}
+    }
+    lineOffset := level.Lines.Offset + line * LineSize
+    frontSide := sideOffset(level, lineOffset, side)
+    front := sideSector(level, frontSide)
+    if front < 0 { return segmentReferences{} }
+    back := -1
+    if U16(file, lineOffset + 4) & 4 != 0 {
+        back = sideSector(level, sideOffset(level, lineOffset, side ^ 1))
+        if back < 0 { return segmentReferences{} }
+    }
+    return segmentReferences{Valid: true, Offset: offset, FirstVertex: a, LastVertex: b,
+        LineOffset: lineOffset, SideOffset: frontSide, FrontSector: front, BackSector: back}
+}
+
+// Check referenced sectors before rendering without decoding draw attributes.
+func (level BspLevel) ValidateSegmentFront(index int) int {
+    refs := level.segmentReferences(index)
+    if !refs.Valid { return -1 }
+    front := level.sectorHeightsAtOffset(refs.FrontSector)
+    if front.Floor > front.Ceiling { return -1 }
+    if refs.BackSector >= 0 {
+        back := level.sectorHeightsAtOffset(refs.BackSector)
+        if back.Floor > back.Ceiling { return -1 }
+    }
+    return refs.FrontSector
+}
+
+func (level BspLevel) SegmentAt(index int) WallSegment {
+    refs := level.segmentReferences(index)
+    if !refs.Valid { return WallSegment{} }
+    file := level.File
+    offset, front, back := refs.Offset, refs.FrontSector, refs.BackSector
+    result := WallSegment{
+        First: VertexAt(file, level.Vertices, refs.FirstVertex), Last: VertexAt(file, level.Vertices, refs.LastVertex),
+        Direction: bits<32>(U16(file, offset + 4)) << 16, Front: level.sectorHeightsAtOffset(front),
+        RecordOffset: offset, SideOffset: refs.SideOffset, LineOffset: refs.LineOffset,
+        FrontSector: front,
+        FrontSky: skyFlatAt(file, front + 12),
+        Light: (U16(file, front + 20) << 16) >> 16,
+    }
+    if back >= 0 {
+        result.TwoSided = true
+        result.BackSector = back
+        result.Back = level.sectorHeightsAtOffset(back)
+        result.BackLight = signed16(U16(file, back + 20))
+        result.SharedSky = result.FrontSky && skyFlatAt(file, back + 12)
+        lightChanged := result.Light != result.BackLight
+        result.MarkFloor = result.Front.Floor != result.Back.Floor || lightChanged || level.floorNameChanged(front, back)
+        result.MarkCeiling = lightChanged ||
+            (!result.SharedSky && (result.Front.Ceiling != result.Back.Ceiling || nameChanged(file, front + 12, back + 12)))
+    }
+    result.Valid = true
+    return result
+}
+
+// Only the light comparison can change while a sector light thinker runs.
+// Rebuild the plane marks when that comparison changes.
+func (level BspLevel) WithWallLighting(wall WallSegment, front int, back int) WallSegment {
+    lightChanged := front != back
+    if wall.TwoSided && (wall.Light != wall.BackLight) != lightChanged {
+        wall.MarkFloor = wall.Front.Floor != wall.Back.Floor || lightChanged ||
+            level.floorNameChanged(wall.FrontSector, wall.BackSector)
+        wall.MarkCeiling = lightChanged || (!wall.SharedSky && (wall.Front.Ceiling != wall.Back.Ceiling ||
+            nameChanged(level.File, wall.FrontSector + 12, wall.BackSector + 12)))
+    }
+    wall.Light, wall.BackLight = front, back
+    return wall
+}
+
+func (level BspLevel) LineSide(index int, side int) int {
+    if side < 0 || side > 1 || index < 0 || index >= level.Lines.Count || !recordLumpInFile(level.File, level.Lines, LineSize) ||
+        !recordLumpInFile(level.File, level.Sides, SideSize) { return -1 }
+    return sideOffset(level, level.Lines.Offset + index * LineSize, side)
+}
+
+func (level BspLevel) LineFrontSide(index int) int { return level.LineSide(index, 0) }
+
+func (level BspLevel) SideMaterialAt(side int) SideMaterial {
+    if !recordLumpInFile(level.File, level.Sides, SideSize) || side < level.Sides.Offset { return SideMaterial{} }
+    relative := side - level.Sides.Offset
+    if relative % SideSize != 0 || relative / SideSize >= level.Sides.Count { return SideMaterial{} }
+    return level.sideMaterial(side)
+}
+
+func (level BspLevel) sideMaterial(side int) SideMaterial {
+    file := level.File
+    material := SideMaterial{
+        Upper: lumpNameAt(file, side + 4), Lower: lumpNameAt(file, side + 12), Middle: lumpNameAt(file, side + 20),
+        OffsetU: signed16(U16(file, side)) << 16,
+        OffsetV: signed16(U16(file, side + 2)) << 16,
+    }
+    if level.Modified { return level.Changes.ReadSideMaterial(side, material) }
+    return material
+}
+
+func (level BspLevel) MaterialAt(wall WallSegment) SideMaterial {
+    if !wall.Valid { return SideMaterial{} }
+    material := level.sideMaterial(wall.SideOffset)
+    material.OffsetU = material.OffsetU + (signed16(U16(level.File, wall.RecordOffset + 10)) << 16)
+    flags := U16(level.File, wall.LineOffset + 4)
+    material.PegTop, material.PegBottom = flags & 8 != 0, flags & 16 != 0
+    return material
+}
+
+func (level BspLevel) PlaneKey(wall WallSegment, ceiling bit) engine.PlaneKey {
+    height := wall.Front.Floor
+    var name LumpName
+    if ceiling {
+        height = wall.Front.Ceiling
+        name = lumpNameAt(level.File, wall.FrontSector + 12)
+    } else {
+        name = level.floorNameAtOffset(wall.FrontSector)
+    }
+    name = normalizeName(name)
+    if name.Low == 0x4b535f46 && name.High == 0x3159 {
+        return engine.PlaneKey{Height: height, TextureLow: 0x4b535f46, TextureHigh: 0x3159, Sky: true}
+    }
+    return engine.PlaneKey{Height: height, Light: wall.Light, TextureLow: bits<32>(name.Low), TextureHigh: bits<32>(name.High)}
+}
+
+func (level BspLevel) FindPlayerStart(limit int) PlayerStart {
+    for index := range level.Things.Count {
+        if index >= limit { return PlayerStart{} }
+        offset := level.Things.Offset + index * ThingSize
+        if U16(level.File, offset + 6) == 1 {
+            angle := (U16(level.File, offset + 4) << 16) >> 16
+            return PlayerStart{
+                Valid: true, X: U16(level.File, offset) << 16, Y: U16(level.File, offset + 2) << 16,
+                Heading: bits<32>(angle / 45) << 29,
+            }
+        }
+    }
+    return PlayerStart{}
+}

@@ -1,0 +1,42 @@
+package main
+
+import "play"
+
+map "Doom random parity" {
+    tick {
+        if currentTick() == 0 {
+            state := play.ClearRandom()
+            for range 256 {
+                step := play.MRandom(state)
+                state = step.State
+                log(step.Value)
+            }
+            wrap := play.MRandom(state)
+            log(wrap.Value, wrap.State.MenuIndex, wrap.State.GameplayIndex)
+        }
+        if currentTick() == 1 {
+            state := play.ClearRandom()
+            for i := range 20 {
+                gameplay := play.PRandom(state)
+                state = gameplay.State
+                if i & 1 == 0 {
+                    menu := play.MRandom(state)
+                    state = menu.State
+                    log(gameplay.Value, menu.Value, state.GameplayIndex, state.MenuIndex)
+                } else {
+                    log(gameplay.Value, state.GameplayIndex, state.MenuIndex)
+                }
+            }
+        }
+        if currentTick() == 2 {
+            state := play.ClearRandom()
+            for range 256 {
+                step := play.PRandom(state)
+                state = step.State
+                log(step.Value)
+            }
+            wrap := play.PRandom(state)
+            log(wrap.Value, wrap.State.MenuIndex, wrap.State.GameplayIndex)
+        }
+    }
+}

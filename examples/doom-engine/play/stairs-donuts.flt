@@ -1,0 +1,150 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted from EV_BuildStairs and EV_DoDonut in linuxdoom-1.10.
+
+package play
+
+import "engine"
+import "wad"
+
+const FloorStair = 13
+const FloorDonutRaise = 14
+
+type StairTarget struct {
+    Sector int
+    Height int
+}
+
+func nextStairSeed(level wad.BspLevel, state LevelSpecials, tag int, after int) int {
+    for offset := range level.Sectors.Count - after - 1 {
+        sector := after + offset + 1
+        if level.SectorTag(sector) == tag && !state.MoverOccupied(sector) { return sector }
+    }
+    return -1
+}
+
+func nextStairTarget(level wad.BspLevel, state LevelSpecials, sector int, flat wad.LumpName, height int, riser int) StairTarget {
+    for index := range level.Lines.Count {
+        line := level.LineAt(index)
+        if line.Valid && line.Flags & 4 != 0 && line.FrontSector == sector && line.BackSector >= 0 {
+            nextSector := line.BackSector
+            if wad.SameLumpName(level.FloorNameAt(nextSector), flat) {
+                // The original increments the destination even for occupied
+                // matches that it subsequently skips.
+                height = height + riser
+                if !state.MoverOccupied(nextSector) {
+                    return StairTarget{Sector: nextSector, Height: height}
+                }
+            }
+        }
+    }
+    return StairTarget{Sector: -1}
+}
+
+func stairMotion(level wad.BspLevel, sector int, target int, speed int) FloorState {
+    // The pinned stair allocator leaves the floor type and crush flag unset.
+    return FloorState{Active: true, Height: level.SectorHeightsAt(sector).Floor, Destination: target,
+        Speed: speed, Direction: 1, Mode: FloorStair}
+}
+
+type StairChain struct {
+    State LevelSpecials
+    Last int
+}
+
+func extendStairs(level wad.BspLevel, state LevelSpecials, sector int, height int, riser int, speed int) StairChain {
+    flat := level.FloorNameAt(sector)
+    for range level.Sectors.Count {
+        target := nextStairTarget(level, state, sector, flat, height, riser)
+        if target.Sector < 0 { return StairChain{State: state, Last: sector} }
+        sector, height = target.Sector, target.Height
+        state = state.queueFloor(sector, stairMotion(level, sector, height, speed), FloorSurface{})
+    }
+    return StairChain{State: state, Last: sector}
+}
+
+func StartStairs(level wad.BspLevel, state LevelSpecials, tag int, turbo bit) TaggedFloorStart {
+    speed, riser := FloorSpeed / 4, 8 * engine.FracUnit
+    if turbo { speed, riser = FloorSpeed * 4, 16 * engine.FracUnit }
+    started, cursor := false, -1
+    for range level.Sectors.Count {
+        cursor = nextStairSeed(level, state, tag, cursor)
+        if cursor < 0 { return TaggedFloorStart{State: state, Started: started} }
+        height := level.SectorHeightsAt(cursor).Floor + riser
+        state = state.queueFloor(cursor, stairMotion(level, cursor, height, speed), FloorSurface{})
+        started = true
+        chain := extendStairs(level, state, cursor, height, riser, speed)
+        // The next tag search resumes from the last sector reached.
+        state, cursor = chain.State, chain.Last
+    }
+    return TaggedFloorStart{State: state, Started: started}
+}
+
+func donutRing(level wad.BspLevel, pillar int) int {
+    for index := range level.Lines.Count {
+        line := level.LineAt(index)
+        if line.Valid && (line.FrontSector == pillar || line.BackSector == pillar) {
+            return neighboringSector(line, pillar)
+        }
+    }
+    return -1
+}
+
+type DonutModel struct {
+    Found bit
+    Sector int
+}
+
+func donutModel(level wad.BspLevel, ring int, pillar int) DonutModel {
+    for index := range level.Lines.Count {
+        line := level.LineAt(index)
+        // The original flags expression does not exclude one-sided lines.
+        // Preserve the first back-side choice and validate it before use.
+        if line.Valid && (line.FrontSector == ring || line.BackSector == ring) && line.BackSector != pillar {
+            return DonutModel{Found: true, Sector: line.BackSector}
+        }
+    }
+    return DonutModel{}
+}
+
+func StartDonut(level wad.BspLevel, state LevelSpecials, tag int) TaggedFloorStart {
+    started := false
+    for pillar := range level.Sectors.Count {
+        if level.SectorTag(pillar) == tag && !state.MoverOccupied(pillar) {
+            ring := donutRing(level, pillar)
+            if ring >= 0 {
+                model := donutModel(level, ring, pillar)
+                if !model.Found { started = true }
+                if model.Found && model.Sector >= 0 {
+                    target := level.SectorHeightsAt(model.Sector).Floor
+                    speed := FloorSpeed / 2
+                    raise := FloorState{Active: true, Height: level.SectorHeightsAt(ring).Floor, Destination: target,
+                        Speed: speed, Direction: 1, Mode: FloorDonutRaise}
+                    lower := FloorState{Active: true, Height: level.SectorHeightsAt(pillar).Floor, Destination: target,
+                        Speed: speed, Direction: -1, Mode: FloorLower}
+                    paste := FloorSurface{Changed: true, Flat: level.FloorNameAt(model.Sector), Special: 0}
+                    state = state.queueFloor(ring, raise, paste)
+                    state = state.queueFloor(pillar, lower, FloorSurface{})
+                    started = true
+                }
+            }
+        }
+    }
+    return TaggedFloorStart{State: state, Started: started}
+}
+
+func activateShapedFloor(level wad.BspLevel, state LevelSpecials, index int, line wad.CollisionLine, use bit) LevelSpecials {
+    var active TaggedFloorStart
+    if line.Action == 9 {
+        active = StartDonut(level, state, line.Tag)
+    } else {
+        active = StartStairs(level, state, line.Tag, line.Action == 100 || line.Action == 127)
+    }
+    state = active.State
+    if use {
+        if active.Started { state.Doors = changeLineSwitch(level, state.Doors, index, true) }
+    } else {
+        state.Doors = state.Doors.consumeLine(index)
+    }
+    return state
+}

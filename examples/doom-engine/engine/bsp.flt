@@ -1,0 +1,118 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted on 2026-11-21 from R_RenderBSPNode in linuxdoom-1.10/r_bsp.c.
+
+package engine
+
+const BspStackPageSize = 128
+const BspStackSavedPages = SubsectorFlag / BspStackPageSize - 1
+
+// Keep the active page local and save older pages only when the traversal
+// grows. A valid classic tree is bounded by its validated node count.
+type BspStackPageRef interface {
+    ReadEntries() [BspStackPageSize]int
+}
+
+type BspStackPage struct {
+    Entries [BspStackPageSize]int
+}
+
+func (page BspStackPage) ReadEntries() [BspStackPageSize]int { return page.Entries }
+
+type BspScene interface {
+    NodeCount() int
+    NodeAt(index int) Node
+    SubsectorCount() int
+    DrawSubsector(index int, coverage ColumnCoverage) ColumnCoverage
+}
+
+type BspFrame<Payload> struct {
+    Coverage ColumnCoverage
+    Data Payload
+}
+
+type BspFrameScene<Payload> interface {
+    NodeCount() int
+    PartitionAt(index int) BspPartition
+    ChildBoundsAt(index int, side int) Box
+    ChildAt(index int, side int) int
+    SubsectorCount() int
+    DrawBspSubsector(index int, frame BspFrame<Payload>) BspFrame<Payload>
+}
+
+type CoverageScene<T extends BspScene> struct { Scene T }
+
+func (pass CoverageScene<T>) NodeCount() int { return pass.Scene.NodeCount() }
+func (pass CoverageScene<T>) PartitionAt(index int) BspPartition { return pass.Scene.NodeAt(index).Partition() }
+func (pass CoverageScene<T>) ChildBoundsAt(index int, side int) Box {
+    node := pass.Scene.NodeAt(index)
+    if side == 0 { return node.FrontBounds }
+    return node.BackBounds
+}
+func (pass CoverageScene<T>) ChildAt(index int, side int) int {
+    node := pass.Scene.NodeAt(index)
+    if side == 0 { return node.Front }
+    return node.Back
+}
+func (pass CoverageScene<T>) SubsectorCount() int { return pass.Scene.SubsectorCount() }
+func (pass CoverageScene<T>) DrawBspSubsector(index int, frame BspFrame<bit>) BspFrame<bit> {
+    frame.Coverage = pass.Scene.DrawSubsector(index, frame.Coverage)
+    return frame
+}
+
+func RenderBsp<T extends BspScene>(scene T, view ViewProjection, heading bits<32>, x int, y int) ColumnCoverage {
+    return RenderBspWithCoverage(scene, view, heading, x, y, ColumnCoverage{})
+}
+
+func RenderBspWithCoverage<T extends BspScene>(scene T, view ViewProjection, heading bits<32>, x int, y int, coverage ColumnCoverage) ColumnCoverage {
+    return RenderBspFrame(CoverageScene<T>{Scene: scene}, view, heading, x, y, BspFrame<bit>{Coverage: coverage}).Coverage
+}
+
+func RenderBspFrame<Payload, T extends BspFrameScene<Payload>>(scene T, view ViewProjection, heading bits<32>, x int, y int,
+    frame BspFrame<Payload>) BspFrame<Payload> {
+    nodeCount, subsectorCount := scene.NodeCount(), scene.SubsectorCount()
+    if nodeCount < 0 || nodeCount > SubsectorFlag || subsectorCount < 1 || subsectorCount > SubsectorFlag {
+        frame.Coverage.Failed = true
+        return frame
+    }
+    if nodeCount == 0 { return scene.DrawBspSubsector(0, frame) }
+
+    var ancestors [BspStackPageSize]int
+    var older [BspStackSavedPages]BspStackPageRef
+    depth := 0
+    child := nodeCount - 1
+    resume := false
+    for range 3 * nodeCount + 2 {
+        if resume {
+            if depth == 0 { return frame }
+            depth = depth - 1
+            slot := depth % BspStackPageSize
+            ancestor := ancestors[slot]
+            if slot == 0 && depth != 0 { ancestors = older[depth / BspStackPageSize - 1].ReadEntries() }
+            index, side := ancestor / 2, (ancestor & 1) ^ 1
+            bounds := scene.ChildBoundsAt(index, side)
+            if BoxVisible(view, heading, x, y, bounds, frame.Coverage) {
+                child = scene.ChildAt(index, side)
+                resume = false
+            }
+        } else if child >= SubsectorFlag {
+            leaf := child - SubsectorFlag
+            if leaf >= subsectorCount { frame.Coverage.Failed = true; return frame }
+            frame = scene.DrawBspSubsector(leaf, frame)
+            if frame.Coverage.Failed { return frame }
+            resume = true
+        } else {
+            if child < 0 || child >= nodeCount || depth == nodeCount { frame.Coverage.Failed = true; return frame }
+            partition := scene.PartitionAt(child)
+            side := partition.Side(x, y)
+            slot := depth % BspStackPageSize
+            if slot == 0 && depth != 0 { older[depth / BspStackPageSize - 1] = BspStackPage{Entries: ancestors} }
+            ancestors[slot] = child * 2 + side
+            depth = depth + 1
+            child = partition.Front
+            if side == 1 { child = partition.Back }
+        }
+    }
+    frame.Coverage.Failed = true
+    return frame
+}

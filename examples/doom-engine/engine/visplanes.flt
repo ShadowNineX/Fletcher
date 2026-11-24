@@ -1,0 +1,268 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted on 2026-11-21 from R_FindPlane and R_CheckPlane in
+// linuxdoom-1.10/r_plane.c.
+
+package engine
+
+const InlineVisplaneCount = 128
+const VisplaneWords = 10
+const visplaneColumnWords = InlineVisplaneCount * VisplaneWords
+const visplaneBuckets = 128
+
+// TextureLow and TextureHigh are an exact eight-byte WAD flat name. Sky
+// planes retain that name while normalizing height and light.
+type PlaneKey struct {
+    Height int
+    TextureLow bits<32>
+    TextureHigh bits<32>
+    Light int
+    Sky bit
+}
+
+type Visplane struct {
+    Key PlaneKey
+    // Min and Max are inclusive, matching the original renderer. A fresh
+    // plane uses the empty interval [MaxViewWidth, -1].
+    Min int
+    Max int
+}
+
+type VisplaneRaster struct {
+    Words [VisplaneWords]bits<32>
+    Rows PlaneColumnBuffer
+    HasRows bit
+}
+
+type overflowVisplane struct {
+    plane Visplane
+    raster VisplaneRaster
+    previousKey int
+}
+
+type visplaneKeysRef interface {
+    Head(bucket int) int
+    KeyAt(index int) PlaneKey
+    Match(index int, key PlaneKey) (bit, int)
+    WithPlane(index int, key PlaneKey, bucket int, previous int) visplaneKeys
+}
+
+// Keys and hash links change only when a plane is allocated. Keep them in
+// an immutable snapshot that span and bitmap updates can share.
+type visplaneKeys struct {
+    heights [InlineVisplaneCount]int
+    textureLow [InlineVisplaneCount]bits<32>
+    textureHigh [InlineVisplaneCount]bits<32>
+    light [InlineVisplaneCount]int
+    sky [InlineVisplaneCount]bit
+    firstByBucket [visplaneBuckets]int
+    previousKey [InlineVisplaneCount]int
+}
+
+func (keys visplaneKeys) Head(bucket int) int { return keys.firstByBucket[bucket] }
+
+func (keys visplaneKeys) KeyAt(index int) PlaneKey {
+    return PlaneKey{Height: keys.heights[index], TextureLow: keys.textureLow[index],
+        TextureHigh: keys.textureHigh[index], Light: keys.light[index], Sky: keys.sky[index]}
+}
+
+func (keys visplaneKeys) Match(index int, key PlaneKey) (bit, int) {
+    return keys.heights[index] == key.Height && keys.textureLow[index] == key.TextureLow &&
+        keys.textureHigh[index] == key.TextureHigh && keys.light[index] == key.Light && keys.sky[index] == key.Sky,
+        keys.previousKey[index]
+}
+
+func (keys visplaneKeys) WithPlane(index int, key PlaneKey, bucket int, previous int) visplaneKeys {
+    if bucket >= 0 { keys.firstByBucket[bucket] = index + 1 }
+    if index < InlineVisplaneCount {
+        keys.heights[index], keys.textureLow[index], keys.textureHigh[index] = key.Height, key.TextureLow, key.TextureHigh
+        keys.light[index], keys.sky[index], keys.previousKey[index] = key.Light, key.Sky, previous
+    }
+    return keys
+}
+
+type Visplanes struct {
+    keys visplaneKeysRef
+    minColumn [InlineVisplaneCount]int
+    maxColumn [InlineVisplaneCount]int
+    // Set where the original plane's top[] is no longer the sentinel.
+    ColumnWords [visplaneColumnWords]bits<32>
+    overflow PagedSlots<overflowVisplane>
+    Count int
+    Failed bit
+}
+
+type PlaneResult struct {
+    State Visplanes
+    Index int
+    Split bit
+}
+
+func normalizedPlaneKey(key PlaneKey) PlaneKey {
+    if key.Sky { return PlaneKey{TextureLow: key.TextureLow, TextureHigh: key.TextureHigh, Sky: true} }
+    return key
+}
+
+func planeKeyBucket(key PlaneKey) int {
+    hash := key.TextureLow ^ key.TextureHigh * bits<32>(0x9e3779b1)
+    hash = hash ^ bits<32>(key.Height) * bits<32>(0x85ebca6b) ^ bits<32>(key.Light) * bits<32>(0xc2b2ae35)
+    if key.Sky { hash = hash ^ 0x27d4eb2f }
+    return int((hash ^ (hash >> 7) ^ (hash >> 14) ^ (hash >> 21)) & (visplaneBuckets - 1))
+}
+
+func (state Visplanes) PlaneAt(index int) Visplane {
+    if index >= InlineVisplaneCount { return state.overflow.At(index - InlineVisplaneCount).plane }
+    if state.Count == 0 { return Visplane{} }
+    return Visplane{Key: state.keys.KeyAt(index),
+        Min: state.minColumn[index], Max: state.maxColumn[index]}
+}
+
+func (state Visplanes) OverflowRasterAt(index int) VisplaneRaster {
+    return state.overflow.At(index - InlineVisplaneCount).raster
+}
+
+func (state Visplanes) WithOverflowRaster(index int, raster VisplaneRaster) Visplanes {
+    slot := index - InlineVisplaneCount
+    entry := state.overflow.At(slot)
+    entry.raster = raster
+    state.overflow = state.overflow.With(slot, entry)
+    return state
+}
+
+func validPlaneRange(start int, end int) bit {
+    return start >= 0 && end <= MaxViewWidth && start < end
+}
+
+func PlaneColumnUsed(state Visplanes, index int, column int) bit {
+    if state.Failed || index < 0 || index >= state.Count || column < 0 || column >= MaxViewWidth { return false }
+    if index >= InlineVisplaneCount {
+        return state.OverflowRasterAt(index).Words[column >> 5][column & 31]
+    }
+    return state.ColumnWords[index * VisplaneWords + (column >> 5)][column & 31]
+}
+
+func newVisplane(state Visplanes, key PlaneKey, start int, end int, bucket int) PlaneResult {
+    index := state.Count
+    state.Count = state.Count + 1
+    keys := state.keys
+    if index == 0 { keys = visplaneKeys{} }
+    previous := 0
+    if bucket >= 0 { previous = keys.Head(bucket) }
+    if index < InlineVisplaneCount || bucket >= 0 {
+        state.keys = keys.WithPlane(index, key, bucket, previous)
+    }
+    if index < InlineVisplaneCount {
+        state.minColumn[index], state.maxColumn[index] = start, end - 1
+    } else {
+        state.overflow = state.overflow.With(index - InlineVisplaneCount,
+            overflowVisplane{plane: Visplane{Key: key, Min: start, Max: end - 1}, previousKey: previous})
+    }
+    return PlaneResult{State: state, Index: index, Split: bucket < 0}
+}
+
+func findPlaneIndex(state Visplanes, key PlaneKey, bucket int) int {
+    if state.Count == 0 { return -1 }
+    handle := state.keys.Head(bucket)
+    for range state.Count {
+        if handle == 0 { return -1 }
+        index := handle - 1
+        if index < InlineVisplaneCount {
+            matched, nextKey := state.keys.Match(index, key)
+            if matched { return index }
+            handle = nextKey
+        } else {
+            entry := state.overflow.At(index - InlineVisplaneCount)
+            candidate := entry.plane.Key
+            if candidate.Height == key.Height && candidate.TextureLow == key.TextureLow &&
+                candidate.TextureHigh == key.TextureHigh && candidate.Light == key.Light && candidate.Sky == key.Sky {
+                return index
+            }
+            handle = entry.previousKey
+        }
+    }
+    return -1
+}
+
+// Index only the first plane with each normalized identity. Split planes
+// keep their draw order and never replace the original lookup result.
+func FindPlane(state Visplanes, key PlaneKey) PlaneResult {
+    if state.Failed { return PlaneResult{State: state, Index: -1} }
+    key = normalizedPlaneKey(key)
+    bucket := planeKeyBucket(key)
+    index := findPlaneIndex(state, key, bucket)
+    if index >= 0 { return PlaneResult{State: state, Index: index} }
+    return newVisplane(state, key, MaxViewWidth, 0, bucket)
+}
+
+// CheckPlane expands an unoccupied overlap or allocates a duplicate plane.
+// start and end are half-open Fletcher column bounds.
+func CheckPlane(state Visplanes, index int, start int, end int) PlaneResult {
+    if state.Failed || index < 0 || index >= state.Count || !validPlaneRange(start, end) {
+        state.Failed = true
+        return PlaneResult{State: state, Index: -1}
+    }
+    var entry overflowVisplane
+    var first int
+    var last int
+    spilled := index >= InlineVisplaneCount
+    if spilled {
+        entry = state.overflow.At(index - InlineVisplaneCount)
+        first, last = entry.plane.Min, entry.plane.Max
+    } else {
+        first, last = state.minColumn[index], state.maxColumn[index]
+    }
+    overlapStart, unionStart := start, first
+    if start < first {
+        overlapStart, unionStart = first, start
+    }
+    candidateLast := end - 1
+    overlapEnd, unionEnd := candidateLast, last
+    if candidateLast > last {
+        overlapEnd, unionEnd = last, candidateLast
+    }
+    if overlapStart <= overlapEnd {
+        overlap := ColumnSpan{First: overlapStart, End: overlapEnd + 1}
+        base := index * VisplaneWords
+        firstWord, lastWord := overlap.First >> 5, (overlap.End - 1) >> 5
+        for offset := range lastWord - firstWord + 1 {
+            word := firstWord + offset
+            var occupied bits<32>
+            if spilled { occupied = entry.raster.Words[word] } else { occupied = state.ColumnWords[base + word] }
+            if occupied & spanMask(overlap, word) != 0 {
+                return newVisplane(state, state.PlaneAt(index).Key, start, end, -1)
+            }
+        }
+    }
+    if spilled {
+        entry.plane.Min, entry.plane.Max = unionStart, unionEnd
+        state.overflow = state.overflow.With(index - InlineVisplaneCount, entry)
+    } else {
+        state.minColumn[index], state.maxColumn[index] = unionStart, unionEnd
+    }
+    return PlaneResult{State: state, Index: index}
+}
+
+// MarkPlaneColumns models top[x] becoming non-sentinel after the wall loop.
+// The caller owns each column's packed top/bottom rows.
+func MarkPlaneColumns(state Visplanes, index int, start int, end int) Visplanes {
+    if state.Failed || index < 0 || index >= state.Count || !validPlaneRange(start, end) {
+        state.Failed = true
+        return state
+    }
+    span := ColumnSpan{First: start, End: end}
+    base := index * VisplaneWords
+    firstWord, lastWord := start >> 5, (end - 1) >> 5
+    if index >= InlineVisplaneCount {
+        raster := state.OverflowRasterAt(index)
+        for offset := range lastWord - firstWord + 1 {
+            word := firstWord + offset
+            raster.Words[word] = raster.Words[word] | spanMask(span, word)
+        }
+        return state.WithOverflowRaster(index, raster)
+    }
+    for offset := range lastWord - firstWord + 1 {
+        word := firstWord + offset
+        state.ColumnWords[base + word] = state.ColumnWords[base + word] | spanMask(span, word)
+    }
+    return state
+}

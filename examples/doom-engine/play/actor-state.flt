@@ -1,0 +1,99 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Actor state transitions and the post-movement arm of P_MobjThinker.
+
+package play
+
+import "actorinfo"
+
+const ActorNullState = 0
+const nightmareWait = 12 * 35
+const fastSargRun1 = 477
+const fastSargPain2 = 489
+
+func StateTics(state int, tics int, fast bit) int {
+    if fast && state >= fastSargRun1 && state <= fastSargPain2 { return tics / 2 }
+    return tics
+}
+
+// A nonzero Action suspends the transition after its new state is installed.
+// The caller runs the action against the current world, then returns the
+// updated actor to ResumeMobjState. Next retains the entered state's successor
+// even if the action itself sets another state on the actor.
+type ActorStateStep struct {
+    Actor LevelActor
+    Action int
+    Next int
+    Remaining int
+    Removed bit
+    Failed bit
+}
+
+func enterMobjStateWithFast(actor LevelActor, state int, remaining int, fast bit) ActorStateStep {
+    for index := range remaining {
+        if state == ActorNullState {
+            actor.State = ActorNullState
+            actor.Valid = false
+            return ActorStateStep{Actor: actor, Removed: true}
+        }
+        definition := actorinfo.StateAt(state)
+        if !definition.Valid { return ActorStateStep{Actor: actor, Failed: true} }
+        actor.State, actor.Tics = state, StateTics(state, definition.Tics, fast)
+        actor.Sprite, actor.Frame = definition.Sprite, definition.Frame
+        if definition.Action != 0 {
+            return ActorStateStep{Actor: actor, Action: definition.Action, Next: definition.Next,
+                Remaining: remaining - index - 1}
+        }
+        if actor.Tics != 0 { return ActorStateStep{Actor: actor} }
+        state = definition.Next
+    }
+    return ActorStateStep{Actor: actor, Failed: true}
+}
+
+func SetMobjState(actor LevelActor, state int) ActorStateStep {
+    return SetMobjStateWithFast(actor, state, false)
+}
+
+func SetMobjStateWithFast(actor LevelActor, state int, fast bit) ActorStateStep {
+    return enterMobjStateWithFast(actor, state, actorinfo.ActorStateCount, fast)
+}
+
+func ResumeMobjState(step ActorStateStep, actor LevelActor) ActorStateStep {
+    return ResumeMobjStateWithFast(step, actor, false)
+}
+
+func ResumeMobjStateWithFast(step ActorStateStep, actor LevelActor, fast bit) ActorStateStep {
+    if step.Action == 0 { return step }
+    if actor.Tics != 0 { return ActorStateStep{Actor: actor} }
+    return enterMobjStateWithFast(actor, step.Next, step.Remaining, fast)
+}
+
+type ActorStateTick struct {
+    Step ActorStateStep
+    Random RandomState
+    Respawn bit
+}
+
+// Called after movement has completed. The caller owns the spatial checks and
+// spawning side effects of a nightmare respawn request.
+func TickMobjState(actor LevelActor, levelTime int, respawnMonsters bit, random RandomState) ActorStateTick {
+    return TickMobjStateWithFast(actor, levelTime, respawnMonsters, false, random)
+}
+
+func TickMobjStateWithFast(actor LevelActor, levelTime int, respawnMonsters bit, fast bit, random RandomState) ActorStateTick {
+    if actor.Valid && actor.Tics != -1 {
+        actor.Tics = actor.Tics - 1
+        if actor.Tics == 0 {
+            state := actorinfo.StateAt(actor.State)
+            if !state.Valid { return ActorStateTick{Step: ActorStateStep{Actor: actor, Failed: true}, Random: random} }
+            return ActorStateTick{Step: SetMobjStateWithFast(actor, state.Next, fast), Random: random}
+        }
+    } else if actor.Valid && respawnMonsters && actor.Physics.Body.Flags & ActorCountKill != 0 {
+        actor.MoveCount = actor.MoveCount + 1
+        if actor.MoveCount >= nightmareWait && levelTime & 31 == 0 {
+            roll := PRandom(random)
+            return ActorStateTick{Step: ActorStateStep{Actor: actor}, Random: roll.State, Respawn: roll.Value <= 4}
+        }
+    }
+    return ActorStateTick{Step: ActorStateStep{Actor: actor}, Random: random}
+}

@@ -1,0 +1,197 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted on 2026-11-21 from R_ClearPlanes, R_MapPlane and R_MakeSpans in
+// linuxdoom-1.10/r_plane.c and the view-size setup in r_main.c.
+
+package engine
+
+import "numeric"
+
+const MaxViewHeight = 200
+
+type PlaneView struct {
+    Camera Camera
+    Height int
+    BaseU int
+    BaseV int
+}
+
+type PlaneSample struct {
+    U int
+    V int
+    StepU int
+    StepV int
+    Distance int
+}
+
+type planeRow struct {
+    Distance int
+    StepU int
+    StepV int
+}
+
+func NewPlaneView(camera Camera, height int) PlaneView {
+    center := camera.View.Width / 2
+    side := int((camera.Heading - angle90) >> FineAngleShift)
+    // The original scales the denominator by FRACUNIT before FixedDiv.
+    return PlaneView{Camera: camera, Height: height,
+        BaseU: fineSine(side + 2048) / center,
+        BaseV: -(fineSine(side) / center)}
+}
+
+func MapPlane(view PlaneView, planeZ int, row int, firstColumn int) PlaneSample {
+    return MapPlaneAngle(view, planeZ, row, planeColumnAngle(view, firstColumn))
+}
+
+func planeColumnAngle(view PlaneView, firstColumn int) bits<32> {
+    offset := view.Camera.View.ClipAngle
+    if firstColumn != 0 || offset == 0 { offset = AngleForColumn(view.Camera.View, firstColumn) }
+    return offset
+}
+
+func MapPlaneAngle(view PlaneView, planeZ int, row int, offset bits<32>) PlaneSample {
+    projection := projectPlaneRow(view, magnitude(planeZ - view.Camera.Z), row)
+    return mapPlaneColumn(view, projection, offset, planeDistanceScale(offset))
+}
+
+func projectPlaneRow(view PlaneView, planeHeight int, row int) planeRow {
+    // The screen-row offset is measured in half pixels, so the factors of
+    // 65536 and 32768 in FixedDiv cancel without an intermediate overflow.
+    dy := magnitude(2 * (row - view.Height / 2) + 1)
+    scaledWidth := view.Camera.View.Width << view.Camera.View.DetailShift
+    slope := ((scaledWidth / 2) << 17) / dy
+    distance := cport.C_FixedMul(planeHeight, slope)
+    return planeRow{Distance: distance,
+        StepU: cport.C_FixedMul(distance, view.BaseU), StepV: cport.C_FixedMul(distance, view.BaseV)}
+}
+
+func planeDistanceScale(offset bits<32>) int {
+    cosine := bits<32>(magnitude(fineSine(int(offset >> FineAngleShift) + 2048)))
+    // FRACUNIT squared is one above the largest bits<32> value.
+    distanceScale := bits<32>(0xffffffff) / cosine
+    if bits<32>(0xffffffff) % cosine == cosine - 1 {
+        distanceScale = distanceScale + 1
+    }
+    return int(distanceScale)
+}
+
+func mapPlaneColumn(view PlaneView, projection planeRow, offset bits<32>, distanceScale int) PlaneSample {
+    camera := view.Camera
+    length := cport.C_FixedMul(projection.Distance, distanceScale)
+    angle := int((camera.Heading + offset) >> FineAngleShift)
+    return PlaneSample{
+        U: camera.X + cport.C_FixedMul(fineSine(angle + 2048), length),
+        V: -camera.Y - cport.C_FixedMul(fineSine(angle), length),
+        StepU: projection.StepU, StepV: projection.StepV, Distance: projection.Distance,
+    }
+}
+
+type PlaneSpanSink interface {
+    PlaneSpan(row int, firstColumn int, endColumn int)
+}
+
+type ProjectedPlaneSpanSink interface {
+    DrawPlaneSpan(row int, firstColumn int, endColumn int, sample PlaneSample)
+}
+
+// A cache belongs to one camera view. It shares the last height's projection
+// per row and the first-column distance scale across all visplanes in that view.
+type PlaneSpanCache struct {
+    enabled bit
+    view PlaneView
+    anglesReady bit
+    angles [MaxViewWidth]bits<32>
+    distanceScales [MaxViewWidth]int
+    heights [MaxViewHeight]int
+    distances [MaxViewHeight]int
+    stepsU [MaxViewHeight]int
+    stepsV [MaxViewHeight]int
+}
+
+func NewPlaneSpanCache(view PlaneView, angles [MaxViewWidth]bits<32>, anglesReady bit) PlaneSpanCache {
+    return PlaneSpanCache{enabled: true, view: view, angles: angles, anglesReady: anglesReady}
+}
+
+type unprojectedSpans<T extends PlaneSpanSink> struct { Sink T }
+
+func (spans unprojectedSpans<T>) DrawPlaneSpan(row int, firstColumn int, endColumn int, sample PlaneSample) {
+    spans.Sink.PlaneSpan(row, firstColumn, endColumn)
+}
+
+func minRow(a int, b int) int {
+    if a < b { return a }
+    return b
+}
+
+func maxRow(a int, b int) int {
+    if a > b { return a }
+    return b
+}
+
+// Each column packs a half-open row interval as first << 16 | end.
+// Zero stores an empty column. As in Doom, its top lies below the display.
+// The final empty column closes all spans still open at the right edge.
+func MakePlaneSpans<T extends PlaneSpanSink>(sink T, columns [MaxViewWidth]bits<32>, span ColumnSpan) {
+    MakeProjectedPlaneSpans(unprojectedSpans<T>{Sink: sink}, columns, span, 0, PlaneSpanCache{})
+}
+
+func MakeProjectedPlaneSpans<T extends ProjectedPlaneSpanSink>(sink T, columns [MaxViewWidth]bits<32>, span ColumnSpan,
+    planeZ int, cache PlaneSpanCache) PlaneSpanCache {
+    var starts [MaxViewHeight]int
+    view := cache.view
+    height := magnitude(planeZ - view.Camera.Z)
+    oldFirst, oldEnd := MaxViewHeight, 0
+    for relative := range span.End - span.First + 1 {
+        column := span.First + relative
+        var packed bits<32>
+        if column < span.End { packed = columns[column] }
+        first, end := int(packed >> 16), int(packed & 0xffff)
+        if packed == 0 { first = MaxViewHeight }
+        if first != oldFirst || end != oldEnd {
+            nextFirst, nextEnd := first, end
+            closeTop := minRow(oldEnd, first)
+            if closeTop < oldFirst { closeTop = oldFirst }
+            closeBottom := maxRow(end, closeTop)
+            if closeBottom > oldEnd { closeBottom = oldEnd }
+            // Doom closes top rows in ascending order, then bottom rows in descending order.
+            for offset := range closeTop - oldFirst + oldEnd - closeBottom {
+                row := oldFirst + offset
+                if row >= closeTop { row = oldEnd - 1 - (row - closeTop) }
+                firstColumn := starts[row]
+                var sample PlaneSample
+                if cache.enabled {
+                    var projection planeRow
+                    if cache.heights[row] == height {
+                        projection = planeRow{Distance: cache.distances[row], StepU: cache.stepsU[row], StepV: cache.stepsV[row]}
+                    } else {
+                        projection = projectPlaneRow(view, height, row)
+                        cache.heights[row], cache.distances[row] = height, projection.Distance
+                        cache.stepsU[row], cache.stepsV[row] = projection.StepU, projection.StepV
+                    }
+                    angle, scale := cache.angles[firstColumn], cache.distanceScales[firstColumn]
+                    if scale == 0 {
+                        if !cache.anglesReady {
+                            angle = planeColumnAngle(view, firstColumn)
+                            cache.angles[firstColumn] = angle
+                        }
+                        scale = planeDistanceScale(angle)
+                        cache.distanceScales[firstColumn] = scale
+                    }
+                    sample = mapPlaneColumn(view, projection, angle, scale)
+                }
+                sink.DrawPlaneSpan(row, firstColumn, column, sample)
+            }
+            oldFirst, oldEnd = closeTop, closeBottom
+            for range minRow(end, oldFirst) - first {
+                starts[first] = column
+                first = first + 1
+            }
+            for range end - maxRow(oldEnd, first) {
+                end = end - 1
+                starts[end] = column
+            }
+            oldFirst, oldEnd = nextFirst, nextEnd
+        }
+    }
+    return cache
+}

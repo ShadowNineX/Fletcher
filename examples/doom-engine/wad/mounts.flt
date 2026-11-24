@@ -1,0 +1,255 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted from W_AddFile, W_CheckNumForName, and W_ReadLump in
+// linuxdoom-1.10/w_wad.c. Each source refers to a Fletcher binary import.
+
+package wad
+
+const MaxWadFiles = 20
+
+type LumpName struct {
+    Low int
+    High int
+}
+
+type LumpRef struct {
+    File bytes
+    Offset int
+    Size int
+    Index int
+    Entry int
+    Name LumpName
+    Found bit
+    Valid bit
+    ArchiveRevision int
+}
+
+type WadSource struct {
+    File bytes
+    Directory int
+    Count int
+    First int
+    SingleName LumpName
+    Reloadable bit
+}
+
+type ArchiveReload struct {
+    Mounts Archives
+    Applied bit
+}
+
+type Archives struct {
+    Sources [MaxWadFiles]WadSource
+    Count int
+    Lumps int
+    Failed bit
+    directory nameIndexRef
+    indexed int
+    spriteNames spriteDirectoryRef
+    spriteRevision int
+    Revision int
+}
+
+func appendSource(mounts Archives, source WadSource) Archives {
+    if mounts.Failed { return mounts }
+    if mounts.Count == MaxWadFiles || source.Count > 2147483647 - mounts.Lumps {
+        mounts.Failed = true
+        return mounts
+    }
+    source.First = mounts.Lumps
+    mounts.Sources[mounts.Count] = source
+    mounts.Count = mounts.Count + 1
+    mounts.Lumps = mounts.Lumps + source.Count
+    mounts.Revision = mounts.Revision + 1
+    return mounts
+}
+
+func OpenArchive(file bytes) Archives { return AddArchive(Archives{}, file) }
+
+func AddArchive(mounts Archives, file bytes) Archives {
+    count := DirectoryCount(file)
+    if count < 0 {
+        mounts.Failed = true
+        return mounts
+    }
+    return appendSource(mounts, WadSource{File: file, Directory: LE32(file, 8), Count: count})
+}
+
+// AddReloadableArchive reserves a mounted WAD for a later immutable snapshot
+// replacement. The caller supplies its source slot to ReloadArchive.
+func AddReloadableArchive(mounts Archives, file bytes) Archives {
+    count := DirectoryCount(file)
+    if count < 0 {
+        mounts.Failed = true
+        return mounts
+    }
+    return appendSource(mounts, WadSource{File: file, Directory: LE32(file, 8), Count: count, Reloadable: true})
+}
+
+// A loose lump uses its caller-supplied base name. It participates in the
+// same last-match lookup as entries in a WAD directory.
+func AddLooseLump(mounts Archives, file bytes, name LumpName) Archives {
+    return appendSource(mounts, WadSource{File: file, Directory: -1, Count: 1, SingleName: normalizeName(name)})
+}
+
+func withoutNamePadding(word int) int {
+    if word & 0xff == 0 { return 0 }
+    if word & 0xff00 == 0 { return word & 0xff }
+    if word & 0xff0000 == 0 { return word & 0xffff }
+    return word
+}
+
+func nameFromWords(low int, high int) LumpName {
+    clean := withoutNamePadding(low)
+    if clean >> 24 == 0 { return LumpName{Low: clean} }
+    return LumpName{Low: clean, High: withoutNamePadding(high)}
+}
+
+func upperWord(word int) int {
+    // The high bit of each byte marks a threshold crossing independently.
+    // Adding 128-'a' and 128-('z'+1) isolates lowercase ASCII without a borrow
+    // or carry between bytes. Keep non-ASCII bytes unchanged.
+    packed := bits<32>(word)
+    ascii := packed & 0x7f7f7f7f
+    lowercase := (ascii + 0x1f1f1f1f) & ~(ascii + 0x05050505) & ~packed & 0x80808080
+    return word ^ int(lowercase >> 2)
+}
+
+func normalizeName(name LumpName) LumpName {
+    return nameFromWords(upperWord(name.Low), upperWord(name.High))
+}
+
+func SameLumpName(left LumpName, right LumpName) bit {
+    left, right = normalizeName(left), normalizeName(right)
+    return left.Low == right.Low && left.High == right.High
+}
+
+func lumpNameAt(file bytes, offset int) LumpName {
+    return nameFromWords(LE32(file, offset), LE32(file, offset + 4))
+}
+
+func (source WadSource) readLump(localIndex int, revision int) LumpRef {
+    index := source.First + localIndex
+    if source.Directory < 0 {
+        return LumpRef{File: source.File, Size: len(source.File), Index: index, Entry: -1,
+            Name: source.SingleName, Found: true, Valid: true, ArchiveRevision: revision}
+    }
+    entry := source.Directory + localIndex * DirectoryEntrySize
+    offset, byteSize := LE32(source.File, entry), LE32(source.File, entry + 4)
+    valid := offset >= 0 && byteSize >= 0 && offset <= len(source.File) - byteSize && (byteSize == 0 || offset >= HeaderSize)
+    return LumpRef{File: source.File, Offset: offset, Size: byteSize, Index: index, Entry: entry,
+        Name: lumpNameAt(source.File, entry + 8), Found: true, Valid: valid, ArchiveRevision: revision}
+}
+
+func (mounts Archives) LumpCount() int {
+    if mounts.Failed { return 0 }
+    return mounts.Lumps
+}
+
+func (mounts Archives) sourceAt(index int) (WadSource, bit) {
+    if mounts.Failed || index < 0 || index >= mounts.Lumps { return WadSource{}, false }
+    for delta := range mounts.Count {
+        source := mounts.Sources[mounts.Count - 1 - delta]
+        if index >= source.First && index - source.First < source.Count {
+            return source, true
+        }
+    }
+    return WadSource{}, false
+}
+
+func (mounts Archives) LumpAt(index int) LumpRef {
+    source, found := mounts.sourceAt(index)
+    if found { return source.readLump(index - source.First, mounts.Revision) }
+    return LumpRef{Index: -1}
+}
+
+func (mounts Archives) Find(name LumpName) LumpRef {
+    if mounts.Failed { return LumpRef{Index: -1} }
+    key := normalizeName(name)
+    if mounts.indexed > 0 && mounts.IndexReady() {
+        return mounts.LumpAt(mounts.directory.Lookup(key) - 1)
+    }
+    for i := range mounts.Count {
+        source := mounts.Sources[mounts.Count - 1 - i]
+        if source.Directory < 0 {
+            if source.SingleName.Low == key.Low && source.SingleName.High == key.High { return source.readLump(0, mounts.Revision) }
+        } else {
+            for delta := range source.Count {
+                local := source.Count - 1 - delta
+                entry := source.Directory + local * DirectoryEntrySize + 8
+                if int(source.File[entry]) == (key.Low & 0xff) {
+                    candidate := lumpNameAt(source.File, entry)
+                    if candidate.Low == key.Low && candidate.High == key.High { return source.readLump(local, mounts.Revision) }
+                }
+            }
+        }
+    }
+    return LumpRef{Index: -1}
+}
+
+// LumpIsCurrent lets copied renderer caches reject a reference from an older
+// immutable archive snapshot. RefreshLump re-reads the same physical index.
+func (mounts Archives) LumpIsCurrent(lump LumpRef) bit {
+    if !lump.Found || lump.ArchiveRevision != mounts.Revision { return false }
+    current := mounts.LumpAt(lump.Index)
+    return current.Found && sameFile(current.File, lump.File) && current.Offset == lump.Offset &&
+        current.Size == lump.Size && current.Entry == lump.Entry && current.Valid == lump.Valid &&
+        current.Name.Low == lump.Name.Low && current.Name.High == lump.Name.High
+}
+
+// SnapshotIsCurrent is the cache guard for values that retain an Archives
+// snapshot, including flat, texture, and sprite definitions.
+func (mounts Archives) SnapshotIsCurrent(snapshot Archives) bit {
+    if mounts.Failed || snapshot.Failed || mounts.Revision != snapshot.Revision ||
+        mounts.Count != snapshot.Count || mounts.Lumps != snapshot.Lumps { return false }
+    for index := range mounts.Count {
+        source, previous := mounts.Sources[index], snapshot.Sources[index]
+        if !sameFile(source.File, previous.File) || source.Directory != previous.Directory ||
+            source.First != previous.First || source.Count != previous.Count || source.Reloadable != previous.Reloadable ||
+            source.SingleName.Low != previous.SingleName.Low || source.SingleName.High != previous.SingleName.High { return false }
+    }
+    return true
+}
+
+func (mounts Archives) RefreshLump(lump LumpRef) LumpRef {
+    if !lump.Found || lump.Index < 0 { return LumpRef{Index: -1} }
+    current := mounts.LumpAt(lump.Index)
+    if current.Name.Low != lump.Name.Low || current.Name.High != lump.Name.High { return LumpRef{Index: -1} }
+    return current
+}
+
+func reloadableDirectory(file bytes) bit {
+    count := DirectoryCount(file)
+    if count < 0 { return false }
+    directory := LE32(file, 8)
+    for index := range count {
+        entry := directory + index * DirectoryEntrySize
+        offset := LE32(file, entry)
+        byteCount := LE32(file, entry + 4)
+        if offset < 0 || byteCount < 0 || offset > len(file) - byteCount || (byteCount > 0 && offset < HeaderSize) { return false }
+    }
+    return true
+}
+
+// ReloadArchive is the safe immutable counterpart of W_Reload. It requires a
+// same-count, same-name directory before replacing the selected snapshot, so
+// physical lump indices and every existing lookup winner remain stable.
+func ReloadArchive(mounts Archives, sourceIndex int, replacement bytes) ArchiveReload {
+    result := ArchiveReload{Mounts: mounts}
+    if mounts.Failed || sourceIndex < 0 || sourceIndex >= mounts.Count || !reloadableDirectory(replacement) { return result }
+    source := mounts.Sources[sourceIndex]
+    if !source.Reloadable || source.Directory < 0 || DirectoryCount(replacement) != source.Count { return result }
+    directory := LE32(replacement, 8)
+    for local := range source.Count {
+        before := lumpNameAt(source.File, source.Directory + local * DirectoryEntrySize + 8)
+        after := lumpNameAt(replacement, directory + local * DirectoryEntrySize + 8)
+        // The optional directory index stores these hash keys, while Doom
+        // keeps names from the first load.
+        if before.Low != after.Low || before.High != after.High { return result }
+    }
+    source.File, source.Directory = replacement, directory
+    mounts.Sources[sourceIndex] = source
+    mounts.Revision = mounts.Revision + 1
+    result.Mounts, result.Applied = mounts, true
+    return result
+}

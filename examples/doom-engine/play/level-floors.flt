@@ -1,0 +1,270 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Tagged floor setup and material changes from linuxdoom-1.10 p_floor.c.
+
+package play
+
+import "wad"
+
+type FloorSurface struct {
+    Changed bit
+    Flat wad.LumpName
+    Special int
+}
+
+type retiredFloor struct {
+    Height int
+    Surface FloorSurface
+    Released int
+}
+
+type SectorFloor struct {
+    Sector int
+    Order int
+    Motion FloorState
+    Platform PlatformState
+    Surface FloorSurface
+    OnFinish FloorSurface
+}
+
+func (entry SectorFloor) sectorIndex() int { return entry.Sector }
+func (entry SectorFloor) registrationOrder() int { return entry.Order }
+
+type LevelFloors struct {
+    thinkers sectorThinkerList<SectorFloor>
+    Count int
+    History SectorHistory<retiredFloor>
+    Revision int
+    ActivePlatforms int
+    PlatformOverflow bit
+    ClearedSpecials ClearedSectorSpecials
+}
+
+func (floor SectorFloor) active() bit {
+    if floor.Platform.Mode != 0 { return floor.Platform.Active }
+    return floor.Motion.Active
+}
+
+func (floor SectorFloor) height() int {
+    if floor.Platform.Mode != 0 { return floor.Platform.Height }
+    return floor.Motion.Height
+}
+
+func (floor SectorFloor) advance(blocked bit) SectorFloor {
+    if floor.Platform.Mode != 0 {
+        floor.Platform = TickPlatform(floor.Platform, blocked)
+    } else {
+        floor.Motion = TickFloor(floor.Motion, blocked)
+    }
+    return floor
+}
+
+func (floors LevelFloors) FindSector(sector int) int { return floors.thinkers.findSector(sector) }
+func (floors LevelFloors) First() int { return floors.thinkers.first }
+func (floors LevelFloors) Following(handle int) int { return floors.thinkers.slotAt(handle).Following }
+func (floors LevelFloors) EntryAt(handle int) SectorFloor { return floors.thinkers.slotAt(handle).Entry }
+
+func (floors LevelFloors) withEntry(handle int, entry SectorFloor) LevelFloors {
+    floors.thinkers = floors.thinkers.withEntry(handle, entry)
+    return floors
+}
+
+func (floors LevelFloors) WithMotion(handle int, motion FloorState) LevelFloors {
+    entry := floors.EntryAt(handle)
+    entry.Motion = motion
+    return floors.withEntry(handle, entry)
+}
+
+func (floors LevelFloors) newestActive(sector int) int {
+    handle := floors.FindSector(sector)
+    for range floors.Count {
+        if handle == 0 { return 0 }
+        slot := floors.thinkers.slotAt(handle)
+        if slot.Entry.active() { return handle }
+        handle = slot.OlderInSector
+    }
+    return 0
+}
+
+func (floors LevelFloors) heightAt(sector int, original int) int {
+    handle := floors.FindSector(sector)
+    if handle > 0 { return floors.EntryAt(handle).height() }
+    saved := floors.History.entryAt(sector)
+    if saved.Released > 0 { return saved.Height }
+    return original
+}
+
+func (floors LevelFloors) surfaceAt(sector int) FloorSurface {
+    handle := floors.FindSector(sector)
+    if handle > 0 { return floors.EntryAt(handle).Surface }
+    return floors.History.entryAt(sector).Surface
+}
+
+func (floors LevelFloors) withHeight(sector int, height int) LevelFloors {
+    handle := floors.FindSector(sector)
+    for range floors.Count {
+        if handle == 0 { return floors }
+        slot := floors.thinkers.slotAt(handle)
+        if slot.Entry.height() != height {
+            if slot.Entry.Platform.Mode != 0 {
+                slot.Entry.Platform.Height = height
+            } else {
+                slot.Entry.Motion.Height = height
+            }
+            floors = floors.withEntry(handle, slot.Entry)
+        }
+        handle = slot.OlderInSector
+    }
+    return floors
+}
+
+func (floors LevelFloors) withSurface(sector int, surface FloorSurface) LevelFloors {
+    handle := floors.FindSector(sector)
+    if handle == 0 {
+        saved := floors.History.entryAt(sector)
+        if saved.Released > 0 {
+            saved.Surface = surface
+            floors.History = floors.History.withEntry(sector, saved, saved.Released)
+        }
+        return floors
+    }
+    for range floors.Count {
+        if handle == 0 { return floors }
+        slot := floors.thinkers.slotAt(handle)
+        slot.Entry.Surface = surface
+        floors = floors.withEntry(handle, slot.Entry)
+        handle = slot.OlderInSector
+    }
+    return floors
+}
+
+func (floors LevelFloors) retire(handle int, released int) LevelFloors {
+    entry := floors.EntryAt(handle)
+    floors.History = floors.History.withEntry(entry.Sector,
+        retiredFloor{Height: entry.height(), Surface: entry.Surface, Released: released}, released)
+    floors.thinkers = floors.thinkers.remove(handle)
+    floors.Count = floors.Count - 1
+    return floors
+}
+
+func (floors LevelFloors) Append(entry SectorFloor) LevelFloors {
+    floors.thinkers = floors.thinkers.append(entry)
+    floors.Count = floors.Count + 1
+    return floors
+}
+
+func neighboringSector(line wad.CollisionLine, sector int) int {
+    if !line.Valid || line.Flags & 4 == 0 || line.BackSector < 0 { return -1 }
+    if line.FrontSector == sector { return line.BackSector }
+    if line.BackSector == sector { return line.FrontSector }
+    return -1
+}
+
+func lowerTextureHeight(textures wad.TextureSet, lower wad.LumpName) int {
+    texture := wad.FindWallTexture(textures, lower)
+    if texture.Valid { return texture.Height << 16 }
+    // The renderer hides texture zero, but EV_DoFloor indexes its height for
+    // both the no-texture marker and an explicit name for that first texture.
+    first := wad.TextureAt(textures, 0)
+    if first.Valid && (lower.Low == 0 || wad.IsEmptyWallTexture(textures, lower)) { return first.Height << 16 }
+    return 2147483647
+}
+
+type FloorNeighbors struct {
+    Setup FloorSetup
+    LowestModel int
+    HasTextureSide bit
+}
+
+func resolveFloorNeighbors(level wad.BspLevel, sector int, mode int, textures wad.TextureSet) FloorNeighbors {
+    heights := level.SectorHeightsAt(sector)
+    setup := FloorSetup{Height: heights.Floor, Ceiling: heights.Ceiling, LowestFloor: heights.Floor,
+        HighestFloor: -500 << 16, NextFloor: heights.Floor, LowestCeiling: 2147483647, ShortestTexture: 2147483647}
+    model, higher := -1, 0
+    hasTextureSide := false
+    if mode == FloorRaise24 || mode == FloorRaise512 || mode == FloorRaise24Change {
+        return FloorNeighbors{Setup: setup, LowestModel: model}
+    }
+    for index := range level.Lines.Count {
+        neighbor := neighboringSector(level.LineAt(index), sector)
+        if neighbor >= 0 {
+            plane := level.SectorHeightsAt(neighbor)
+            if plane.Floor < setup.LowestFloor {
+                setup.LowestFloor, model = plane.Floor, neighbor
+            } else if plane.Floor == setup.LowestFloor && model < 0 {
+                model = neighbor
+            }
+            if plane.Floor > setup.HighestFloor { setup.HighestFloor = plane.Floor }
+            if plane.Ceiling < setup.LowestCeiling { setup.LowestCeiling = plane.Ceiling }
+            // Vanilla only considers the first 20 higher neighboring linedefs.
+            if plane.Floor > setup.Height && higher < 20 {
+                if higher == 0 || plane.Floor < setup.NextFloor { setup.NextFloor = plane.Floor }
+                higher = higher + 1
+            }
+            if mode == FloorRaiseTexture {
+                hasTextureSide = true
+                for side := range 2 {
+                    material := level.SideMaterialAt(level.LineSide(index, side))
+                    height := lowerTextureHeight(textures, material.Lower)
+                    if height < setup.ShortestTexture { setup.ShortestTexture = height }
+                }
+            }
+        }
+    }
+    return FloorNeighbors{Setup: setup, LowestModel: model, HasTextureSide: hasTextureSide}
+}
+
+func (state LevelSpecials) floorSurface(level wad.BspLevel, sector int) FloorSurface {
+    surface := state.Floors.surfaceAt(sector)
+    if surface.Changed { return surface }
+    return FloorSurface{Changed: true, Flat: level.FloorNameAt(sector),
+        Special: state.baseSectorSpecial(level, sector)}
+}
+
+type TaggedFloorStart struct {
+    State LevelSpecials
+    Started bit
+}
+
+// Allocate a thinker in order, retaining the live surface. A donut can add a
+// second active mover to its ring.
+func (state LevelSpecials) queueFloor(sector int, motion FloorState, onFinish FloorSurface) LevelSpecials {
+    return state.queueFloorEntry(SectorFloor{Sector: sector, Motion: motion, OnFinish: onFinish})
+}
+
+func (state LevelSpecials) queueFloorEntry(entry SectorFloor) LevelSpecials {
+    entry.Order = state.Doors.NextMover
+    entry.Surface = state.Floors.surfaceAt(entry.Sector)
+    state.Floors = state.Floors.Append(entry)
+    state.Doors.NextMover = state.Doors.NextMover + 1
+    return state
+}
+
+func startTaggedFloors(level wad.BspLevel, state LevelSpecials, line wad.CollisionLine, mode int) TaggedFloorStart {
+    started := false
+    var textures wad.TextureSet
+    if mode == FloorRaiseTexture { textures = wad.LoadTextureSet(level.File) }
+    for sector := range level.Sectors.Count {
+        if level.SectorTag(sector) == line.Tag && !state.MoverOccupied(sector) {
+            adjacent := resolveFloorNeighbors(level, sector, mode, textures)
+            // With no two-sided lines EV_DoFloor retains MAXINT as its rise.
+            // The signed destination is representable from a nonpositive floor.
+            if mode != FloorRaiseTexture || adjacent.Setup.ShortestTexture < 2147483647 ||
+                (!adjacent.HasTextureSide && adjacent.Setup.Height <= 0) {
+                var onFinish FloorSurface
+                if mode == FloorLowerChange && adjacent.LowestModel >= 0 {
+                    onFinish = state.floorSurface(level, adjacent.LowestModel)
+                }
+                motion := StartFloor(mode, adjacent.Setup)
+                state = state.queueFloor(sector, motion, onFinish)
+                if mode == FloorRaise24Change {
+                    surface := state.floorSurface(level, line.FrontSector)
+                    state.Floors = state.Floors.withSurface(sector, surface)
+                    state.Floors.Revision = state.Floors.Revision + 1
+                }
+                started = true
+            }
+        }
+    }
+    return TaggedFloorStart{State: state, Started: started}
+}

@@ -1,0 +1,63 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// G_Responder and G_BuildTiccmd mouse and movement logic from linuxdoom-1.10 g_game.c.
+
+package play
+
+type PlayerMoveKeys struct {
+    Forward bit
+    Reverse bit
+    TurnLeft bit
+    TurnRight bit
+    StrafeLeft bit
+    StrafeRight bit
+    Run bit
+    Strafe bit
+}
+
+const slowTurnTics = 6
+const slowTurn = 320
+const walkTurn = 640
+const runTurn = 1280
+const walkForward = 25
+const runForward = 50
+const walkSide = 24
+const runSide = 40
+const maxPlayerMove = 50
+const DefaultMouseSensitivity = 5
+const MaxMouseSensitivity = 9
+
+func ScalePlayerMouseDelta(delta int, sensitivity int) int {
+    return delta * (sensitivity + 5) / 10
+}
+
+// Mouse deltas are already Doom command units. Positive Y moves forward.
+func BuildPlayerMoveCommand(keys PlayerMoveKeys, turnHeld int, mouseDX int, mouseDY int) (PlayerMoveCommand, int) {
+    forward, side, turn := 0, 0, 0
+    forwardStep, sideStep, turnStep := walkForward, walkSide, walkTurn
+    if keys.Run { forwardStep, sideStep, turnStep = runForward, runSide, runTurn }
+
+    if keys.TurnLeft || keys.TurnRight { turnHeld = turnHeld + 1 } else { turnHeld = 0 }
+    if turnHeld < slowTurnTics { turnStep = slowTurn }
+
+    if keys.Strafe {
+        if keys.TurnRight { side = side + sideStep }
+        if keys.TurnLeft { side = side - sideStep }
+    } else {
+        if keys.TurnRight { turn = turn - turnStep }
+        if keys.TurnLeft { turn = turn + turnStep }
+    }
+    if keys.Forward { forward = forward + forwardStep }
+    if keys.Reverse { forward = forward - forwardStep }
+    if keys.StrafeRight { side = side + sideStep }
+    if keys.StrafeLeft { side = side - sideStep }
+
+    forward = forward + mouseDY
+    if keys.Strafe { side = side + mouseDX * 2 } else { turn = turn - mouseDX * 8 }
+    if forward > maxPlayerMove { forward = maxPlayerMove }
+    if forward < -maxPlayerMove { forward = -maxPlayerMove }
+    if side > maxPlayerMove { side = maxPlayerMove }
+    if side < -maxPlayerMove { side = -maxPlayerMove }
+    // ticcmd_t stores angleturn as a signed short.
+    return PlayerMoveCommand{Forward: forward, Side: side, Turn: (turn << 16) >> 16}, turnHeld
+}

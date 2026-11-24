@@ -1,0 +1,32 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// View sizing from R_ExecuteSetViewSize and R_InitBuffer in Linux Doom 1.10.
+
+package main
+
+const supportedViewBlocks = [8]int{3, 4, 5, 6, 7, 8, 9, 10}
+const configuredViewBlocks = supportedViewBlocks[ViewBlocks - 3]
+
+type ViewWindow struct {
+    X int
+    Y int
+    Width int
+    Height int
+    Blocks int
+    NativeWidth int
+    NativeHeight int
+}
+
+func previewViewWindow(statusVisible bit, blocks int) ViewWindow {
+    if !statusVisible { return ViewWindow{Width: Width, Height: Height, Blocks: 11,
+        NativeWidth: intermissionWidth, NativeHeight: intermissionHeight} }
+    nativeWidth := blocks * 32
+    nativeHeight := (blocks * statusBarTop / 10) & ~7
+    nativeLeft, nativeTop := (intermissionWidth - nativeWidth) / 2, (statusBarTop - nativeHeight) / 2
+    left := intermissionPixelEdge(nativeLeft, intermissionWidth, Width)
+    right := intermissionPixelEdge(nativeLeft + nativeWidth, intermissionWidth, Width)
+    top := intermissionPixelEdge(nativeTop, intermissionHeight, Height)
+    bottom := intermissionPixelEdge(nativeTop + nativeHeight, intermissionHeight, Height)
+    return ViewWindow{X: left, Y: top, Width: right - left, Height: bottom - top, Blocks: blocks,
+        NativeWidth: nativeWidth, NativeHeight: nativeHeight}
+}

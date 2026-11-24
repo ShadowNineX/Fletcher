@@ -1,0 +1,119 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// P_NoiseAlert and P_RecursiveSound from linuxdoom-1.10/p_enemy.c.
+
+package play
+
+import "wad"
+
+const soundTwoSided = 4
+const soundBlock = 64
+
+// Odd and even handles visit a line from its front and back respectively.
+// Prepending in reverse linedef order produces Doom's sector line order.
+type SoundGraph struct {
+    Valid bit
+    file bytes
+    sectors wad.Lump
+    lines wad.Lump
+    sides wad.Lump
+    vertices wad.Lump
+    heads PagedSlots<int>
+    links PagedSlots<soundLine>
+}
+
+type soundLine struct {
+    Front int
+    Back int
+    FrontNext int
+    BackNext int
+    Blocker int
+}
+
+func BuildSoundGraph(level wad.BspLevel) SoundGraph {
+    if !level.Valid { return SoundGraph{} }
+    graph := SoundGraph{Valid: true, file: level.File, sectors: level.Sectors, lines: level.Lines,
+        sides: level.Sides, vertices: level.Vertices}
+    for i := range graph.lines.Count {
+        index := graph.lines.Count - i - 1
+        line := level.LineAt(index)
+        if !line.Valid { return SoundGraph{} }
+        if line.Flags & soundTwoSided != 0 {
+            front, back := line.FrontSector, line.BackSector
+            if back < 0 || front < 0 || back >= graph.sectors.Count || front >= graph.sectors.Count { return SoundGraph{} }
+            if front != back {
+                frontEdge, backEdge := 2 * index + 1, 2 * index + 2
+                blocker := 0
+                if line.Flags & soundBlock != 0 { blocker = 1 }
+                graph.links = graph.links.With(index, soundLine{Front: front, Back: back,
+                    FrontNext: graph.heads.At(front), BackNext: graph.heads.At(back), Blocker: blocker})
+                graph.heads = graph.heads.With(front, frontEdge).With(back, backEdge)
+            }
+        }
+    }
+    return graph
+}
+
+func sameSoundLump(a wad.Lump, b wad.Lump) bit {
+    return a.Offset == b.Offset && a.Count == b.Count && a.Valid == b.Valid
+}
+
+type SectorSound struct {
+    Target int
+    Traversed int
+}
+
+type SoundTargets struct {
+    Valid bit
+    entries PagedSlots<SectorSound>
+}
+
+func (sounds SoundTargets) At(sector int) SectorSound { return sounds.entries.At(sector) }
+
+type soundPath struct {
+    Edge int
+    Cost int
+}
+
+// Lines remain in the graph when a door closes. Each alert reads the live
+// opening and may revisit a sector reached earlier through one sound blocker.
+// Targets in sectors the new alert cannot reach survive from previous alerts.
+func NoiseAlert(level wad.BspLevel, graph SoundGraph, sounds SoundTargets, emitterSector int, target int) SoundTargets {
+    sounds.Valid = false
+    if !level.Valid || !graph.Valid || emitterSector < 0 || emitterSector >= graph.sectors.Count || target <= 0 ||
+        !sameFile(graph.file, level.File) || !sameSoundLump(graph.lines, level.Lines) || !sameSoundLump(graph.sides, level.Sides) ||
+        !sameSoundLump(graph.vertices, level.Vertices) || !sameSoundLump(graph.sectors, level.Sectors) { return sounds }
+    var reached PagedSlots<int>
+    var stack PagedSlots<soundPath>
+    depth := 0
+    cursor := soundPath{Edge: graph.heads.At(emitterSector), Cost: 1}
+    reached = reached.With(emitterSector, 1)
+    sounds.entries = sounds.entries.With(emitterSector, SectorSound{Target: target, Traversed: 1})
+
+    // A sector can be entered at most twice, once with each traversal cost.
+    for range 4 * graph.lines.Count + 2 * graph.sectors.Count {
+        edge := cursor.Edge
+        if edge == 0 {
+            if depth == 0 { sounds.Valid = true; return sounds }
+            depth = depth - 1
+            cursor = stack.At(depth)
+        } else {
+            link := graph.links.At((edge - 1) / 2)
+            sibling := link.Back
+            cursor.Edge = link.FrontNext
+            if edge & 1 == 0 { sibling, cursor.Edge = link.Front, link.BackNext }
+            cost := cursor.Cost + link.Blocker
+            previous := reached.At(sibling)
+            line := wad.CollisionLine{Valid: true, FrontSector: link.Front, BackSector: link.Back}
+            if cost <= 2 && (previous == 0 || cost < previous) && wad.LineOpening(level, line).Range > 0 {
+                stack = stack.With(depth, cursor)
+                depth = depth + 1
+                if depth >= graph.sectors.Count { return sounds }
+                cursor = soundPath{Edge: graph.heads.At(sibling), Cost: cost}
+                reached = reached.With(sibling, cost)
+                sounds.entries = sounds.entries.With(sibling, SectorSound{Target: target, Traversed: cost})
+            }
+        }
+    }
+    return sounds
+}

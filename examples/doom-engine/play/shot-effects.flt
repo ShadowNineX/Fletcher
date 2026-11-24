@@ -1,0 +1,55 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted from P_SpawnPuff and P_SpawnBlood in p_mobj.c.
+
+package play
+
+import "actorinfo"
+import "engine"
+import "wad"
+
+const meleeAttackRange = 64 * engine.FracUnit
+
+type ShotEffectSpawn struct {
+    World CombatWorld
+    Handle int
+    Valid bit
+}
+
+func SpawnShotEffect(level wad.BspLevel, world CombatWorld, x int, y int, z int, blood bit,
+    amount int, distance int, rules CombatRules) ShotEffectSpawn {
+    handle := world.Actors.NextTransientHandle()
+    if handle == 0 { return ShotEffectSpawn{World: world} }
+    kind, state, momentum := actorinfo.ActorPuff, ActorNullState, engine.FracUnit
+    if blood {
+        kind, momentum = actorinfo.ActorBlood, 2 * engine.FracUnit
+        if amount < 9 {
+            state = actorinfo.StateBlood3
+        } else if amount <= 12 {
+            state = actorinfo.StateBlood2
+        }
+    } else if distance == meleeAttackRange {
+        state = actorinfo.StatePuff3
+    }
+
+    first := PRandom(world.Random)
+    second := PRandom(first.State)
+    z = z + ((int(first.Value) - int(second.Value)) << 10)
+    spawn := SpawnMobj(level, kind, x, y, z, rules.Skill, second.State)
+    if !spawn.Actor.Valid { return ShotEffectSpawn{World: world} }
+    actor := spawn.Actor
+    actor.Physics.MomentumZ = momentum
+    roll := PRandom(spawn.Random)
+    actor.Tics = actor.Tics - int(roll.Value & 3)
+    if actor.Tics < 1 { actor.Tics = 1 }
+    if state != ActorNullState {
+        entry := SetMobjState(actor, state)
+        if entry.Failed || !entry.Actor.Valid || entry.Action != 0 { return ShotEffectSpawn{World: world} }
+        actor = entry.Actor
+    }
+    position := world.Links.SetActorPosition(level, handle, actor)
+    if !position.Valid { return ShotEffectSpawn{World: world} }
+    world.Actors = world.Actors.AppendTransient(position.Actor)
+    world.Links, world.Random = position.Links, roll.State
+    return ShotEffectSpawn{World: world, Handle: handle, Valid: true}
+}

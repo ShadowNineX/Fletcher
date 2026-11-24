@@ -1,0 +1,32 @@
+package bitmap
+
+func glyph(letter string) [GlyphHeight]int {
+    if letter == "A" { return [5]int{2, 5, 7, 5, 5} }
+    if letter == "B" { return [5]int{6, 5, 6, 5, 6} }
+    if letter == "C" { return [5]int{3, 4, 4, 4, 3} }
+    if letter == "D" { return [5]int{6, 5, 5, 5, 6} }
+    if letter == "E" { return [5]int{7, 4, 6, 4, 7} }
+    if letter == "F" { return [5]int{7, 4, 6, 4, 4} }
+    if letter == "G" { return [5]int{3, 4, 5, 5, 3} }
+    if letter == "H" { return [5]int{5, 5, 7, 5, 5} }
+    if letter == "I" { return [5]int{7, 2, 2, 2, 7} }
+    if letter == "J" { return [5]int{1, 1, 1, 5, 2} }
+    if letter == "K" { return [5]int{5, 5, 6, 5, 5} }
+    if letter == "L" { return [5]int{4, 4, 4, 4, 7} }
+    if letter == "M" { return [5]int{5, 7, 7, 5, 5} }
+    if letter == "N" { return [5]int{5, 7, 7, 7, 5} }
+    if letter == "O" { return [5]int{2, 5, 5, 5, 2} }
+    if letter == "P" { return [5]int{6, 5, 6, 4, 4} }
+    if letter == "Q" { return [5]int{2, 5, 5, 3, 1} }
+    if letter == "R" { return [5]int{6, 5, 6, 5, 5} }
+    if letter == "S" { return [5]int{3, 4, 2, 1, 6} }
+    if letter == "T" { return [5]int{7, 2, 2, 2, 2} }
+    if letter == "U" { return [5]int{5, 5, 5, 5, 7} }
+    if letter == "V" { return [5]int{5, 5, 5, 5, 2} }
+    if letter == "W" { return [5]int{5, 5, 7, 7, 5} }
+    if letter == "X" { return [5]int{5, 5, 2, 5, 5} }
+    if letter == "Y" { return [5]int{5, 5, 2, 2, 2} }
+    if letter == "Z" { return [5]int{7, 1, 2, 4, 7} }
+    if letter == " " { return [5]int{} }
+    return [5]int{7, 1, 2, 0, 2}
+}

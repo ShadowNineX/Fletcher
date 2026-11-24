@@ -1,0 +1,379 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Door activation and sector changes from linuxdoom-1.10 p_doors.c and p_switch.c.
+
+package play
+
+import "actorinfo"
+import "engine"
+import "wad"
+
+type SectorDoor struct {
+    Sector int
+    Order int
+    State DoorState
+}
+
+func (entry SectorDoor) sectorIndex() int { return entry.Sector }
+func (entry SectorDoor) registrationOrder() int { return entry.Order }
+
+type retiredCeiling struct {
+    Height int
+    Released int
+}
+
+type LevelDoors struct {
+    Count int
+    thinkers sectorThinkerList<SectorDoor>
+    UsedCount int
+    UsedLines UsedLines
+    Switches LevelSwitches
+    CeilingHistory SectorHistory<retiredCeiling>
+    NextMover int // Shared registration and mover-ownership order for sector thinkers.
+    Sounds MoverSounds
+}
+
+func (doors LevelDoors) ClearSounds() LevelDoors {
+    doors.Sounds = MoverSounds{}
+    return doors
+}
+
+func (doors LevelDoors) First() int { return doors.thinkers.first }
+func (doors LevelDoors) Following(handle int) int { return doors.thinkers.slotAt(handle).Following }
+func (doors LevelDoors) EntryAt(handle int) SectorDoor { return doors.thinkers.slotAt(handle).Entry }
+
+func (doors LevelDoors) Append(entry SectorDoor) LevelDoors {
+    doors.thinkers = doors.thinkers.append(entry)
+    doors.Count = doors.Count + 1
+    return doors
+}
+
+func (doors LevelDoors) WithState(handle int, state DoorState) LevelDoors {
+    entry := doors.EntryAt(handle)
+    entry.State = state
+    doors.thinkers = doors.thinkers.withEntry(handle, entry)
+    return doors
+}
+
+func (doors LevelDoors) newestActive(sector int) int {
+    handle := doors.thinkers.findSector(sector)
+    for range doors.Count {
+        if handle == 0 { return 0 }
+        slot := doors.thinkers.slotAt(handle)
+        if slot.Entry.State.Active { return handle }
+        handle = slot.OlderInSector
+    }
+    return 0
+}
+
+// Geometry is a snapshot shared by BSP, position checks, and line traversal.
+type SectorChanges struct {
+    doors sectorThinkerList<SectorDoor>
+    UsedLines UsedLines
+    Textures SwitchTextures
+    Floors LevelFloors
+    Ceilings LevelCeilings
+    CeilingHistory SectorHistory<retiredCeiling>
+}
+
+func (geometry SectorChanges) ReadHeights(sector int, original engine.SectorHeights) engine.SectorHeights {
+    original.Floor = geometry.Floors.heightAt(sector, original.Floor)
+    door := geometry.doors.findSector(sector)
+    if door > 0 {
+        original.Ceiling = geometry.doors.slotAt(door).Entry.State.Ceiling
+        return original
+    }
+    ceiling := geometry.Ceilings.FindSector(sector)
+    if ceiling > 0 {
+        original.Ceiling = geometry.Ceilings.EntryAt(ceiling).Motion.Height
+    } else {
+        saved := geometry.CeilingHistory.entryAt(sector)
+        if saved.Released > 0 { original.Ceiling = saved.Height }
+    }
+    return original
+}
+
+func (geometry SectorChanges) ReadLineAction(line int, original int) int {
+    if original == 0 || geometry.UsedLines.contains(line) { return 0 }
+    return original
+}
+
+func (geometry SectorChanges) ReadSectorSpecial(sector int, original int) int {
+    surface := geometry.Floors.surfaceAt(sector)
+    if surface.Changed { return surface.Special }
+    if geometry.Floors.ClearedSpecials.Contains(sector) { return 0 }
+    if original == 10 || original == 14 {
+        if geometry.doors.findSector(sector) > 0 { return 0 }
+        if geometry.CeilingHistory.entryAt(sector).Released > 0 { return 0 }
+    }
+    return original
+}
+
+func (geometry SectorChanges) ReadSideMaterial(side int, original wad.SideMaterial) wad.SideMaterial {
+    if geometry.Textures.Count == 0 { return original }
+    return geometry.Textures.MaterialAt(side, original)
+}
+
+func (geometry SectorChanges) ReadFloorName(sector int, original wad.LumpName) wad.LumpName {
+    surface := geometry.Floors.surfaceAt(sector)
+    if surface.Changed { return surface.Flat }
+    return original
+}
+
+func (doors LevelDoors) ApplyTo(level wad.BspLevel) wad.BspLevel {
+    return LevelSpecials{Doors: doors}.ApplyTo(level)
+}
+
+func (state LevelSpecials) ApplyTo(level wad.BspLevel) wad.BspLevel {
+    doors := state.Doors
+    if doors.Count == 0 && doors.UsedCount == 0 && doors.Switches.Textures.Count == 0 &&
+        state.Floors.Count == 0 && state.Floors.History.LastRelease == 0 && state.Floors.ClearedSpecials.Count == 0 &&
+        state.Ceilings.Count == 0 && doors.CeilingHistory.LastRelease == 0 { return level }
+    geometry := SectorChanges{doors: doors.thinkers, UsedLines: doors.UsedLines,
+        Textures: doors.Switches.Textures, Floors: state.Floors, Ceilings: state.Ceilings, CeilingHistory: doors.CeilingHistory}
+    return level.WithChanges(geometry)
+}
+
+func lowestDoorNeighbor(level wad.BspLevel, sector int) int {
+    minimum := 2147483647
+    for i := range level.Lines.Count {
+        line := level.LineAt(i)
+        if line.Valid && line.Flags & 4 != 0 && line.BackSector >= 0 {
+            neighbor := -1
+            if line.FrontSector == sector {
+                neighbor = line.BackSector
+            } else if line.BackSector == sector {
+                neighbor = line.FrontSector
+            }
+            if neighbor >= 0 {
+                ceiling := level.SectorHeightsAt(neighbor).Ceiling
+                if ceiling < minimum { minimum = ceiling }
+            }
+        }
+    }
+    return minimum
+}
+
+func (doors LevelDoors) withCeiling(sector int, ceiling int) LevelDoors {
+    handle := doors.thinkers.findSector(sector)
+    for range doors.Count {
+        if handle == 0 { return doors }
+        slot := doors.thinkers.slotAt(handle)
+        if slot.Entry.State.Ceiling != ceiling {
+            slot.Entry.State.Ceiling = ceiling
+            doors.thinkers = doors.thinkers.withEntry(handle, slot.Entry)
+        }
+        handle = slot.OlderInSector
+    }
+    return doors
+}
+
+func (doors LevelDoors) appendDoor(sector int, door DoorState) LevelDoors {
+    doors = doors.Append(SectorDoor{Sector: sector, Order: doors.NextMover, State: door})
+    doors.NextMover = doors.NextMover + 1
+    return doors
+}
+
+func (doors LevelDoors) removeDoor(handle int) LevelDoors {
+    doors.thinkers = doors.thinkers.remove(handle)
+    doors.Count = doors.Count - 1
+    return doors
+}
+
+func UseLevelDoor(level wad.BspLevel, blockMap wad.BlockMapInfo, doors LevelDoors, player ActorPhysics) LevelDoors {
+    if doors.Switches.ButtonOverflow { return doors }
+    hit := FindUseLine(level, blockMap, player.Body.X, player.Body.Y, player.Angle)
+    if !hit.Valid || !hit.Found || hit.Back { return doors }
+    line := level.LineAt(hit.Index)
+    if requiredDoorKey(line.Action) >= 0 { return doors }
+    return useDoorLine(level, doors, LevelFloors{}, LevelCeilings{}, hit.Index, line, player.Body.Player)
+}
+
+func useDoorLine(level wad.BspLevel, doors LevelDoors, floors LevelFloors, ceilings LevelCeilings,
+    index int, line wad.CollisionLine, player bit) LevelDoors {
+    action := switchDoorAction(line.Action)
+    if action.Valid {
+        if !player { return doors }
+        return useDoorSwitch(level, doors, floors, ceilings, index, line.Tag, action)
+    }
+    if line.BackSector < 0 { return doors }
+    repeat := line.Action == 1 || line.Action == 117 || (line.Action >= 26 && line.Action <= 28)
+    once := line.Action == 118 || (line.Action >= 31 && line.Action <= 34)
+    if !repeat && !once { return doors }
+
+    owner := moverOwner(doors, floors, ceilings, line.BackSector)
+    if repeat {
+        if owner.Floor >= 0 || owner.Ceiling >= 0 { return doors }
+        if owner.Door >= 0 {
+            current := doors.EntryAt(owner.Door).State
+            if current.Direction == -1 {
+                current.Direction = 1
+                return doors.WithState(owner.Door, current)
+            }
+            if player {
+                current.Direction = -1
+                return doors.WithState(owner.Door, current)
+            }
+            return doors
+        }
+    }
+
+    // An open-stay manual can install a newer thinker for the same sector.
+    // The old thinker stays scheduled and both see its live ceiling height.
+    heights := level.SectorHeightsAt(line.BackSector)
+    door := OpenManualDoor(line.Action, heights.Ceiling, heights.Floor, lowestDoorNeighbor(level, line.BackSector))
+    doors = doors.appendDoor(line.BackSector, door)
+    sound := actorinfo.SoundDoorOpen
+    if door.Mode == DoorBlazeRaise || door.Mode == DoorBlazeOpen { sound = actorinfo.SoundBlazeOpen }
+    doors.Sounds = doors.Sounds.add(sound, line.BackSector)
+    if once { doors = doors.consumeLine(index) }
+    return doors
+}
+
+// P_SpawnSpecials installs timed doors in sector order.
+func LoadTimedDoors(level wad.BspLevel) LevelDoors {
+    // P_SpawnSpecials registers every startup thinker in sector order.
+    doors := LevelDoors{NextMover: level.Sectors.Count}
+    for sector := range level.Sectors.Count {
+        special := level.SectorSpecial(sector)
+        if special == 10 || special == 14 {
+            heights := level.SectorHeightsAt(sector)
+            adjacent := heights.Ceiling
+            if special == 14 { adjacent = lowestDoorNeighbor(level, sector) }
+            door := SpawnTimedDoor(special, heights.Ceiling, heights.Floor, adjacent)
+            doors = doors.Append(SectorDoor{Sector: sector, Order: sector, State: door})
+            doors.NextMover = doors.NextMover + 1
+        }
+    }
+    return doors
+}
+
+type TaggedDoorAction struct {
+    Valid bit
+    Once bit
+    Mode int
+}
+
+func walkDoorAction(action int) TaggedDoorAction {
+    switch action {
+    case 2, 86: return TaggedDoorAction{Valid: true, Once: action == 2, Mode: DoorOpen}
+    case 3, 75: return TaggedDoorAction{Valid: true, Once: action == 3, Mode: DoorClose}
+    case 4, 90: return TaggedDoorAction{Valid: true, Once: action == 4, Mode: DoorNormal}
+    case 16, 76: return TaggedDoorAction{Valid: true, Once: action == 16, Mode: DoorClose30ThenOpen}
+    case 108, 105: return TaggedDoorAction{Valid: true, Once: action == 108, Mode: DoorBlazeRaise}
+    case 109, 106: return TaggedDoorAction{Valid: true, Once: action == 109, Mode: DoorBlazeOpen}
+    case 110, 107: return TaggedDoorAction{Valid: true, Once: action == 110, Mode: DoorBlazeClose}
+    }
+    return TaggedDoorAction{}
+}
+
+func switchDoorAction(action int) TaggedDoorAction {
+    switch action {
+    case 29, 63: return TaggedDoorAction{Valid: true, Once: action == 29, Mode: DoorNormal}
+    case 50, 42: return TaggedDoorAction{Valid: true, Once: action == 50, Mode: DoorClose}
+    case 103, 61: return TaggedDoorAction{Valid: true, Once: action == 103, Mode: DoorOpen}
+    case 111, 114: return TaggedDoorAction{Valid: true, Once: action == 111, Mode: DoorBlazeRaise}
+    case 112, 115: return TaggedDoorAction{Valid: true, Once: action == 112, Mode: DoorBlazeOpen}
+    case 113, 116: return TaggedDoorAction{Valid: true, Once: action == 113, Mode: DoorBlazeClose}
+    case 99, 134, 136: return TaggedDoorAction{Valid: true, Mode: DoorBlazeOpen}
+    case 133, 135, 137: return TaggedDoorAction{Valid: true, Once: true, Mode: DoorBlazeOpen}
+    }
+    return TaggedDoorAction{}
+}
+
+type TaggedDoorStart struct {
+    Doors LevelDoors
+    Started bit
+}
+
+// EV_DoDoor appends thinkers in sector order and skips occupied sectors.
+func startTaggedDoors(level wad.BspLevel, doors LevelDoors, floors LevelFloors, ceilings LevelCeilings, tag int, mode int) TaggedDoorStart {
+    started := false
+    for sector := range level.Sectors.Count {
+        if level.SectorTag(sector) == tag {
+            owner := moverOwner(doors, floors, ceilings, sector)
+            if !owner.Occupied() {
+                heights := level.SectorHeightsAt(sector)
+                adjacent := heights.Ceiling
+                if mode != DoorClose30ThenOpen { adjacent = lowestDoorNeighbor(level, sector) }
+                door := OpenTaggedDoor(mode, heights.Ceiling, heights.Floor, adjacent)
+                doors = doors.appendDoor(sector, door)
+                doors.Sounds = doors.Sounds.add(taggedDoorStartSound(door), sector)
+                started = true
+            }
+        }
+    }
+    return TaggedDoorStart{Doors: doors, Started: started}
+}
+
+func useDoorSwitch(level wad.BspLevel, doors LevelDoors, floors LevelFloors, ceilings LevelCeilings,
+    line int, tag int, action TaggedDoorAction) LevelDoors {
+    started := startTaggedDoors(level, doors, floors, ceilings, tag, action.Mode)
+    if !started.Started { return doors }
+    return changeLineSwitch(level, started.Doors, line, action.Once)
+}
+
+func changeLineSwitch(level wad.BspLevel, doors LevelDoors, line int, once bit) LevelDoors {
+    if once { doors = doors.consumeLine(line) }
+    mounts := wad.OpenArchive(level.File)
+    textures := wad.LoadMountedTextureSet(mounts)
+    if textures.Valid {
+        side := level.LineFrontSide(line)
+        material := level.SideMaterialAt(side)
+        matched := wad.MatchSwitchTexture(material, textures, wad.SwitchEpisode(mounts, level.MapName))
+        changed := doors.Switches.ChangeTexture(line, side, matched, !once)
+        if changed.Revision != doors.Switches.Revision {
+            // P_ChangeSwitchTexture clears one-shot specials before choosing the sound.
+            sound := actorinfo.SoundSwitch
+            trigger := level.LineAt(line)
+            if !once && trigger.Action == 11 { sound = actorinfo.SoundSwitchExit }
+            // The original uses buttonlist[0].soundorg before starting the new button.
+            origin := GlobalMoverSoundSector
+            first := doors.Switches.Buttons[0]
+            if first.Tics > 0 { origin = level.LineAt(first.Line).FrontSector }
+            doors.Sounds = doors.Sounds.add(sound, origin)
+        }
+        doors.Switches = changed
+    }
+    return doors
+}
+
+// P_CrossSpecialLine consumes a one-shot linedef even when there are no
+// available tagged sectors. Use triggers consume only after EV_DoDoor succeeds.
+func CrossLevelDoor(level wad.BspLevel, doors LevelDoors, lineIndex int) LevelDoors {
+    if doors.Switches.ButtonOverflow { return doors }
+    return crossDoorLine(level, doors, LevelFloors{}, LevelCeilings{}, lineIndex, level.LineAt(lineIndex))
+}
+
+func crossDoorLine(level wad.BspLevel, doors LevelDoors, floors LevelFloors, ceilings LevelCeilings,
+    lineIndex int, line wad.CollisionLine) LevelDoors {
+    if !line.Valid { return doors }
+    action := walkDoorAction(line.Action)
+    if !action.Valid { return doors }
+    doors = startTaggedDoors(level, doors, floors, ceilings, line.Tag, action.Mode).Doors
+    if action.Once { doors = doors.consumeLine(lineIndex) }
+    return doors
+}
+
+type DoorFrame struct {
+    Valid bit
+    Changed bit
+    Doors LevelDoors
+    Player MapActor
+}
+
+func clipMoverPlayer(player MapActor, position MapPositionCheck) MapActor {
+    onFloor := player.Z == player.Floor
+    player.Floor, player.Ceiling = position.Floor, position.Ceiling
+    if onFloor {
+        player.Z = player.Floor
+    } else if player.Z + player.Height > player.Ceiling {
+        player.Z = player.Ceiling - player.Height
+    }
+    return player
+}
+
+func TickLevelDoors(base wad.BspLevel, blockMap wad.BlockMapInfo, doors LevelDoors, player MapActor) DoorFrame {
+    frame := TickLevelMovers(base, blockMap, LevelSpecials{Doors: doors}, player)
+    return DoorFrame{Valid: frame.Valid, Changed: frame.Changed, Doors: frame.State.Doors, Player: frame.Player}
+}

@@ -1,0 +1,118 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Mixed line/thing P_PathTraverse intercept collection for hitscan callers.
+
+package play
+
+import "wad"
+
+const attackLineWords = 65536 / 32
+
+type AttackTrace struct {
+    Valid bit
+    Ray wad.DivLine
+    Count int
+    Hits wad.PathHits
+    seenLines [attackLineWords]bits<32>
+}
+
+func addAttackHit(trace AttackTrace, line bit, index int, fraction int) AttackTrace {
+    // Native collection keeps any nonnegative intercept. Consumers stop when
+    // the sorted fraction exceeds FRACUNIT.
+    if index < 0 || fraction < 0 { return trace }
+    trace.Hits = trace.Hits.With(trace.Count, wad.PathIntercept{IsLine: line, Index: index, Fraction: fraction})
+    trace.Count = trace.Count + 1
+    return trace
+}
+
+func attackThingFraction(ray wad.DivLine, actor LevelActor) int {
+    body := actor.Physics.Body
+    positive := (ray.DeltaX ^ ray.DeltaY) > 0
+    x1, y1 := body.X - body.Radius, body.Y - body.Radius
+    x2, y2 := body.X + body.Radius, body.Y + body.Radius
+    if positive { y1, y2 = body.Y + body.Radius, body.Y - body.Radius }
+    if wad.PointOnDivLineSide(ray, x1, y1) == wad.PointOnDivLineSide(ray, x2, y2) { return -1 }
+    fraction := wad.InterceptVector(ray, wad.DivLine{Valid: true, X: x1, Y: y1, DeltaX: x2 - x1, DeltaY: y2 - y1})
+    if fraction < 0 { return -1 }
+    return fraction
+}
+
+func attackBlockLines(level wad.BspLevel, blocks wad.BlockMapInfo, cell wad.BlockCell, ray wad.DivLine, trace AttackTrace) AttackTrace {
+    start := wad.BlockLineListStart(level, blocks, cell)
+    if start < 0 { trace.Valid = false; return trace }
+    for entry := range (level.BlockMap.Count - start) / 2 {
+        index := wad.BlockLineAt(level, blocks, start, entry)
+        if index < 0 { return trace }
+        // P_BlockLinesIterator marks even lines that miss the trace.
+        word := index >> 5
+        mask := bits<32>(1) << (index & 31)
+        if trace.seenLines[word] & mask == 0 {
+            trace.seenLines[word] = trace.seenLines[word] | mask
+            line := level.LineAt(index)
+            if !line.Valid { trace.Valid = false; return trace }
+            trace = addAttackHit(trace, true, index, wad.PathLineFraction(ray, line))
+        }
+    }
+    trace.Valid = false
+    return trace
+}
+
+func attackBlockThings(world CombatWorld, cell wad.BlockCell, ray wad.DivLine, trace AttackTrace) AttackTrace {
+    handle := world.Links.BlockFirst(cell.X, cell.Y)
+    for range world.Actors.Count {
+        if handle == 0 { return trace }
+        actor := world.Actors.ActorAt(handle - 1)
+        if !actor.Valid { trace.Valid = false; return trace }
+        trace = addAttackHit(trace, false, handle, attackThingFraction(ray, actor))
+        handle = world.Links.BlockNext(handle)
+    }
+    trace.Valid = handle == 0
+    return trace
+}
+
+func repeatAttackThings(trace AttackTrace, first int, passes int) AttackTrace {
+    count := trace.Count - first
+    if count == 0 { return trace }
+    for range passes {
+        for index := range count {
+            trace.Hits = trace.Hits.With(trace.Count, trace.Hits.At(first + index))
+            trace.Count = trace.Count + 1
+        }
+    }
+    return trace
+}
+
+func (trace AttackTrace) sorted() AttackTrace {
+    trace.Hits = trace.Hits.Sorted(trace.Count)
+    return trace
+}
+
+// TraceAttackPath collects PIT_AddLineIntercepts then PIT_AddThingIntercepts
+// for every native DDA cell. Lines are validcount-deduped; thing links are not
+// deduped, matching P_BlockThingsIterator visits after a DDA rounding stall.
+func TraceAttackPath(level wad.BspLevel, blocks wad.BlockMapInfo, world CombatWorld, x1 int, y1 int, x2 int, y2 int) AttackTrace {
+    trace := AttackTrace{Valid: true}
+    walk := wad.BeginPathWalk(blocks, x1, y1, x2, y2)
+    if !walk.Valid { trace.Valid = false; return trace }
+    trace.Ray = walk.Ray
+    for range wad.PathBlockLimit {
+        cell := walk.Cell(blocks)
+        firstThing := trace.Count
+        if cell.Valid {
+            trace = attackBlockLines(level, blocks, cell, walk.Ray, trace)
+            if !trace.Valid { return trace }
+            firstThing = trace.Count
+            trace = attackBlockThings(world, cell, walk.Ray, trace)
+            if !trace.Valid { return trace }
+        }
+        nextWalk := walk.Advance()
+        if nextWalk.Done { return trace.sorted() }
+        if nextWalk.MapX == walk.MapX && nextWalk.MapY == walk.MapY &&
+            nextWalk.XIntercept == walk.XIntercept && nextWalk.YIntercept == walk.YIntercept {
+            // A stalled cell yields the same thing callbacks on every pass.
+            return repeatAttackThings(trace, firstThing, wad.PathBlockLimit - nextWalk.Pass).sorted()
+        }
+        walk = nextWalk
+    }
+    return trace.sorted()
+}

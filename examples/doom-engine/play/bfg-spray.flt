@@ -1,0 +1,75 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// A_BFGSpray from linuxdoom-1.10/p_pspr.c.
+
+package play
+
+import "actorinfo"
+import "engine"
+import "wad"
+
+const bfgRayCount = 40
+const bfgRayStep = 0x40000000 / bfgRayCount
+const bfgAimDistance = 16 * 64 * engine.FracUnit
+
+type BfgSprayStep struct {
+    Combat CombatStep
+    Done bit
+    Hit DamageRequest
+    Effect int
+    owner int
+    start bits<32>
+    ray int
+}
+
+func BeginBfgSpray(level wad.BspLevel, blocks wad.BlockMapInfo, world CombatWorld, missile int,
+    rules CombatRules) BfgSprayStep {
+    projectile := world.Actors.ActorAt(missile - 1)
+    if !projectile.Valid || !world.Actors.ActorAt(projectile.Target - 1).Valid {
+        return BfgSprayStep{Combat: CombatStep{World: world, Failed: true}}
+    }
+    return ResumeBfgSpray(level, blocks, BfgSprayStep{Combat: CombatStep{World: world}, owner: projectile.Target,
+        start: projectile.Physics.Angle - 0x20000000}, rules)
+}
+
+func sprayOnTarget(level wad.BspLevel, step BfgSprayStep, target int, rules CombatRules) BfgSprayStep {
+    world := step.Combat.World
+    handle := world.Actors.NextTransientHandle()
+    if handle == 0 { step.Combat.Failed = true; return step }
+    body := world.Actors.ActorAt(target - 1).Physics.Body
+    spawn := SpawnMobj(level, actorinfo.ActorExtraBfg, body.X, body.Y, body.Z + (body.Height >> 2), rules.Skill, world.Random)
+    linked := world.Links.SetActorPosition(level, handle, spawn.Actor)
+    if !linked.Valid { step.Combat.Failed = true; return step }
+    world.Actors = world.Actors.AppendTransient(linked.Actor)
+    world.Links, world.Random = linked.Links, spawn.Random
+    damage := 0
+    for range 15 {
+        roll := PRandom(world.Random)
+        world.Random = roll.State
+        damage = damage + int(roll.Value & 7) + 1
+    }
+    step.Effect = handle
+    step.Hit = DamageRequest{Target: target, Inflictor: step.owner, Source: step.owner, Amount: damage}
+    step.Combat = DamageMobj(level, world, step.Hit, rules)
+    return step
+}
+
+func ResumeBfgSpray(level wad.BspLevel, blocks wad.BlockMapInfo, step BfgSprayStep, rules CombatRules) BfgSprayStep {
+    if step.Done || step.Combat.Failed { return step }
+    step.Hit, step.Effect = DamageRequest{}, 0
+    if step.Combat.State.Action != 0 {
+        step.Combat = ResumeMobjCombat(level, step.Combat, rules)
+        return step
+    }
+    step.Combat.Feedback = CombatFeedback{}
+    for range bfgRayCount - step.ray {
+        angle := step.start + bits<32>(step.ray * bfgRayStep)
+        step.ray = step.ray + 1
+        aim := AimLineAttack(level, blocks, step.Combat.World, step.owner, angle, bfgAimDistance)
+        if !aim.Valid { step.Combat.Failed = true; return step }
+        step.Combat.World.AttackRange = bfgAimDistance
+        if aim.Target > 0 { return sprayOnTarget(level, step, aim.Target, rules) }
+    }
+    step.Done = true
+    return step
+}

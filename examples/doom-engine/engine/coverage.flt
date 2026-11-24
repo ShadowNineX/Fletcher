@@ -1,0 +1,128 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted on 2026-11-21 from column clipping and R_CheckBBox in linuxdoom-1.10/r_bsp.c.
+
+package engine
+
+const CoverageWords = 10
+
+type PlaneColumnBuffer interface {
+    ReadRows() [MaxViewWidth]bits<32>
+}
+
+type PlaneRows struct {
+    Values [MaxViewWidth]bits<32>
+}
+
+func (rows PlaneRows) ReadRows() [MaxViewWidth]bits<32> { return rows.Values }
+
+type ColumnCoverage struct {
+    Words [CoverageWords]bits<32>
+    Rows [MaxViewWidth]bits<32>
+    Planes Visplanes
+    // Only planes touched by a visible wall range allocate column rows.
+    PlaneRows [InlineVisplaneCount]PlaneColumnBuffer
+    HasPlaneRows [InlineVisplaneCount]bit
+    FloorPlane int
+    CeilingPlane int
+    TrackDrawSegments bit
+    // Set when the last wall had a column range left after solid clipping.
+    StoredWallRange bit
+    DrawSegments DrawSegmentStore
+    Failed bit
+}
+
+// The active plane cursors are one-based so zero means no plane. R_Subsector
+// chooses both cursors again even if two adjacent leaves share a plane.
+func BeginSubsectorPlanes(coverage ColumnCoverage, eye int, floor PlaneKey, ceiling PlaneKey) ColumnCoverage {
+    coverage.FloorPlane, coverage.CeilingPlane = 0, 0
+    drawFloor, drawCeiling := floor.Height < eye, ceiling.Height > eye || ceiling.Sky
+    if coverage.Planes.Failed && (drawFloor || drawCeiling) {
+        coverage.Failed = true
+        return coverage
+    }
+    if drawFloor {
+        key := normalizedPlaneKey(floor)
+        bucket := planeKeyBucket(key)
+        index := findPlaneIndex(coverage.Planes, key, bucket)
+        if index < 0 {
+            added := newVisplane(coverage.Planes, key, MaxViewWidth, 0, bucket)
+            coverage.Planes, index = added.State, added.Index
+        }
+        coverage.FloorPlane = index + 1
+    }
+    if drawCeiling {
+        key := normalizedPlaneKey(ceiling)
+        bucket := planeKeyBucket(key)
+        index := findPlaneIndex(coverage.Planes, key, bucket)
+        if index < 0 {
+            added := newVisplane(coverage.Planes, key, MaxViewWidth, 0, bucket)
+            coverage.Planes, index = added.State, added.Index
+        }
+        coverage.CeilingPlane = index + 1
+    }
+    return coverage
+}
+
+func spanMask(span ColumnSpan, word int) bits<32> {
+    first := span.First - word * 32
+    end := span.End - word * 32
+    var mask bits<32> = 0xffffffff
+    if first > 0 { mask = mask << first }
+    if end < 32 { mask = mask & ((bits<32>(1) << end) - 1) }
+    return mask
+}
+
+func validSpan(span ColumnSpan) bit {
+    return span.First >= 0 && span.End <= MaxViewWidth && span.First < span.End
+}
+
+func ColumnOpen(coverage ColumnCoverage, column int) bit {
+    if column < 0 || column >= MaxViewWidth { return false }
+    return !coverage.Words[column / 32][column % 32]
+}
+
+func SpanOpen(coverage ColumnCoverage, span ColumnSpan) bit {
+    if !validSpan(span) { return false }
+    first, last := span.First / 32, (span.End - 1) / 32
+    for i := range last - first + 1 {
+        word := first + i
+        if spanMask(span, word) & ~coverage.Words[word] != 0 { return true }
+    }
+    return false
+}
+
+// Mark an opaque wall after drawing its visible columns. Open portals leave
+// the horizontal coverage alone, allowing farther walls through the gap.
+func CoverSpan(coverage ColumnCoverage, span ColumnSpan) ColumnCoverage {
+    if !validSpan(span) { return coverage }
+    first, last := span.First / 32, (span.End - 1) / 32
+    for i := range last - first + 1 {
+        word := first + i
+        coverage.Words[word] = coverage.Words[word] | spanMask(span, word)
+    }
+    return coverage
+}
+
+// Bounding box deltas are in BOXTOP, BOXBOTTOM, BOXLEFT, BOXRIGHT order.
+const boxCorners = [11][4]int{
+    [4]int{3, 0, 2, 1}, [4]int{3, 0, 2, 0}, [4]int{3, 1, 2, 0}, [4]int{},
+    [4]int{2, 0, 2, 1}, [4]int{}, [4]int{3, 1, 3, 0}, [4]int{},
+    [4]int{2, 0, 3, 1}, [4]int{2, 1, 3, 1}, [4]int{2, 1, 3, 0},
+}
+
+func BoxVisible(view ViewProjection, heading bits<32>, x int, y int, bounds Box, coverage ColumnCoverage) bit {
+    boxX, boxY := 1, 1
+    if x <= bounds.Left { boxX = 0 } else if x >= bounds.Right { boxX = 2 }
+    if y >= bounds.Top { boxY = 0 } else if y <= bounds.Bottom { boxY = 2 }
+    position := boxY * 4 + boxX
+    if position == 5 { return true }
+
+    coordinates := [4]int{bounds.Top, bounds.Bottom, bounds.Left, bounds.Right}
+    corners := boxCorners[position]
+    left := PointToAngle(x, y, coordinates[corners[0]], coordinates[corners[1]]) - heading
+    right := PointToAngle(x, y, coordinates[corners[2]], coordinates[corners[3]]) - heading
+    span := left - right
+    if span >= angle180 { return true }
+    return SpanOpen(coverage, clipAngularSpan(view, left, right, span))
+}

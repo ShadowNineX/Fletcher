@@ -1,0 +1,76 @@
+package view
+
+const Width = 192
+const Height = 108
+const ScreenHeight = Height + 10
+const horizon = Height / 2
+const plane = 704
+
+type surface struct {
+    body color
+    seam color
+    trim color
+}
+
+func wallSurface(hit rayHit) surface {
+    bright, shade, trim := color.Orange, color.Red, color.Yellow
+    if hit.material == 2 { bright, shade, trim = color.Blue, color.Purple, color.White }
+    if hit.material == 3 { bright, shade, trim = color.Green, color.Blue, color.Yellow }
+    if hit.side == 1 || hit.depth > 5 * scale {
+        return surface{body: shade, seam: bright, trim: trim}
+    }
+    return surface{body: bright, seam: shade, trim: trim}
+}
+
+func Render(x int, y int, heading Vector) {
+    // The camera plane is perpendicular to the viewing direction. A ray's
+    // DDA distance along this basis is the perpendicular projection depth.
+    planeX := -heading.Y * plane / scale
+    planeY := heading.X * plane / scale
+    for column := range Width {
+        offset := (2 * column + 1 - Width) * scale / Width
+        rayX := heading.X + planeX * offset / scale
+        rayY := heading.Y + planeY * offset / scale
+        hit := cast(x, y, rayX, rayY)
+        depth := hit.depth
+        if depth < scale / 8 { depth = scale / 8 }
+        height := Height * scale / depth
+        if height == 0 { height = 1 }
+        top := horizon - height / 2
+        bottom := top + height
+        material := wallSurface(hit)
+
+        first, last := top, bottom
+        if first < 0 { first = 0 }
+        if last > Height { last = Height }
+        for i := range last - first {
+            row := first + i
+            band := (row - top) * 8 / height
+            ink := material.body
+            if hit.strip == 0 || band == 0 || band == 7 {
+                ink = material.seam
+            } else if band == 1 && hit.depth < 4 * scale {
+                ink = material.trim
+            }
+            pixel(column, row, true, ink)
+        }
+
+        // Only project floor rows that are visible beneath the wall and
+        // close enough to show the checkerboard.
+        floorStart := horizon + horizon / 6 + 1
+        if bottom > floorStart { floorStart = bottom }
+        for i := range Height - floorStart {
+            row := floorStart + i
+            distance := horizon * scale / (row - horizon)
+            floorX := (x + distance * rayX / scale) / scale
+            floorY := (y + distance * rayY / scale) / scale
+            if (floorX + floorY) & 1 == 0 { pixel(column, row, true, color.Purple) }
+        }
+    }
+    pixel(Width / 2, horizon, true, color.White)
+    pixel(Width / 2 - 1, horizon, true, color.White)
+    pixel(Width / 2 + 1, horizon, true, color.White)
+    pixel(Width / 2, horizon - 1, true, color.White)
+    pixel(Width / 2, horizon + 1, true, color.White)
+    drawControls()
+}

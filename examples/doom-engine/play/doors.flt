@@ -1,0 +1,151 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted on 2026-11-21 from T_VerticalDoor, EV_DoDoor, and EV_VerticalDoor
+// in linuxdoom-1.10/p_doors.c.
+
+package play
+
+import "engine"
+
+const DoorNormal = 0
+const DoorClose30ThenOpen = 1
+const DoorClose = 2
+const DoorOpen = 3
+const DoorRaiseIn5Mins = 4
+const DoorBlazeRaise = 5
+const DoorBlazeOpen = 6
+const DoorBlazeClose = 7
+
+const DoorWait = 150
+const DoorSpeed = 2 * engine.FracUnit
+
+// DoorState is a pure vertical-door thinker. Direction is -1 down, 0 waiting,
+// 1 up, or 2 for the original initial timed wait.
+type DoorState struct {
+    Active bit
+    Ceiling int
+    Floor int
+    Top int
+    Speed int
+    Direction int
+    Countdown int
+    Mode int
+    TopWait int
+}
+
+func doorTop(lowestAdjacentCeiling int) int { return lowestAdjacentCeiling - 4 * engine.FracUnit }
+
+// OpenManualDoor constructs the motion after the use-line key check.
+func OpenManualDoor(special int, ceiling int, floor int, lowestAdjacentCeiling int) DoorState {
+    door := DoorState{Ceiling: ceiling, Floor: floor, Top: doorTop(lowestAdjacentCeiling),
+        Speed: DoorSpeed, Direction: 1, TopWait: DoorWait}
+    switch special {
+    case 1, 26, 27, 28:
+        door.Mode = DoorNormal
+    case 31, 32, 33, 34:
+        door.Mode = DoorOpen
+    case 117:
+        door.Mode, door.Speed = DoorBlazeRaise, DoorSpeed * 4
+    case 118:
+        door.Mode, door.Speed = DoorBlazeOpen, DoorSpeed * 4
+    default:
+        return DoorState{Ceiling: ceiling, Floor: floor}
+    }
+    door.Active = true
+    return door
+}
+
+// OpenTaggedDoor is EV_DoDoor's constructor for a sector selected by a line
+// tag. Callers select Mode from the Door* constants after resolving targets.
+func OpenTaggedDoor(mode int, ceiling int, floor int, lowestAdjacentCeiling int) DoorState {
+    door := DoorState{Active: true, Ceiling: ceiling, Floor: floor, Top: doorTop(lowestAdjacentCeiling),
+        Speed: DoorSpeed, TopWait: DoorWait, Mode: mode}
+    switch mode {
+    case DoorNormal, DoorOpen:
+        door.Direction = 1
+    case DoorBlazeRaise, DoorBlazeOpen:
+        door.Direction, door.Speed = 1, DoorSpeed * 4
+    case DoorClose, DoorBlazeClose:
+        door.Direction = -1
+        if mode == DoorBlazeClose { door.Speed = DoorSpeed * 4 }
+    case DoorClose30ThenOpen:
+        // EV_DoDoor closes from the sector's present ceiling, then waits and
+        // reopens to that captured height rather than the neighboring ceiling.
+        door.Direction, door.Top = -1, ceiling
+    default:
+        return DoorState{Ceiling: ceiling, Floor: floor}
+    }
+    return door
+}
+
+// SpawnTimedDoor covers P_SpawnDoorCloseIn30 (special 10) and
+// P_SpawnDoorRaiseIn5Mins (special 14). They are initially waiting thinkers,
+// not ordinary manual doors.
+func SpawnTimedDoor(special int, ceiling int, floor int, lowestAdjacentCeiling int) DoorState {
+    switch special {
+    case 10:
+        // The C spawner leaves these two fields unset. Supply a repeatable
+        // opening height and wait if the closing door encounters an actor.
+        return DoorState{Active: true, Ceiling: ceiling, Floor: floor, Top: ceiling, Speed: DoorSpeed,
+            Direction: 0, Countdown: 30 * 35, Mode: DoorNormal, TopWait: DoorWait}
+    case 14:
+        return DoorState{Active: true, Ceiling: ceiling, Floor: floor, Top: doorTop(lowestAdjacentCeiling),
+            Speed: DoorSpeed, Direction: 2, Countdown: 5 * 60 * 35, Mode: DoorRaiseIn5Mins, TopWait: DoorWait}
+    }
+    return DoorState{Ceiling: ceiling, Floor: floor}
+}
+
+// blocked is P_ChangeSector's result for the attempted ceiling height.
+// T_MovePlane reports a terminal move as pastdest even after rollback.
+func TickDoor(door DoorState, blocked bit) DoorState {
+    if !door.Active { return door }
+    switch door.Direction {
+    case 0:
+        door.Countdown = door.Countdown - 1
+        if door.Countdown == 0 {
+            if door.Mode == DoorNormal || door.Mode == DoorBlazeRaise { door.Direction = -1 }
+            if door.Mode == DoorClose30ThenOpen { door.Direction = 1 }
+        }
+    case 2:
+        door.Countdown = door.Countdown - 1
+        if door.Countdown == 0 && door.Mode == DoorRaiseIn5Mins {
+            door.Direction, door.Mode = 1, DoorNormal
+        }
+    case -1:
+        door = moveDoorDown(door, blocked)
+    case 1:
+        door = moveDoorUp(door, blocked)
+    }
+    return door
+}
+
+func moveDoorDown(door DoorState, blocked bit) DoorState {
+    step := MoveSectorPlane(door.Ceiling, door.Speed, door.Floor, -1, true, false, blocked)
+    door.Ceiling = step.Height
+    if step.Result == PlanePastDestination { return finishDoorDown(door) }
+    if step.Result == PlaneCrushed {
+        if door.Mode != DoorClose && door.Mode != DoorBlazeClose { door.Direction = 1 }
+    }
+    return door
+}
+
+func finishDoorDown(door DoorState) DoorState {
+    if door.Mode == DoorClose30ThenOpen {
+        door.Direction, door.Countdown = 0, 35 * 30
+    } else if door.Mode == DoorNormal || door.Mode == DoorClose || door.Mode == DoorBlazeRaise || door.Mode == DoorBlazeClose {
+        door.Active = false
+    }
+    return door
+}
+
+func moveDoorUp(door DoorState, blocked bit) DoorState {
+    step := MoveSectorPlane(door.Ceiling, door.Speed, door.Top, 1, true, false, blocked)
+    door.Ceiling = step.Height
+    if step.Result != PlanePastDestination { return door }
+    if door.Mode == DoorNormal || door.Mode == DoorBlazeRaise {
+        door.Direction, door.Countdown = 0, door.TopWait
+    } else if door.Mode == DoorClose30ThenOpen || door.Mode == DoorOpen || door.Mode == DoorBlazeOpen {
+        door.Active = false
+    }
+    return door
+}

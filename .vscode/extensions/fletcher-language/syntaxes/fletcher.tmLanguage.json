@@ -1,0 +1,113 @@
+{
+  "name": "Fletcher",
+  "scopeName": "source.fletcher",
+  "patterns": [
+    {
+      "include": "#comments"
+    },
+    {
+      "include": "#strings"
+    },
+    {
+      "include": "#keywords"
+    },
+    {
+      "include": "#types-and-literals"
+    },
+    {
+      "include": "#numbers"
+    },
+    {
+      "include": "#operators"
+    },
+    {
+      "include": "#punctuation"
+    }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.double-slash.fletcher",
+          "match": "//.*$"
+        },
+        {
+          "name": "comment.block.fletcher",
+          "begin": "/\\*",
+          "end": "\\*/"
+        }
+      ]
+    },
+    "strings": {
+      "name": "string.quoted.double.fletcher",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        {
+          "name": "constant.character.escape.fletcher",
+          "match": "\\\\(?:[\"\\\\/bfnrt]|u[0-9a-fA-F]{4})"
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.fletcher",
+          "match": "\\b(?:if|else|switch|case|default|for|range|return|next)\\b"
+        },
+        {
+          "name": "keyword.declaration.fletcher",
+          "match": "\\b(?:package|import|const|var|type|struct|interface|func|test|extends)\\b|\\bbackend\\b(?=\\s+(?:circuit|script)\\b)|\\bmacro\\b(?=\\s+[A-Za-z_]\\w*\\s*\\()"
+        },
+        {
+          "name": "keyword.map.fletcher",
+          "match": "\\b(?:map|input|output|wire|publish|register|host|tick|circuit|script|place|screen|size|at|facing|flipped|with)\\b|\\bexpand\\b(?=\\s+[A-Za-z_]\\w*(?:\\.[A-Za-z_]\\w*)?\\s*\\()"
+        },
+        {
+          "name": "storage.type.fletcher",
+          "match": "\\b(?:bit|bits|int|string|bytes|color)\\b"
+        },
+        {
+          "name": "support.function.builtin.fletcher",
+          "match": "\\b(?:currentTick|hostTimeMillis|len|log|mouseX|mouseY|pixel|readFile|readFileIfPresent)\\b(?=\\s*\\()"
+        }
+      ]
+    },
+    "types-and-literals": {
+      "patterns": [
+        {
+          "name": "constant.language.fletcher",
+          "match": "\\b(?:true|false)\\b"
+        },
+        {
+          "name": "entity.name.type.fletcher",
+          "match": "\\b[A-Z][A-Za-z0-9_]*\\b"
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.integer.fletcher",
+          "match": "\\b(?:0[xX][0-9a-fA-F](?:_?[0-9a-fA-F])*|0[bB][01](?:_?[01])*|[0-9](?:_?[0-9])*)\\b"
+        }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        {
+          "name": "keyword.operator.fletcher",
+          "match": ":=|==|!=|<=|>=|<<|>>|&&|\\|\\||[+*/%!=~&|^<>-]"
+        }
+      ]
+    },
+    "punctuation": {
+      "patterns": [
+        {
+          "name": "punctuation.definition.fletcher",
+          "match": "[{}\\[\\](),:;.]"
+        }
+      ]
+    }
+  }
+}

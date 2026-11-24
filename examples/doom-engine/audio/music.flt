@@ -1,0 +1,59 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Music identifiers and routing from linuxdoom-1.10/sounds.c and s_sound.c.
+
+package audio
+
+import "wad"
+
+const MusicCount = 68
+const MusicEpisodeStart = 1
+const MusicCommercialStart = 33
+const MusicEpisodeIntermission = 28
+const MusicCommercialIntermission = 67
+const episodeFourMusic = [9]int{22, 20, 21, 5, 16, 13, 15, 14, 9}
+
+const musicLow = [MusicCount]int{
+    0x00000000, 0x31455f44, 0x31455f44, 0x31455f44, 0x31455f44, 0x31455f44, 0x31455f44, 0x31455f44,
+    0x31455f44, 0x31455f44, 0x32455f44, 0x32455f44, 0x32455f44, 0x32455f44, 0x32455f44, 0x32455f44,
+    0x32455f44, 0x32455f44, 0x32455f44, 0x33455f44, 0x33455f44, 0x33455f44, 0x33455f44, 0x33455f44,
+    0x33455f44, 0x33455f44, 0x33455f44, 0x33455f44, 0x4e495f44, 0x4e495f44, 0x55425f44, 0x49565f44,
+    0x4e495f44, 0x55525f44, 0x54535f44, 0x4f435f44, 0x45425f44, 0x4f445f44, 0x48545f44, 0x48535f44,
+    0x44445f44, 0x4e495f44, 0x45445f44, 0x54535f44, 0x48545f44, 0x4f445f44, 0x44445f44, 0x55525f44,
+    0x45445f44, 0x54535f44, 0x4f525f44, 0x48535f44, 0x454d5f44, 0x4f435f44, 0x44445f44, 0x4d415f44,
+    0x48545f44, 0x44415f44, 0x454d5f44, 0x4f525f44, 0x45545f44, 0x48535f44, 0x504f5f44, 0x56455f44,
+    0x4c555f44, 0x45525f44, 0x4d445f44, 0x4d445f44,
+}
+
+const musicHigh = [MusicCount]int{
+    0x00000000, 0x0000314d, 0x0000324d, 0x0000334d, 0x0000344d, 0x0000354d, 0x0000364d, 0x0000374d,
+    0x0000384d, 0x0000394d, 0x0000314d, 0x0000324d, 0x0000334d, 0x0000344d, 0x0000354d, 0x0000364d,
+    0x0000374d, 0x0000384d, 0x0000394d, 0x0000314d, 0x0000324d, 0x0000334d, 0x0000344d, 0x0000354d,
+    0x0000364d, 0x0000374d, 0x0000384d, 0x0000394d, 0x00524554, 0x004f5254, 0x00594e4e, 0x524f5443,
+    0x414f5254, 0x4e494e4e, 0x534b4c41, 0x44544e55, 0x45455754, 0x00004d4f, 0x41445f45, 0x004e5741,
+    0x554c4254, 0x5449435f, 0x00004441, 0x32534b4c, 0x32414445, 0x00324d4f, 0x324c4254, 0x32494e4e,
+    0x00324441, 0x33534b4c, 0x4f52454d, 0x324e5741, 0x47415353, 0x32544e55, 0x334c4254, 0x00454950,
+    0x33414445, 0x4e414952, 0x32475353, 0x3252454d, 0x0045534e, 0x334e5741, 0x4e494e45, 0x00004c49,
+    0x414d4954, 0x4d5f4441, 0x4c545432, 0x544e4932,
+}
+
+func MusicLumpName(id int) wad.LumpName {
+    if id <= 0 || id >= MusicCount { return wad.LumpName{} }
+    return wad.LumpName{Low: musicLow[id], High: musicHigh[id]}
+}
+
+func LevelMusic(commercial bit, episode int, mapNumber int) int {
+    if mapNumber < 1 { return 0 }
+    if commercial {
+        if mapNumber > 32 { return 0 }
+        return MusicCommercialStart + mapNumber - 1
+    }
+    if episode < 1 || episode > 4 || mapNumber > 9 { return 0 }
+    if episode == 4 { return episodeFourMusic[mapNumber - 1] }
+    return MusicEpisodeStart + (episode - 1) * 9 + mapNumber - 1
+}
+
+func IntermissionMusic(commercial bit) int {
+    if commercial { return MusicCommercialIntermission }
+    return MusicEpisodeIntermission
+}

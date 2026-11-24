@@ -1,0 +1,103 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// F_StartCast/F_CastTicker/F_CastResponder from linuxdoom-1.10/f_finale.c.
+
+package play
+
+import "actorinfo"
+
+const finaleCastCount = 17
+const finaleCastKinds = [finaleCastCount]int{actorinfo.ActorPossessed, actorinfo.ActorShotGuy, actorinfo.ActorChainGuy,
+    actorinfo.ActorImp, actorinfo.ActorDemon, actorinfo.ActorSkull, actorinfo.ActorCacodemon, actorinfo.ActorKnight,
+    actorinfo.ActorBruiser, actorinfo.ActorArachnotron, actorinfo.ActorPainElemental, actorinfo.ActorRevenant,
+    actorinfo.ActorMancubus, actorinfo.ActorVile, actorinfo.ActorSpider, actorinfo.ActorCyborg, actorinfo.ActorPlayer}
+
+type FinaleCast struct {
+    Index int
+    Kind int
+    State int
+    Tics int
+    Frames int
+    Dying bit
+    Attacking bit
+    OnMelee bit
+    Sound int
+    Changed bit
+}
+
+// f_finale.c's attack-state switches use the state and sound ordinals in info.h and sounds.h.
+func finaleCastAttackSound(state int) int {
+    switch state {
+    case actorinfo.StatePlayerAttack1: return actorinfo.SoundSuperShotgun
+    case 185: return actorinfo.SoundPistol // S_POSS_ATK2
+    case 218, 417, 418, 419, 616, 617: return actorinfo.SoundShotgun // S_SPOS, S_CPOS, S_SPID attacks
+    case 256: return actorinfo.SoundVileAttack // S_VILE_ATK2
+    case 336: return actorinfo.SoundSkeletonSwing // S_SKEL_FIST2
+    case 338: return actorinfo.SoundSkeletonPunch // S_SKEL_FIST4
+    case 340: return 107 // S_SKEL_MISS2
+    case 377, 380, 383, 505, 538, 567: return 16 // S_FATT, S_HEAD, S_BOSS, S_BOS2 fire shots
+    case 454: return actorinfo.SoundClaw // S_TROO_ATK3
+    case 486: return 52 // S_SARG_ATK2
+    case 590, 710: return 51 // S_SKULL_ATK2, S_PAIN_ATK3
+    case 648: return 8 // S_BSPI_ATK2
+    case 685, 687, 689: return 14 // S_CYBER rockets
+    }
+    return 0
+}
+
+func finaleCastEnter(cast FinaleCast, index int, sound bit) FinaleCast {
+    cast.Index, cast.Kind = index, finaleCastKinds[index]
+    info := actorinfo.KindAt(cast.Kind)
+    cast.State, cast.Tics, cast.Frames, cast.Dying, cast.Attacking = info.SeeState, actorinfo.StateAt(info.SeeState).Tics, 0, false, false
+    if sound { cast.Sound = info.SeeSound }
+    return cast
+}
+
+func StartFinaleCast() FinaleCast { return finaleCastEnter(FinaleCast{}, 0, false) }
+
+func TickFinaleCast(cast FinaleCast) FinaleCast {
+    cast.Changed, cast.Sound = false, 0
+    cast.Tics = cast.Tics - 1
+    if cast.Tics > 0 { return cast }
+    state := actorinfo.StateAt(cast.State)
+    if state.Tics == -1 || state.Next == ActorNullState {
+        index := cast.Index + 1
+        if index == finaleCastCount { index = 0 }
+        cast = finaleCastEnter(cast, index, true)
+        cast.Changed = true
+        return cast
+    }
+    if cast.State == actorinfo.StatePlayerAttack1 {
+        info := actorinfo.KindAt(cast.Kind)
+        cast.State, cast.Tics, cast.Frames, cast.Attacking = info.SeeState, actorinfo.StateAt(info.SeeState).Tics, 0, false
+        cast.Changed = true
+        return cast
+    }
+    cast.State, cast.Frames = state.Next, cast.Frames + 1
+    cast.Sound = finaleCastAttackSound(cast.State)
+    info := actorinfo.KindAt(cast.Kind)
+    if cast.Frames == 12 {
+        cast.Attacking = true
+        if cast.OnMelee { cast.State = info.MeleeState } else { cast.State = info.MissileState }
+        cast.OnMelee = !cast.OnMelee
+        if cast.State == ActorNullState {
+            if cast.OnMelee { cast.State = info.MeleeState } else { cast.State = info.MissileState }
+        }
+    }
+    if cast.Attacking && (cast.Frames == 24 || cast.State == info.SeeState) {
+        cast.State, cast.Frames, cast.Attacking = info.SeeState, 0, false
+    }
+    cast.Tics = actorinfo.StateAt(cast.State).Tics
+    if cast.Tics == -1 { cast.Tics = 15 }
+    cast.Changed = true
+    return cast
+}
+
+// The caller has already filtered for a key-down event.
+func RespondFinaleCast(cast FinaleCast) FinaleCast {
+    cast.Changed, cast.Sound = false, 0
+    if cast.Dying { return cast }
+    info := actorinfo.KindAt(cast.Kind)
+    cast.Dying, cast.State, cast.Tics, cast.Frames, cast.Attacking, cast.Sound = true, info.DeathState, actorinfo.StateAt(info.DeathState).Tics, 0, false, info.DeathSound
+    cast.Changed = true
+    return cast
+}

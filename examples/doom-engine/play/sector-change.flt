@@ -1,0 +1,202 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// P_ThingHeightClip, PIT_ChangeSector and P_ChangeSector from linuxdoom-1.10/p_map.c.
+
+package play
+
+import "actorinfo"
+import "wad"
+
+type SectorChange struct {
+    State WalkoverState
+    Blocked bit
+    Changed bit
+    DamageSound int
+    PickupSound int
+    PickupMessage int
+}
+
+func sectorCombat(result SectorChange, event CombatStep, rules CombatRules, actions WalkoverTelefrag) SectorChange {
+    result.Changed = true
+    for range actorinfo.ActorStateCount + 1 {
+        result.State.World = event.World
+        if event.Failed { result.State.Failed = true; return result }
+        if event.Feedback.Sound != 0 { result.DamageSound = event.Feedback.Sound }
+        if event.State.Action == 0 && event.Feedback.LowerWeapon == 0 && event.Feedback.Sound == 0 { return result }
+        result.State.DamageSound = 0
+        result.State.Specials.Lighting.Random = result.State.World.Random
+        result.State = result.State.syncThinkerOrder()
+        result.State = actions.OnTelefrag(result.State, event, rules)
+        if result.State.Failed { return result }
+        if result.State.DamageSound != 0 { result.DamageSound = result.State.DamageSound }
+        result.State = result.State.syncThinkerOrder()
+        if event.State.Action == 0 { return result }
+        event.World = result.State.World
+        event = ResumeMobjCombat(result.State.Level, event, rules)
+    }
+    result.State.Failed = true
+    return result
+}
+
+func removeSectorThing(world CombatWorld, handle int, thing LevelActor) CombatWorld {
+    thing.Valid = false
+    world.Actors = world.Actors.WithActor(handle, thing)
+    world.Links = world.Links.UnlinkActor(handle)
+    return world
+}
+
+func sectorPickup(result SectorChange, mover int, special int, rules CombatRules) SectorChange {
+    world := result.State.World
+    player := world.Actors.ActorAt(mover - 1)
+    slot := combatPlayer(player)
+    if slot < 0 { return result }
+    item := world.Actors.ActorAt(special - 1)
+    pickup := TouchPickup(world.Players[slot], item, player,
+        PickupRules{Skill: rules.Skill, Commercial: result.State.Level.MapName.Low & 0xffffff == 0x50414d})
+    world.Players[slot] = pickup.Inventory
+    world.Actors = world.Actors.WithActor(mover, pickup.Actor)
+    if pickup.Removed { world = removeSectorThing(world, special, item) }
+    if pickup.Sound != 0 { result.PickupSound = pickup.Sound }
+    if pickup.Message != 0 { result.PickupMessage = pickup.Message }
+    result.Changed = result.Changed || pickup.Removed || pickup.Message != 0 || pickup.Sound != 0
+    result.State.World = world
+    return result
+}
+
+func crushBlood(level wad.BspLevel, world CombatWorld, body MapActor, rules CombatRules) ShotEffectSpawn {
+    handle := world.Actors.NextTransientHandle()
+    if handle == 0 { return ShotEffectSpawn{World: world} }
+    spawn := SpawnMobjWithFast(level, actorinfo.ActorBlood, body.X, body.Y, body.Z + body.Height / 2,
+        rules.Skill, rules.Fast, world.Random)
+    if !spawn.Actor.Valid { return ShotEffectSpawn{World: world} }
+    x1 := PRandom(spawn.Random)
+    x2 := PRandom(x1.State)
+    y1 := PRandom(x2.State)
+    y2 := PRandom(y1.State)
+    spawn.Actor.Physics.MomentumX = (int(x1.Value) - int(x2.Value)) << 12
+    spawn.Actor.Physics.MomentumY = (int(y1.Value) - int(y2.Value)) << 12
+    linked := world.Links.SetActorPosition(level, handle, spawn.Actor)
+    if !linked.Valid { return ShotEffectSpawn{World: world} }
+    world.Actors = world.Actors.AppendTransient(linked.Actor)
+    world.Links, world.Random = linked.Links, y2.State
+    return ShotEffectSpawn{World: world, Handle: handle, Valid: true}
+}
+
+type sectorContactResult struct {
+    Change SectorChange
+    Blocked bit
+}
+
+func sectorThingContacts(result SectorChange, blocks wad.BlockMapInfo, handle int, actor LevelActor,
+    rules CombatRules, actions WalkoverTelefrag) sectorContactResult {
+    body := actor.Physics.Body
+    scan := BeginThingScan(blocks, body, body.X, body.Y)
+    for range ThinkerIterationLimit {
+        if scan.Done { return sectorContactResult{Change: result, Blocked: scan.Blocked} }
+        step := ScanThingContacts(scan, result.State.World.Actors, result.State.World.Links, actor, handle, result.State.World.Random)
+        scan = step.Scan
+        if step.Contact.Action == ContactTouch {
+            result = sectorPickup(result, handle, step.Contact.Target, rules)
+        } else if step.Contact.Action == ContactDamage || step.Contact.Action == ContactSkull {
+            result.State.World.Random = step.Random
+            result = sectorCombat(result, ApplyThingImpact(result.State.Level, result.State.World, handle, step.Contact, rules), rules, actions)
+            if result.State.Failed { return sectorContactResult{Change: result} }
+        }
+    }
+    result.State.Failed = !scan.Done
+    return sectorContactResult{Change: result, Blocked: scan.Blocked}
+}
+
+func changeSectorThing(result SectorChange, blocks wad.BlockMapInfo, handle int, damage bit,
+    rules CombatRules, actions WalkoverTelefrag) SectorChange {
+    actor := result.State.World.Actors.ActorAt(handle - 1)
+    body := actor.Physics.Body
+    onFloor := body.Z == body.Floor
+    position := BeginMapPositionCheck(result.State.Level, blocks, body, body.X, body.Y)
+    if !position.Valid { result.State.Failed = true; return result }
+    result.State.World = result.State.World.WithPositionCheck(handle, body.X, body.Y, position)
+    contacts := sectorThingContacts(result, blocks, handle, actor, rules, actions)
+    result = contacts.Change
+    if result.State.Failed { return result }
+    // P_ThingHeightClip uses tmfloorz/tmceilingz even when P_CheckPosition
+    // stops at a solid thing or line. Only lines visited before that stop count.
+    if !contacts.Blocked {
+        position = FinishMapPositionCheck(result.State.Level, blocks, body, body.X, body.Y, position)
+        if !position.Valid { result.State.Failed = true; return result }
+        result.State.World = result.State.World.WithPositionCheck(handle, body.X, body.Y, position)
+    }
+    floor, ceiling := result.State.World.Position.Floor, result.State.World.Position.Ceiling
+    actor = result.State.World.Actors.ActorAt(handle - 1)
+    if !actor.Valid { return result }
+    body = actor.Physics.Body
+    z := body.Z
+    if onFloor { z = floor } else if z + body.Height > ceiling { z = ceiling - body.Height }
+    if body.Floor != floor || body.Ceiling != ceiling || body.Z != z {
+        actor.Physics.Body.Z, actor.Physics.Body.Floor, actor.Physics.Body.Ceiling = z, floor, ceiling
+        result.State.World.Actors = result.State.World.Actors.WithActor(handle, actor)
+        result.Changed = true
+    }
+    if ceiling - floor >= body.Height { return result }
+    if actor.Health <= 0 {
+        gibs := SetMobjStateWithFast(actor, actorinfo.StateGibs, rules.Fast)
+        if gibs.Failed { result.State.Failed = true; return result }
+        actor = gibs.Actor
+        actor.Physics.Body.Flags = actor.Physics.Body.Flags & ~bits<32>(ActorSolid)
+        actor.Physics.Body.Height, actor.Physics.Body.Radius = 0, 0
+        result.State.World.Actors = result.State.World.Actors.WithActor(handle, actor)
+        result.Changed = true
+    } else if body.Flags & PickupDropped != 0 {
+        result.State.World = removeSectorThing(result.State.World, handle, actor)
+        result.Changed = true
+    } else if body.Flags & ActorShootable != 0 {
+        result.Blocked = true
+        if damage {
+            result = sectorCombat(result, DamageMobj(result.State.Level, result.State.World,
+                DamageRequest{Target: handle, Amount: 10}, rules), rules, actions)
+            if result.State.Failed { return result }
+            body = result.State.World.Actors.ActorAt(handle - 1).Physics.Body
+            blood := crushBlood(result.State.Level, result.State.World, body, rules)
+            result.State.World, result.State.Failed = blood.World, !blood.Valid
+        }
+    }
+    return result
+}
+
+func changeSectorBlock(result SectorChange, blocks wad.BlockMapInfo, handle int, damage bit,
+    rules CombatRules, actions WalkoverTelefrag) SectorChange {
+    for range ThinkerIterationLimit {
+        if handle == 0 { return result }
+        successor := result.State.World.Links.BlockNext(handle)
+        result = changeSectorThing(result, blocks, handle, damage, rules, actions)
+        if result.State.Failed { return result }
+        // A pickup can unlink the next thing while this actor stays linked.
+        // A removed current thing keeps its old successor in Doom.
+        if result.State.World.Actors.ActorAt(handle - 1).Valid {
+            successor = result.State.World.Links.BlockNext(handle)
+        }
+        handle = successor
+    }
+    result.State.Failed = handle != 0
+    return result
+}
+
+func ChangeSector(state WalkoverState, blocks wad.BlockMapInfo, sector int, levelTime int, crush bit,
+    rules CombatRules, actions WalkoverTelefrag) SectorChange {
+    result := SectorChange{State: state}
+    if state.Failed { return result }
+    info := state.Level.SectorLineInfo(sector)
+    if info.Count < 0 { result.State.Failed = true; return result }
+    box := info.Block
+    if !blocks.Valid || !box.Valid || box.Right < box.Left || box.Top < box.Bottom { return result }
+    damage := crush && (levelTime & 3) == 0
+    for dx := range box.Right - box.Left + 1 {
+        for dy := range box.Top - box.Bottom + 1 {
+            first := result.State.World.Links.BlockFirst(box.Left + dx, box.Bottom + dy)
+            if first != 0 {
+                result = changeSectorBlock(result, blocks, first, damage, rules, actions)
+                if result.State.Failed { return result }
+            }
+        }
+    }
+    return result
+}

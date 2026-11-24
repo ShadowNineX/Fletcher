@@ -1,0 +1,127 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted from P_RadiusAttack in p_map.c and A_Explode in p_enemy.c.
+
+package play
+
+import "actorinfo"
+import "wad"
+
+const radiusWorkBatch = 16
+
+type RadiusAttackStep struct {
+    Combat CombatStep
+    Done bit
+    Hit DamageRequest
+    spot int
+    source int
+    damage int
+    left int
+    right int
+    top int
+    column int
+    row int
+    candidate int
+    nextCandidate int
+    activeTarget int
+    enteredCell bit
+}
+
+func sightEndpoint(actor LevelActor) wad.SightEndpoint {
+    body := actor.Physics.Body
+    return wad.SightEndpoint{X: body.X, Y: body.Y, Z: body.Z, Height: body.Height, Sector: actor.Sector}
+}
+
+func radiusDistance(target MapActor, origin MapActor) int {
+    dx, dy := target.X - origin.X, target.Y - origin.Y
+    if dx < 0 { dx = -dx }
+    if dy < 0 { dy = -dy }
+    if dy > dx { dx = dy }
+    distance := (dx - target.Radius) >> 16
+    if distance < 0 { return 0 }
+    return distance
+}
+
+func BeginRadiusAttack(level wad.BspLevel, blocks wad.BlockMapInfo, world CombatWorld, spot int,
+    source int, damage int, rules CombatRules) RadiusAttackStep {
+    result := RadiusAttackStep{Combat: CombatStep{World: world}, spot: spot, source: source, damage: damage}
+    origin := world.Actors.ActorAt(spot - 1)
+    if !origin.Valid || damage <= 0 || !blocks.Valid { result.Done = true; return result }
+    body := origin.Physics.Body
+    // Vanilla shifts MAXRADIUS a second time here, dropping that term from
+    // the 32-bit block extent. The per-actor radius still affects falloff.
+    reach := (damage + thingSearchRadius) << 16
+    left, right := (body.X - reach - blocks.OriginX) >> wad.MapBlockShift, (body.X + reach - blocks.OriginX) >> wad.MapBlockShift
+    bottom, top := (body.Y - reach - blocks.OriginY) >> wad.MapBlockShift, (body.Y + reach - blocks.OriginY) >> wad.MapBlockShift
+    if left < 0 { left = 0 }
+    if bottom < 0 { bottom = 0 }
+    if right >= blocks.Width { right = blocks.Width - 1 }
+    if top >= blocks.Height { top = blocks.Height - 1 }
+    result.left, result.right, result.top, result.column, result.row = left, right, top, left, bottom
+    result.Done = left > right || bottom > top
+    return ResumeRadiusAttack(level, result, rules)
+}
+
+func BeginExplodeAction(level wad.BspLevel, blocks wad.BlockMapInfo, world CombatWorld, spot int,
+    rules CombatRules) RadiusAttackStep {
+    actor := world.Actors.ActorAt(spot - 1)
+    return BeginRadiusAttack(level, blocks, world, spot, actor.Target, 128, rules)
+}
+
+// A damage response can yield before the next BLOCKMAP member. After running
+// its action, pass the updated Combat.World back before resuming this sweep.
+func ResumeRadiusAttack(level wad.BspLevel, result RadiusAttackStep, rules CombatRules) RadiusAttackStep {
+    if result.Done || result.Combat.Failed { return result }
+    result.Hit = DamageRequest{}
+    if result.Combat.State.Action != 0 {
+        result.Combat = ResumeMobjCombat(level, result.Combat, rules)
+        return result
+    }
+    result.Combat.Feedback = CombatFeedback{}
+    world := result.Combat.World
+    if result.activeTarget > 0 {
+        // The native iterator reads bnext after the callback. Removal keeps
+        // the old successor, while an actor still linked may have moved.
+        result.candidate = result.nextCandidate
+        if world.Actors.ActorAt(result.activeTarget - 1).Valid {
+            result.candidate = world.Links.BlockNext(result.activeTarget)
+        }
+        result.activeTarget = 0
+    }
+    for range radiusWorkBatch {
+        if result.row > result.top {
+            result.Done = true
+            return result
+        }
+        if !result.enteredCell {
+            result.candidate = world.Links.BlockFirst(result.column, result.row)
+            result.enteredCell = true
+        }
+        if result.candidate == 0 {
+            result.column = result.column + 1
+            if result.column > result.right { result.column, result.row = result.left, result.row + 1 }
+            result.enteredCell = false
+        } else {
+            handle := result.candidate
+            result.candidate = world.Links.BlockNext(handle)
+            target := world.Actors.ActorAt(handle - 1)
+            if target.Valid && target.Physics.Body.Flags & ActorShootable != 0 &&
+                target.Kind != actorinfo.ActorSpider && target.Kind != actorinfo.ActorCyborg {
+                spot := world.Actors.ActorAt(result.spot - 1)
+                distance := radiusDistance(target.Physics.Body, spot.Physics.Body)
+                if distance < result.damage {
+                    sight := wad.CheckSight(level, sightEndpoint(target), sightEndpoint(spot))
+                    if !sight.Valid { result.Combat.Failed = true; return result }
+                    if sight.Visible {
+                        result.activeTarget, result.nextCandidate = handle, result.candidate
+                        result.Hit = DamageRequest{Target: handle, Inflictor: result.spot, Source: result.source,
+                            Amount: result.damage - distance}
+                        result.Combat = DamageMobj(level, world, result.Hit, rules)
+                        return result
+                    }
+                }
+            }
+        }
+    }
+    return result
+}

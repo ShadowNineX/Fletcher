@@ -1,0 +1,142 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted on 2026-11-21 from R_InitTextureMapping in linuxdoom-1.10/r_main.c
+// and the angular clipping in r_bsp.c.
+
+package engine
+
+import "numeric"
+
+const FineAngleShift = 19
+const FineTangentCount = 4096
+const MaxViewWidth = 320
+
+type ViewProjection struct {
+    Width int
+    FocalLength int
+    ClipAngle bits<32>
+    DetailShift int
+    ScreenX int
+    ScreenY int
+}
+
+// Column spans are half-open. An empty span has a length of zero.
+type ColumnSpan struct {
+    First int
+    End int
+}
+
+func fineTangent(index int) int {
+    if index < FineTangentCount / 2 { return -positiveTangents[FineTangentCount / 2 - 1 - index] }
+    return positiveTangents[index - FineTangentCount / 2]
+}
+
+func rawColumn(view ViewProjection, fineAngle int) int {
+    tangent := fineTangent(fineAngle)
+    if tangent > 2 * FracUnit { return -1 }
+    if tangent < -2 * FracUnit { return view.Width + 1 }
+    center := (view.Width / 2) << 16
+    column := (center - cport.C_FixedMul(tangent, view.FocalLength) + (FracUnit - 1)) >> 16
+    if column < -1 { return -1 }
+    if column > view.Width + 1 { return view.Width + 1 }
+    return column
+}
+
+// Invert the monotonic, unclamped viewangletox values before removing the
+// fencepost cases, as Doom does when deriving xtoviewangle and clipangle.
+func AngleForColumn(view ViewProjection, column int) bits<32> {
+    if view.Width == 0 || column < 0 || column > view.Width { return 0 }
+    return (bits<32>(fineAngleForColumn(view, column, 0, FineTangentCount)) << FineAngleShift) - angle90
+}
+
+func fineAngleForColumn(view ViewProjection, column int, left int, right int) int {
+    for range 13 {
+        if left == right { return left }
+        middle := (left + right) / 2
+        if rawColumn(view, middle) > column { left = middle + 1 } else { right = middle }
+    }
+    return left
+}
+
+// The inverse projection decreases across the screen. Reusing the preceding
+// result bounds each search. Check the lower estimate before trusting it.
+func ViewColumnAngles(view ViewProjection) [MaxViewWidth]bits<32> {
+    var angles [MaxViewWidth]bits<32>
+    if view.Width < 2 || view.Width > MaxViewWidth || view.FocalLength <= 0 { return angles }
+    angles[0] = view.ClipAngle
+    if angles[0] == 0 { angles[0] = AngleForColumn(view, 0) }
+    previous := int((angles[0] + angle90) >> FineAngleShift)
+    window := 4096 / view.Width + 2
+    focal := bits<32>(view.FocalLength)
+    // Split 2^32 / focal into quotient and remainder once. Then the
+    // tangent cut at each pixel is ceil((center - x) * 2^32 / focal).
+    quotient := bits<32>(0xffffffff) / focal
+    remainder := bits<32>(0xffffffff) % focal + 1
+    if remainder == focal { quotient, remainder = quotient + 1, 0 }
+    for index := range view.Width - 1 {
+        column := index + 1
+        delta := view.Width / 2 - column
+        fraction := delta * int(remainder)
+        if delta > 0 { fraction = fraction + view.FocalLength - 1 }
+        threshold := delta * int(quotient) + fraction / view.FocalLength
+        left := previous - window
+        if left < 0 || fineTangent(left) >= threshold { left = 0 }
+        previous = findTangent(threshold, left, previous)
+        angles[column] = (bits<32>(previous) << FineAngleShift) - angle90
+    }
+    return angles
+}
+
+func findTangent(threshold int, left int, right int) int {
+    for range 13 {
+        if left == right { return left }
+        middle := (left + right) / 2
+        if fineTangent(middle) < threshold { left = middle + 1 } else { right = middle }
+    }
+    return left
+}
+
+func NewViewProjection(width int) ViewProjection {
+    if width < 2 || width > MaxViewWidth { return ViewProjection{} }
+    view := ViewProjection{Width: width, FocalLength: cport.C_FixedDiv((width / 2) << 16, fineTangent(3072))}
+    view.ClipAngle = AngleForColumn(view, 0)
+    return view
+}
+
+func NewLowDetailProjection(width int) ViewProjection {
+    if width < 4 || width > MaxViewWidth || width & 1 != 0 { return NewViewProjection(width) }
+    view := NewViewProjection(width >> 1)
+    view.DetailShift = 1
+    return view
+}
+
+func ColumnForAngle(view ViewProjection, angle bits<32>) int {
+    if int(angle) <= -int(angle90) { return view.Width }
+    if int(angle) >= int(angle90) { return 0 }
+    column := rawColumn(view, int((angle + angle90) >> FineAngleShift))
+    if column < 0 { return 0 }
+    if column > view.Width { return view.Width }
+    return column
+}
+
+func clipAngularSpan(view ViewProjection, left bits<32>, right bits<32>, span bits<32>) ColumnSpan {
+    clip := view.ClipAngle
+    doubled := clip + clip
+    past := left + clip
+    if past > doubled {
+        if past - doubled >= span { return ColumnSpan{} }
+        left = clip
+    }
+    past = clip - right
+    if past > doubled {
+        if past - doubled >= span { return ColumnSpan{} }
+        right = -clip
+    }
+    return ColumnSpan{First: ColumnForAngle(view, left), End: ColumnForAngle(view, right)}
+}
+
+func WallColumns(view ViewProjection, heading bits<32>, first bits<32>, last bits<32>) ColumnSpan {
+    span := first - last
+    if span >= angle180 { return ColumnSpan{} }
+    return clipAngularSpan(view, first - heading, last - heading, span)
+}

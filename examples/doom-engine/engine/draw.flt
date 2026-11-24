@@ -1,0 +1,30 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted on 2026-11-21 from the column and span loops in linuxdoom-1.10/r_draw.c.
+
+package engine
+
+import "numeric"
+
+// A sampler maps texture indices through a palette suitable for the screen.
+type Sampler interface {
+    Texel(index int) color
+}
+
+func DrawColumn<T extends Sampler>(texture T, x int, firstY int, lastY int, centerY int, middle int, step int) {
+    fraction := middle + (firstY - centerY) * step
+    for row := range lastY - firstY + 1 {
+        ink := texture.Texel(cport.C_R_ColumnTexel(fraction))
+        pixel(x, firstY + row, true, ink)
+        fraction = fraction + step
+    }
+}
+
+func DrawSpan<T extends Sampler>(texture T, y int, firstX int, lastX int, u int, v int, stepU int, stepV int) {
+    for column := range lastX - firstX + 1 {
+        ink := texture.Texel(cport.C_R_SpanTexel(u, v))
+        pixel(firstX + column, y, true, ink)
+        u = u + stepU
+        v = v + stepV
+    }
+}

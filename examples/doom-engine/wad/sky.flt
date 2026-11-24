@@ -1,0 +1,29 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Classic level sky selection adapted from g_game.c and r_sky.h.
+
+package wad
+
+func skyFlatAt(file bytes, offset int) bit {
+    initial := file[offset]
+    if initial != 70 && initial != 102 { return false }
+    name := normalizeName(lumpNameAt(file, offset))
+    return name.Low == 0x4b535f46 && name.High == 0x3159 // F_SKY1
+}
+
+func SkyTextureName(mapName LumpName) LumpName {
+    name := normalizeName(mapName)
+    sky := 1
+    if name.Low & 0xffffff == 0x50414d { // MAPnn
+        tens, ones := (name.Low >> 24) & 0xff, name.High
+        if tens >= 48 && tens <= 57 && ones >= 48 && ones <= 57 {
+            number := (tens - 48) * 10 + ones - 48
+            if number >= 21 { sky = 3 } else if number >= 12 { sky = 2 }
+        }
+    } else if name.Low & 0xff00ff == 0x4d0045 && name.High == 0 { // EnMn
+        episode := ((name.Low >> 8) & 0xff) - 48
+        mission := ((name.Low >> 24) & 0xff) - 48
+        if episode >= 1 && episode <= 4 && mission >= 1 && mission <= 9 { sky = episode }
+    }
+    return LumpName{Low: 0x594b53 | ((48 + sky) << 24)} // SKYn
+}

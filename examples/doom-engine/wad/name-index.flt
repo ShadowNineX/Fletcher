@@ -1,0 +1,101 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
+package wad
+
+import "engine"
+
+const nameBuckets = 8192
+const emptyNameBuckets = [nameBuckets]int{}
+
+type indexKey struct {
+    Name LumpName
+    Found bit
+}
+
+type nameIndexSource interface {
+    IndexKey(index int) indexKey
+}
+
+// Retain a compact direct lookup for the first name in a bucket. Further
+// names share that bucket's chain, allocated only as collisions arrive.
+// Every entry checks the full name, including entries with identical hashes.
+type nameIndexRef interface {
+    Lookup(key LumpName) int
+    Extend(source nameIndexSource, start int, count int, replace bit) nameIndex
+}
+
+type nameIndexEntry struct {
+    Key LumpName
+    Code int
+    Next int
+}
+
+type nameIndex struct {
+    codes [nameBuckets]int
+    lowNames [nameBuckets]int
+    highNames [nameBuckets]int
+    heads engine.PagedSlots<int>
+    overflow engine.PagedSlots<nameIndexEntry>
+    count int
+}
+
+func newNameIndex() nameIndexRef {
+    return nameIndex{codes: emptyNameBuckets, lowNames: emptyNameBuckets, highNames: emptyNameBuckets}
+}
+
+func nameBucket(key LumpName) int {
+    // Mix both words so common prefixes and suffixes distribute across buckets.
+    mixed := bits<32>(key.Low) * 0x9e3779b1 ^ bits<32>(key.High) * 0x85ebca6b
+    mixed = (mixed ^ (mixed >> 16)) * 0xc2b2ae35
+    return int((mixed ^ (mixed >> 16)) & (nameBuckets - 1))
+}
+
+func (table nameIndex) findChain(key LumpName, head int) (int, int) {
+    for range table.count {
+        if head == 0 { return 0, 0 }
+        entry := table.overflow.At(head - 1)
+        if entry.Key.Low == key.Low && entry.Key.High == key.High { return head, entry.Code }
+        head = entry.Next
+    }
+    return 0, 0
+}
+
+func (table nameIndex) Lookup(key LumpName) int {
+    bucket := nameBucket(key)
+    code := table.codes[bucket]
+    if code == 0 { return 0 }
+    if table.lowNames[bucket] == key.Low && table.highNames[bucket] == key.High { return code }
+    _, chained := table.findChain(key, table.heads.At(bucket))
+    return chained
+}
+
+func (table nameIndex) Extend(source nameIndexSource, start int, count int, replace bit) nameIndex {
+    for delta := range count {
+        index := start + delta
+        candidate := source.IndexKey(index)
+        if candidate.Found {
+            key := candidate.Name
+            bucket := nameBucket(key)
+            code := index + 1
+            if table.codes[bucket] == 0 {
+                table.codes[bucket] = code
+                table.lowNames[bucket], table.highNames[bucket] = key.Low, key.High
+            } else if table.lowNames[bucket] == key.Low && table.highNames[bucket] == key.High {
+                if replace { table.codes[bucket] = code }
+            } else {
+                head := table.heads.At(bucket)
+                link, _ := table.findChain(key, head)
+                if link == 0 {
+                    table.overflow = table.overflow.With(table.count, nameIndexEntry{Key: key, Code: code, Next: head})
+                    table.count = table.count + 1
+                    table.heads = table.heads.With(bucket, table.count)
+                } else if replace {
+                    entry := table.overflow.At(link - 1)
+                    entry.Code = code
+                    table.overflow = table.overflow.With(link - 1, entry)
+                }
+            }
+        }
+    }
+    return table
+}

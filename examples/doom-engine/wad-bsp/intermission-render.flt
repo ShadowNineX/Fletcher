@@ -1,0 +1,234 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Single-player intermission layout from linuxdoom-1.10/wi_stuff.c.
+
+package main
+
+import "play"
+import "wad"
+import "walls"
+
+const intermissionWidth = 320
+const intermissionHeight = 200
+const worldMapNodes = [54]int{
+    185, 164, 148, 143, 69, 122, 209, 102, 116, 89, 166, 55, 71, 56, 135, 29, 71, 24,
+    254, 25, 97, 50, 188, 64, 128, 78, 214, 92, 133, 130, 208, 136, 148, 140, 235, 158,
+    156, 168, 48, 154, 174, 95, 265, 75, 130, 48, 279, 23, 198, 48, 140, 25, 281, 136,
+}
+
+type IntermissionPatch struct {
+    Lump wad.LumpRef
+    Width int
+    Height int
+    Left int
+    Top int
+}
+
+func intermissionSigned(value int) int { return (value << 16) >> 16 }
+
+func readIntermissionPatch(mounts wad.Archives, name wad.LumpName) IntermissionPatch {
+    return decodeIntermissionPatch(mounts.Find(name))
+}
+
+func decodeIntermissionPatch(lump wad.LumpRef) IntermissionPatch {
+    if !lump.Valid || lump.Size < wad.PatchHeaderSize { return IntermissionPatch{} }
+    width := intermissionSigned(wad.U16(lump.File, lump.Offset))
+    height := intermissionSigned(wad.U16(lump.File, lump.Offset + 2))
+    if width <= 0 || height <= 0 || wad.PatchHeaderSize + width * 4 > lump.Size { return IntermissionPatch{} }
+    return IntermissionPatch{Lump: lump, Width: width, Height: height,
+        Left: intermissionSigned(wad.U16(lump.File, lump.Offset + 4)),
+        Top: intermissionSigned(wad.U16(lump.File, lump.Offset + 6))}
+}
+
+func intermissionPixelEdge(value int, original int, displayed int) int {
+    if value <= 0 { return 0 }
+    if value >= original { return displayed }
+    if displayed == original { return value }
+    return (value * displayed + original - 1) / original
+}
+
+func drawIntermissionColumn(post wad.PostSource, shade walls.WadShading, x int, top int) {
+    if !post.Valid { return }
+    cursor, file := post.Offset, post.Patch.File
+    for range post.Patch.Size / 4 + 1 {
+        start := int(file[cursor])
+        if start == 255 { return }
+        length := int(file[cursor + 1])
+        absolute := top + start
+        firstRow := intermissionPixelEdge(absolute, intermissionHeight, Height)
+        lastRow := intermissionPixelEdge(absolute + length, intermissionHeight, Height)
+        sourceBase := cursor + 3 - absolute
+        patternColumn := x & 3
+        for row := range lastRow - firstRow {
+            py := firstRow + row
+            sourceY := py
+            if Height != intermissionHeight { sourceY = py * intermissionHeight / Height }
+            index := int(file[sourceBase + sourceY])
+            var swatch color
+            if shade.Dithered {
+                if walls.Bayer4[((py & 3) << 2) | patternColumn] < shade.Patterns.Coverage[index] {
+                    swatch = shade.Patterns.Second[index]
+                } else { swatch = shade.Patterns.First[index] }
+            } else { swatch = shade.Palette[index] }
+            pixel(x, py, true, swatch)
+        }
+        cursor = cursor + length + 4
+    }
+}
+
+func drawIntermissionPatch(patch IntermissionPatch, shade walls.WadShading, x int, y int) {
+    drawPatchFrame(patch, shade, x, y, false)
+}
+
+// D_Display overlays M_PAUSE on the frozen view, including the automap.
+func drawPause(mounts wad.Archives, shade walls.WadShading) {
+    if !shade.Valid { return }
+    patch := readIntermissionPatch(mounts, wad.LumpName{Low: 0x41505f4d, High: 0x00455355})
+    drawIntermissionPatch(patch, shade, (intermissionWidth - 68) / 2, 4)
+}
+
+func drawPatchFrame(patch IntermissionPatch, shade walls.WadShading, x int, y int, flip bit) {
+    if patch.Width == 0 { return }
+    left, top := x - patch.Left, y - patch.Top
+    firstColumn := intermissionPixelEdge(left, intermissionWidth, Width)
+    lastColumn := intermissionPixelEdge(left + patch.Width, intermissionWidth, Width)
+    for column := range lastColumn - firstColumn {
+        px := firstColumn + column
+        source := px - left
+        if Width != intermissionWidth { source = px * intermissionWidth / Width - left }
+        if flip { source = patch.Width - 1 - source }
+        post := wad.PatchPostSource(patch.Lump, source)
+        drawIntermissionColumn(post, shade, px, top)
+    }
+}
+
+func intermissionTitle(route play.CampaignRoute, index int) wad.LumpName {
+    if route.Commercial {
+        return wad.LumpName{Low: 0x4c495743, High: 86 | ((48 + index / 10) << 8) | ((48 + index % 10) << 16)} // CWILVnn
+    }
+    return wad.LumpName{Low: 0x564c4957, High: (48 + route.Episode) | ((48 + index) << 8)} // WILVem
+}
+
+func intermissionDigit(mounts wad.Archives, digit int) IntermissionPatch {
+    return readIntermissionPatch(mounts, wad.LumpName{Low: 0x554e4957, High: 77 | ((48 + digit) << 8)}) // WINUMn
+}
+
+func drawIntermissionNumber(mounts wad.Archives, shade walls.WadShading, value int, x int, y int,
+    digits int, width int) int {
+    if width == 0 || value < 0 || value == 1994 { return x }
+    if digits < 0 {
+        digits = 1
+        probe := value
+        for range 9 {
+            if probe >= 10 { probe, digits = probe / 10, digits + 1 }
+        }
+    }
+    for range digits {
+        x = x - width
+        drawIntermissionPatch(intermissionDigit(mounts, value % 10), shade, x, y)
+        value = value / 10
+    }
+    return x
+}
+
+func drawIntermissionPercent(mounts wad.Archives, shade walls.WadShading, value int, x int, y int, width int) {
+    if value < 0 { return }
+    drawIntermissionPatch(readIntermissionPatch(mounts, wad.LumpName{Low: 0x43504957, High: 0x544e}), shade, x, y)
+    drawIntermissionNumber(mounts, shade, value, x, y, -1, width)
+}
+
+func drawIntermissionTime(mounts wad.Archives, shade walls.WadShading, seconds int, x int, y int, width int) {
+    if seconds < 0 { return }
+    if seconds > 61 * 59 {
+        overflow := readIntermissionPatch(mounts, wad.LumpName{Low: 0x55534957, High: 0x534b43})
+        drawIntermissionPatch(overflow, shade, x - overflow.Width, y)
+        return
+    }
+    colon := readIntermissionPatch(mounts, wad.LumpName{Low: 0x4f434957, High: 0x4e4f4c})
+    x = drawIntermissionNumber(mounts, shade, seconds % 60, x, y, 2, width) - colon.Width
+    drawIntermissionPatch(colon, shade, x, y)
+    if seconds >= 60 { drawIntermissionNumber(mounts, shade, seconds / 60, x, y, 2, width) }
+}
+
+func drawIntermissionStats(mounts wad.Archives, shade walls.WadShading, state play.IntermissionState) {
+    title := readIntermissionPatch(mounts, intermissionTitle(state.Route, state.Route.LastMap))
+    finished := readIntermissionPatch(mounts, wad.LumpName{Low: 0x464957, High: 0x0})
+    drawIntermissionPatch(title, shade, (intermissionWidth - title.Width) / 2, 2)
+    drawIntermissionPatch(finished, shade, (intermissionWidth - finished.Width) / 2, 2 + title.Height * 5 / 4)
+    number := intermissionDigit(mounts, 0)
+    spacing := number.Height * 3 / 2
+    drawIntermissionPatch(readIntermissionPatch(mounts, wad.LumpName{Low: 0x534f4957, High: 0x4b54}), shade, 50, 50)
+    drawIntermissionPatch(readIntermissionPatch(mounts, wad.LumpName{Low: 0x534f4957, High: 0x4954}), shade, 50, 50 + spacing)
+    drawIntermissionPatch(readIntermissionPatch(mounts, wad.LumpName{Low: 0x43534957, High: 0x325452}), shade, 50, 50 + 2 * spacing)
+    drawIntermissionPercent(mounts, shade, state.Counts.Kills, 270, 50, number.Width)
+    drawIntermissionPercent(mounts, shade, state.Counts.Items, 270, 50 + spacing, number.Width)
+    drawIntermissionPercent(mounts, shade, state.Counts.Secrets, 270, 50 + 2 * spacing, number.Width)
+    drawIntermissionPatch(readIntermissionPatch(mounts, wad.LumpName{Low: 0x49544957, High: 0x454d}), shade, 16, 168)
+    drawIntermissionTime(mounts, shade, state.Counts.Time, 144, 168, number.Width)
+    if state.Route.ShowPar {
+        drawIntermissionPatch(readIntermissionPatch(mounts, wad.LumpName{Low: 0x41504957, High: 0x52}), shade, 176, 168)
+        drawIntermissionTime(mounts, shade, state.Counts.Par, 304, 168, number.Width)
+    }
+}
+
+func intermissionPatchFits(patch IntermissionPatch, x int, y int) bit {
+    left, top := x - patch.Left, y - patch.Top
+    return patch.Width > 0 && left >= 0 && top >= 0 &&
+        left + patch.Width < intermissionWidth && top + patch.Height < intermissionHeight
+}
+
+func drawIntermissionNext(mounts wad.Archives, shade walls.WadShading, state play.IntermissionState) {
+    route := state.Route
+    if !route.Commercial && route.Episode < 3 {
+        first := route.Episode * 18
+        last := route.LastMap
+        if last == 8 { last = route.NextMap - 1 }
+        splat := readIntermissionPatch(mounts, wad.LumpName{Low: 0x50534957, High: 0x54414c})
+        for index := range last + 1 {
+            pos := first + index * 2
+            drawIntermissionPatch(splat, shade, worldMapNodes[pos], worldMapNodes[pos + 1])
+        }
+        if route.DidSecret { drawIntermissionPatch(splat, shade, worldMapNodes[first + 16], worldMapNodes[first + 17]) }
+        if state.PointerOn || state.Stage == play.IntermissionDelay {
+            pos := first + route.NextMap * 2
+            x, y := worldMapNodes[pos], worldMapNodes[pos + 1]
+            arrow := readIntermissionPatch(mounts, wad.LumpName{Low: 0x52554957, High: 0x3048})
+            if !intermissionPatchFits(arrow, x, y) { arrow = readIntermissionPatch(mounts, wad.LumpName{Low: 0x52554957, High: 0x3148}) }
+            if intermissionPatchFits(arrow, x, y) { drawIntermissionPatch(arrow, shade, x, y) }
+        }
+    }
+    if route.Commercial && route.NextMap == 30 { return }
+    entering := readIntermissionPatch(mounts, wad.LumpName{Low: 0x4e454957, High: 0x524554})
+    title := readIntermissionPatch(mounts, intermissionTitle(route, route.NextMap))
+    drawIntermissionPatch(entering, shade, (intermissionWidth - entering.Width) / 2, 2)
+    drawIntermissionPatch(title, shade, (intermissionWidth - title.Width) / 2, 2 + title.Height * 5 / 4)
+}
+
+func drawIntermission(mounts wad.Archives, shade walls.WadShading, state play.IntermissionState,
+    backdrop play.IntermissionBackdrop, paused bit) bit {
+    name := wad.LumpName{Low: 0x45544e49, High: 0x43495052}
+    if !state.Route.Commercial && state.Route.Episode < 3 {
+        name = wad.LumpName{Low: 0x414d4957, High: 80 | ((48 + state.Route.Episode) << 8)} // WIMAPn
+    }
+    background := readIntermissionPatch(mounts, name)
+    if background.Width == 0 { return false }
+    if !shade.Valid { shade = walls.LoadShading(mounts) }
+    if !shade.Valid { return false }
+    drawIntermissionPatch(background, shade, 0, 0)
+    for index := range backdrop.Count {
+        frame := backdrop.Frame[index]
+        if frame >= 0 {
+            asset := index
+            if state.Route.Episode == 1 && index == 8 { asset = 4 }
+            animation := play.IntermissionAnimationAt(state.Route.Episode, index)
+            name := wad.LumpName{Low: 0x414957 | ((48 + state.Route.Episode) << 24),
+                High: 48 | ((48 + asset) << 8) | (48 << 16) | ((48 + frame) << 24)} // WIAe0a0f
+            drawIntermissionPatch(readIntermissionPatch(mounts, name), shade, animation.X, animation.Y)
+        }
+    }
+    if state.Stage == play.IntermissionStats {
+        drawIntermissionStats(mounts, shade, state)
+    } else { drawIntermissionNext(mounts, shade, state) }
+    if paused { drawPause(mounts, shade) }
+    return true
+}

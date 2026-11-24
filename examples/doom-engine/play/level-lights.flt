@@ -1,0 +1,217 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Sector startup and tagged lighting from linuxdoom-1.10/p_spec.c and p_lights.c.
+
+package play
+
+import "wad"
+
+const LightNeighborsDarkest = -1
+const LightStartStrobe = -2
+
+type levelLightSlot struct {
+    Light SectorLight
+    Owner int
+}
+
+// Entries stay in registration order. The first entry for each sector owns
+// its light level and special, including when additional strobes are started.
+type LevelLights struct {
+    entries PagedSlots<levelLightSlot>
+    firstInSector PagedSlots<int>
+    Count int
+    ThinkerCount int
+}
+
+type LevelLightStep struct {
+    Lights LevelLights
+    Random RandomState
+    Changed bit
+}
+
+func (lights LevelLights) EntryAt(index int) SectorLight { return lights.entries.At(index).Light }
+
+func (lights LevelLights) IndexOf(sector int) int { return lights.firstInSector.At(sector) - 1 }
+
+func (lights LevelLights) Append(light SectorLight) LevelLights {
+    owner := lights.IndexOf(light.Sector)
+    if owner < 0 {
+        owner = lights.Count
+        lights.firstInSector = lights.firstInSector.With(light.Sector, owner + 1)
+    }
+    lights.entries = lights.entries.With(lights.Count, levelLightSlot{Light: light, Owner: owner})
+    lights.Count = lights.Count + 1
+    if light.Kind != SectorLightInactive { lights.ThinkerCount = lights.ThinkerCount + 1 }
+    return lights
+}
+
+func (lights LevelLights) withLowerMinimum(index int, minimum int) LevelLights {
+    slot := lights.entries.At(index)
+    if minimum < slot.Light.Min {
+        slot.Light.Min = minimum
+        lights.entries = lights.entries.With(index, slot)
+    }
+    return lights
+}
+
+func (lights LevelLights) SectorSpecialAt(sector int, base int) int {
+    index := lights.IndexOf(sector)
+    if index < 0 { return base }
+    return lights.EntryAt(index).Special
+}
+
+func (lights LevelLights) LightAt(sector int, base int) int {
+    index := lights.IndexOf(sector)
+    if index < 0 { return base }
+    return lights.EntryAt(index).Level
+}
+
+// P_SpawnSpecials installs light thinkers in sector order. Compute the
+// minimum neighboring light in one pass over the validated two-sided lines.
+func LoadLevelLights(level wad.BspLevel, random RandomState) LevelLightStep {
+    var lights LevelLights
+    if !level.Valid { return LevelLightStep{Random: random} }
+    for sector := range level.Sectors.Count {
+        special := level.SectorSpecial(sector)
+        kind := sectorLightKind(special)
+        if kind != SectorLightInactive {
+            light := level.SectorLight(sector)
+            lights = lights.Append(SectorLight{Sector: sector, Kind: kind,
+                Special: special, Level: light, Min: light})
+        }
+    }
+    if lights.Count == 0 { return LevelLightStep{Lights: lights, Random: random} }
+
+    for index := range level.Lines.Count {
+        line := level.LineAt(index)
+        if line.Valid && line.Flags & 4 != 0 && line.BackSector >= 0 && line.FrontSector != line.BackSector {
+            front, back := lights.IndexOf(line.FrontSector), lights.IndexOf(line.BackSector)
+            if front >= 0 {
+                lights = lights.withLowerMinimum(front, level.SectorLight(line.BackSector))
+            }
+            if back >= 0 {
+                lights = lights.withLowerMinimum(back, level.SectorLight(line.FrontSector))
+            }
+        }
+    }
+    for index := range lights.Count {
+        slot := lights.entries.At(index)
+        light := slot.Light
+        spawned := SpawnSectorLight(light.Sector, light.Special, light.Level, light.Min, random)
+        spawned.Light.Order = light.Sector
+        slot.Light, random = spawned.Light, spawned.Random
+        lights.entries = lights.entries.With(index, slot)
+    }
+    return LevelLightStep{Lights: lights, Random: random}
+}
+
+func surroundingLight(level wad.BspLevel, lights LevelLights, sector int, initial int, brightest bit) int {
+    result := initial
+    for index := range level.Lines.Count {
+        line := level.LineAt(index)
+        if line.Valid && line.Flags & 4 != 0 && line.BackSector >= 0 {
+            neighbor := -1
+            if line.FrontSector == sector {
+                neighbor = line.BackSector
+            } else if line.BackSector == sector {
+                neighbor = line.FrontSector
+            }
+            if neighbor >= 0 {
+                light := lights.LightAt(neighbor, level.SectorLight(neighbor))
+                if (brightest && light > result) || (!brightest && light < result) { result = light }
+            }
+        }
+    }
+    return result
+}
+
+func (state LevelLightStep) setTaggedLevel(level wad.BspLevel, sector int, current int, target int) LevelLightStep {
+    if current == target { return state }
+    index := state.Lights.IndexOf(sector)
+    if index < 0 {
+        state.Lights = state.Lights.Append(SectorLight{Sector: sector, Special: level.SectorSpecial(sector), Level: target})
+    } else {
+        slot := state.Lights.entries.At(index)
+        slot.Light.Level = target
+        state.Lights.entries = state.Lights.entries.With(index, slot)
+    }
+    state.Changed = true
+    return state
+}
+
+func (state LevelLightStep) startTaggedStrobe(level wad.BspLevel, sector int, current int, order int) LevelLightStep {
+    minimum := surroundingLight(level, state.Lights, sector, current, false)
+    spawned := SpawnSectorLight(sector, 3, current, minimum, state.Random)
+    spawned.Light.Order = order
+    owner := state.Lights.IndexOf(sector)
+    if owner >= 0 {
+        slot := state.Lights.entries.At(owner)
+        if slot.Light.Special != 0 {
+            slot.Light.Special = 0
+            state.Lights.entries = state.Lights.entries.With(owner, slot)
+        }
+    }
+    state.Lights = state.Lights.Append(spawned.Light)
+    state.Random = spawned.Random
+    return state
+}
+
+// Events update the live sectors in map order. For EV_LightTurnOn, a zero
+// argument takes the first nonzero neighboring maximum and retains it for
+// later sectors. The minimum event sees earlier sectors already updated.
+func ActivateTaggedLights(level wad.BspLevel, doors LevelDoors, state LevelLightStep, tag int, action int) LevelLightStep {
+    return activateTaggedLights(level, LevelSpecials{Doors: doors, Lighting: state}, tag, action).Lighting
+}
+
+func activateTaggedLights(level wad.BspLevel, state LevelSpecials, tag int, action int) LevelSpecials {
+    brightness := action
+    lighting := state.Lighting
+    for sector := range level.Sectors.Count {
+        if level.SectorTag(sector) == tag {
+            current := lighting.Lights.LightAt(sector, level.SectorLight(sector))
+            if action == LightStartStrobe {
+                if !state.MoverOccupied(sector) {
+                    order := state.Doors.NextMover
+                    if order < level.Sectors.Count { order = level.Sectors.Count }
+                    lighting = lighting.startTaggedStrobe(level, sector, current, order)
+                    state.Doors.NextMover = order + 1
+                }
+            } else if action == LightNeighborsDarkest {
+                minimum := surroundingLight(level, lighting.Lights, sector, current, false)
+                lighting = lighting.setTaggedLevel(level, sector, current, minimum)
+            } else {
+                if brightness == 0 { brightness = surroundingLight(level, lighting.Lights, sector, 0, true) }
+                lighting = lighting.setTaggedLevel(level, sector, current, brightness)
+            }
+        }
+    }
+    state.Lighting = lighting
+    return state
+}
+
+func (state LevelLightStep) tickThinker(index int) LevelLightStep {
+    slot := state.Lights.entries.At(index)
+    before := slot.Light
+    if before.Kind == SectorLightInactive { return state }
+    var owner levelLightSlot
+    if slot.Owner != index {
+        owner = state.Lights.entries.At(slot.Owner)
+        before.Level = owner.Light.Level
+    }
+    after := TickSectorLight(before, state.Random)
+    changed := before.Level != after.Light.Level
+    state.Changed = state.Changed || changed
+    slot.Light, state.Random = after.Light, after.Random
+    state.Lights.entries = state.Lights.entries.With(index, slot)
+    if changed && slot.Owner != index {
+        owner.Light.Level = after.Light.Level
+        state.Lights.entries = state.Lights.entries.With(slot.Owner, owner)
+    }
+    return state
+}
+
+func TickLevelLights(lights LevelLights, random RandomState) LevelLightStep {
+    state := LevelLightStep{Lights: lights, Random: random}
+    for index := range lights.Count { state = state.tickThinker(index) }
+    return state
+}

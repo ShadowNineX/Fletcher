@@ -1,0 +1,1745 @@
+package main
+
+import "automap"
+import "audio"
+import "engine"
+import "enemy"
+import "play"
+import "wad"
+import "walls"
+
+const Archive = readFile("LEVEL.WAD")
+const StatusViewHeight = (statusBarTop * Height + intermissionHeight - 1) / intermissionHeight
+// Each subsector's first SEG and count are signed 16-bit fields.
+const MaxClassicSegmentEnd = 2 * 0x7fff
+const SegmentReferenceWords = (MaxClassicSegmentEnd + 31) / 32
+const LineReferenceWords = 0x10000 / 32
+const BspReferenceWords = engine.SubsectorFlag / 32
+const WallCacheSlots = 4096
+// Commit resource indexes in batches. The sliced controller can yield inside
+// a batch while keeping the partial index private.
+const ResourceIndexBatch = 1024
+const NewPlayerHealth = [wad.VanillaPlayers]int{100, 100, 100, 100}
+const castHostLetters bits<26> = (1 << 11) | (1 << 14) | (1 << 19) | (1 << 24) // L, O, T, Y
+const menuNavigationLetters bits<26> = (1 << 5) | (1 << 18) | (1 << 22) // F, S, W
+const HostMusicTickBatch = 64
+
+type Scene struct {
+    Level wad.BspLevel
+    Camera engine.Camera
+    Materials walls.Materials
+    Scrolls play.LineScrolls
+    Lights play.LevelLights
+    ColumnAngles [engine.MaxViewWidth]bits<32>
+    Actors play.MapActors
+    ActorLinks play.ActorLinks
+    ActorSprites PreviewSprites
+    ViewHeight int
+}
+
+func (scene Scene) NodeCount() int { return scene.Level.NodeCount() }
+func (scene Scene) PartitionAt(index int) engine.BspPartition { return scene.Level.PartitionAt(index) }
+func (scene Scene) ChildBoundsAt(index int, side int) engine.Box { return scene.Level.ChildBoundsAt(index, side) }
+func (scene Scene) ChildAt(index int, side int) int { return scene.Level.ChildAt(index, side) }
+func (scene Scene) SubsectorCount() int { return scene.Level.SubsectorCount() }
+
+func (geometry RenderGeometry) wallEntry(level wad.BspLevel, index int) (RenderWall, bit) {
+    cached := geometry.Walls.At(index & (WallCacheSlots - 1))
+    if cached.SegmentID == index + 1 { return cached, true }
+    return RenderWall{SegmentID: index + 1, Edge: level.WallEdgeAt(index)}, false
+}
+
+func (geometry RenderGeometry) keepWall(entry RenderWall) RenderGeometry {
+    slot := (entry.SegmentID - 1) & (WallCacheSlots - 1)
+    geometry.Walls = geometry.Walls.With(slot, entry)
+    return geometry
+}
+
+func (entry RenderWall) decodeWall(level wad.BspLevel) RenderWall {
+    entry.Wall = level.CacheWallFor(entry.Edge)
+    entry.Decoded = true
+    return entry
+}
+
+func lightWall(level wad.BspLevel, wall wad.WallSegment, lights play.LevelLights) wad.WallSegment {
+    frontSector := (wall.FrontSector - level.Sectors.Offset) / wad.SectorSize
+    front := lights.LightAt(frontSector, wall.Light)
+    back := wall.BackLight
+    if wall.TwoSided {
+        backSector := (wall.BackSector - level.Sectors.Offset) / wad.SectorSize
+        back = lights.LightAt(backSector, back)
+    }
+    return level.WithWallLighting(wall, front, back)
+}
+
+func (scene Scene) DrawBspSubsector(index int, frame engine.BspFrame<SpritePass>) engine.BspFrame<SpritePass> {
+    coverage := frame.Coverage
+    leaf := scene.Level.SubsectorAt(index)
+    entry, _ := frame.Data.Geometry.wallEntry(scene.Level, leaf.FirstSegment)
+    if !entry.Decoded {
+        entry = entry.decodeWall(scene.Level)
+        frame.Data.Geometry = frame.Data.Geometry.keepWall(entry)
+    }
+    wall := entry.Wall.ReadWall(scene.Level)
+    if scene.Lights.Count > 0 { wall = lightWall(scene.Level, wall, scene.Lights) }
+    coverage = engine.BeginSubsectorPlanes(coverage, scene.Camera.Z, scene.Level.PlaneKey(wall, false), scene.Level.PlaneKey(wall, true))
+    if coverage.Failed { frame.Coverage = coverage; return frame }
+    sector := (wall.FrontSector - scene.Level.Sectors.Offset) / wad.SectorSize
+    frame.Data = addSectorSprites(scene, frame.Data, sector, wall.Front, wall.Light)
+    for i := range leaf.SegmentCount {
+        cached := true
+        if i != 0 { entry, cached = frame.Data.Geometry.wallEntry(scene.Level, leaf.FirstSegment + i) }
+        projected := walls.ProjectWall(scene.Camera, coverage, entry.Edge.First, entry.Edge.Last)
+        visible := projected.Span.First < projected.Span.End
+        if visible && !entry.Decoded {
+            entry = entry.decodeWall(scene.Level)
+            cached = false
+        }
+        if !cached { frame.Data.Geometry = frame.Data.Geometry.keepWall(entry) }
+        if visible {
+            // The first SEG already resolved the live sector for planes and sprites.
+            // Other SEGs only need live heights and lights if they survive clipping.
+            if i != 0 {
+                wall = entry.Wall.ReadWall(scene.Level)
+                if scene.Lights.Count > 0 { wall = lightWall(scene.Level, wall, scene.Lights) }
+            }
+            solid := !wall.TwoSided || wall.Back.Ceiling <= wall.Front.Floor || wall.Back.Floor >= wall.Front.Ceiling
+            geometry := solid || wall.MarkCeiling || wall.MarkFloor
+            var materials walls.WallMaterials
+            if scene.Materials.Textures.Valid {
+                side := entry.Wall.ReadWallMaterial(scene.Level)
+                if geometry || (wall.TwoSided && side.Middle.Low != 0) {
+                    if scene.Scrolls.Count > 0 { side.OffsetU = side.OffsetU + scene.Scrolls.OffsetForSide(wall.SideOffset) }
+                    materials = walls.ResolveWallMaterials(scene.Materials, wall, side, scene.Camera.Z)
+                }
+            }
+            if geometry || materials.Masked.Texture.Valid {
+                shade := color.Orange
+                if wall.Light < 128 { shade = color.Purple }
+                surface := walls.Surface{Front: wall.Front, Back: wall.Back, Solid: solid, TwoSided: wall.TwoSided,
+                    FrontSky: wall.FrontSky, SharedSky: wall.SharedSky,
+                    MarkCeiling: wall.MarkCeiling, MarkFloor: wall.MarkFloor, Shade: shade,
+                    Materials: materials, ColumnAngles: scene.ColumnAngles}
+                coverage, frame.Data.Columns = walls.DrawProjectedWallCached(scene.Camera, coverage, wall.First, wall.Last,
+                    wall.Direction, surface, scene.ViewHeight, projected, frame.Data.Columns)
+                if coverage.Failed { frame.Coverage = coverage; return frame }
+                if coverage.StoredWallRange {
+                    line := (wall.LineOffset - scene.Level.Lines.Offset) / wad.LineSize
+                    if line < LineReferenceWords * 32 { frame.Data.Mapped.Words[line / 32][line % 32] = true }
+                    if solid && i + 1 < leaf.SegmentCount && coverage.Words[0][0] &&
+                        !engine.SpanOpen(coverage, engine.ColumnSpan{End: scene.Camera.View.Width}) {
+                        // Sprites and visplanes have already been collected for this leaf.
+                        // The remaining SEGs have no uncovered columns to contribute.
+                        coverage.StoredWallRange = false
+                        frame.Coverage = coverage
+                        return frame
+                    }
+                }
+            }
+        } else { coverage.StoredWallRange = false }
+    }
+    frame.Coverage = coverage
+    return frame
+}
+
+type RenderWall struct {
+    SegmentID int // SEG index plus one. Zero marks an empty slot.
+    Edge wad.WallEdge
+    Wall wad.CachedWallRef
+    Decoded bit
+}
+
+type RenderGeometry struct {
+    Valid bit
+    Marker int
+    // Entries start with endpoints. The walker decodes the remaining data
+    // when a SEG survives clipping or supplies a subsector's front sector.
+    Walls engine.PagedSlots<RenderWall>
+}
+
+// Called after checking that every non-root child has one parent. A cycle
+// can only be disconnected from the root. Count the reachable nodes.
+func allBspNodesReachable(level wad.BspLevel, nodes int) bit {
+    var pending engine.PagedSlots<int>
+    pending = pending.With(0, nodes - 1)
+    depth := 1
+    for range nodes {
+        if depth == 0 { return false }
+        depth = depth - 1
+        for _, child := range level.NodeChildrenAt(pending.At(depth)) {
+            if child < engine.SubsectorFlag {
+                pending = pending.With(depth, child)
+                depth = depth + 1
+            }
+        }
+    }
+    return depth == 0
+}
+
+func validBspTopology(level wad.BspLevel) bit {
+    nodes := level.NodeCount()
+    leaves := level.SubsectorCount()
+    if leaves != nodes + 1 || leaves > engine.SubsectorFlag { return false }
+    var nodeReaders [BspReferenceWords]bits<32>
+    var leafReaders [BspReferenceWords]bits<32>
+    hasForwardChild := false
+    for i := range nodes {
+        for _, child := range level.NodeChildrenAt(i) {
+            if child >= engine.SubsectorFlag {
+                j := child - engine.SubsectorFlag
+                if j >= leaves || leafReaders[j / 32][j & 31] { return false }
+                leafReaders[j / 32] = leafReaders[j / 32] | (bits<32>(1) << (j & 31))
+            } else {
+                if child >= nodes - 1 || nodeReaders[child / 32][child & 31] { return false }
+                nodeReaders[child / 32] = nodeReaders[child / 32] | (bits<32>(1) << (child & 31))
+                if child >= i { hasForwardChild = true }
+            }
+        }
+    }
+    // Backward-only references already prove the tree is acyclic.
+    return !hasForwardChild || allBspNodesReachable(level, nodes)
+}
+
+// Check the BSP tree and every SEG used by a subsector before the first paint.
+func loadRenderGeometry(level wad.BspLevel, marker int) RenderGeometry {
+    if !level.Valid || !validBspTopology(level) { return RenderGeometry{} }
+    // Subsector ranges can skip records or share them. Validate their union
+    // once, using the signed first/count fields to size the reference bits.
+    var referenced [SegmentReferenceWords]bits<32>
+    lastUsedWord := 0
+    for i := range level.SubsectorCount() {
+        leaf := level.SubsectorAt(i)
+        if leaf.SegmentCount <= 0 || leaf.FirstSegment < 0 || leaf.FirstSegment > level.Segs.Count - leaf.SegmentCount {
+            return RenderGeometry{}
+        }
+        first, last := leaf.FirstSegment, leaf.FirstSegment + leaf.SegmentCount - 1
+        firstWord, lastWord := first >> 5, last >> 5
+        firstMask := bits<32>(0xffffffff) << (first & 31)
+        lastMask := bits<32>(0xffffffff) >> (31 - (last & 31))
+        if firstWord == lastWord {
+            referenced[firstWord] = referenced[firstWord] | (firstMask & lastMask)
+        } else {
+            referenced[firstWord] = referenced[firstWord] | firstMask
+            for word := range lastWord - firstWord - 1 { referenced[firstWord + word + 1] = 0xffffffff }
+            referenced[lastWord] = referenced[lastWord] | lastMask
+        }
+        if lastWord > lastUsedWord { lastUsedWord = lastWord }
+    }
+    for word := range lastUsedWord + 1 {
+        mask := referenced[word]
+        if mask != 0 {
+            // SEGs in one subsector can face different sectors, as in E3M8.
+            for offset := range 32 {
+                if mask[offset] && level.ValidateSegmentFront(word * 32 + offset) < 0 { return RenderGeometry{} }
+            }
+        }
+    }
+    return RenderGeometry{Marker: marker, Valid: true}
+}
+
+func previewMaterials(materials walls.Materials, animations wad.AnimationSet, levelTime int) walls.Materials {
+    if materials.Shade.Valid {
+        materials.Animations = animations
+        materials.LevelTime = levelTime
+    }
+    return materials
+}
+
+func previewStageGamma(materials walls.Materials, mounts wad.Archives, gamma int) walls.Materials {
+    if !materials.Shade.Valid { materials.Shade = walls.LoadShading(mounts) }
+    materials.Shade = materials.Shade.WithGamma(gamma)
+    return materials
+}
+
+type CameraDraw struct {
+    Valid bit
+    FuzzPhase int
+    FuzzVisible bit
+    Mapped MappedLines
+    Columns walls.ColumnCache
+    Geometry RenderGeometry
+    Border ViewBorderCache
+}
+
+type CameraDisplay struct {
+    Shade walls.WadShading
+    Border ViewBorderCache
+    Inventory play.PlayerInventory
+    StatusVisible bit
+    ViewBlocks int
+    LowDetail bit
+    Face int
+    Invisible bit
+    FuzzPhase int
+    Mapped MappedLines
+    Columns walls.ColumnCache
+    Geometry RenderGeometry
+}
+
+type HostMusicAdvance struct {
+    Player audio.MusPlayer
+    Queue SoundtrackQueue
+    Packets [audio.MusVoiceCount]bits<13>
+    Debt int
+    Emitted bit
+}
+
+type SoundtrackQueue struct {
+    Notes audio.MusNotes
+    First int
+}
+
+// Each host callback can pulse each bank once. Fill free banks in score
+// order, carrying undelivered notes ahead of the next score tic.
+func advanceHostMusic(player audio.MusPlayer, queue SoundtrackQueue, packets [audio.MusVoiceCount]bits<13>,
+    debt int, muted bit) HostMusicAdvance {
+    if muted && queue.Notes.Count > 0 { queue = SoundtrackQueue{} }
+    steps := debt
+    if steps < 0 { steps = 0 }
+    if steps > HostMusicTickBatch { steps = HostMusicTickBatch }
+    voice := 0
+    for step := range steps + 1 {
+        count := queue.Notes.Count - queue.First
+        room := audio.MusVoiceCount - voice
+        if count > room { count = room }
+        if count > 0 {
+            for offset := range count {
+                index := voice + offset
+                packets[index] = packetForMusicNote(packets[index], queue.Notes.At(queue.First + offset))
+            }
+            voice, queue.First = voice + count, queue.First + count
+            if queue.First == queue.Notes.Count { queue = SoundtrackQueue{} }
+        }
+        if voice == audio.MusVoiceCount || step == steps || !player.Active {
+            return HostMusicAdvance{Player: player, Queue: queue, Packets: packets, Debt: debt, Emitted: voice != 0}
+        }
+        frame := audio.TickMusPlayer(player)
+        player = frame.Player
+        debt = debt - 1
+        if !muted && frame.Notes.Count > 0 { queue = SoundtrackQueue{Notes: frame.Notes} }
+    }
+    return HostMusicAdvance{Player: player, Queue: queue, Packets: packets, Debt: debt, Emitted: voice != 0}
+}
+
+func statusValuesChanged(before play.PlayerInventory, after play.PlayerInventory) bit {
+    if before.Health != after.Health || before.Armor != after.Armor || before.ReadyWeapon != after.ReadyWeapon { return true }
+    for index := range play.AmmoCount {
+        if before.Ammo[index] != after.Ammo[index] || before.MaxAmmo[index] != after.MaxAmmo[index] { return true }
+    }
+    for index := range play.CardCount {
+        if before.Cards[index] != after.Cards[index] { return true }
+    }
+    for index := range play.WeaponCount {
+        if before.Weapons[index] != after.Weapons[index] { return true }
+    }
+    return false
+}
+
+func nextStatusFace(previous play.StatusFace, inventory play.PlayerInventory, actors play.MapActors, moved play.ActorPhysics,
+    attackHeld bit, randomValue int) play.StatusFace {
+    otherAttacker := inventory.Attacker > 0 && inventory.Attacker != actors.PlayerActors[0]
+    attackerAngle := bits<32>(0)
+    if inventory.DamageCount != 0 && otherAttacker {
+        culprit := actors.ActorAt(inventory.Attacker - 1)
+        otherAttacker = culprit.Valid
+        if culprit.Valid {
+            attackerAngle = engine.PointToAngle(moved.Body.X, moved.Body.Y, culprit.Physics.Body.X, culprit.Physics.Body.Y)
+        }
+    }
+    return play.TickStatusFace(previous, inventory, moved.Angle, attackerAngle, otherAttacker, attackHeld, randomValue)
+}
+
+func updateMessageToggle(messages play.HudMessages, enabled bit, toggle bit) (play.HudMessages, bit) {
+    if !toggle { return messages, enabled }
+    enabled = !enabled
+    label := "MESSAGE DISPLAY OFF"
+    if enabled { label = "MESSAGE DISPLAY ON" }
+    return play.QueueHudMessage(messages, label, true), enabled
+}
+
+func visibleMessage(messages play.HudMessages) string {
+    if messages.Visible { return messages.Current }
+    return ""
+}
+
+func drawCamera(level wad.BspLevel, mounts wad.Archives, actors play.MapActors, links play.ActorLinks, actorsSprites PreviewSprites,
+    x int, y int, eyeZ int, heading bits<32>, materials walls.Materials, scrolls play.LineScrolls, lights play.LevelLights,
+    weapon play.WeaponView, display CameraDisplay) CameraDraw {
+    window := previewViewWindow(display.StatusVisible, display.ViewBlocks)
+    viewHeight := window.Height
+    // Scaled compact windows can have an odd width. Leave the extra cell
+    // to the border so every column of the 3D view belongs to a pixel pair.
+    roundedWidth := display.LowDetail && window.Width >= 4 && window.Width & 1 != 0
+    if roundedWidth { window.Width = window.Width - 1 }
+    var view engine.ViewProjection
+    if display.LowDetail {
+        view = engine.NewLowDetailProjection(window.Width)
+    } else { view = engine.NewViewProjection(window.Width) }
+    view.ScreenX, view.ScreenY = window.X, window.Y
+    camera := engine.Camera{
+        X: x, Y: y, Z: eyeZ, Heading: heading,
+        View: view,
+    }
+    drawWeapon := WeaponViewVisible(weapon, mounts)
+    materials.Shade = display.Shade.WithFixedColormap(display.Inventory.FixedColormap)
+    materials.Shade.DetailShift = view.DetailShift
+    materials.Shade.ScreenX, materials.Shade.ScreenY = window.X, window.Y
+    materials.Shade.LightRows = sharedBytes("doomLightRows")
+    if roundedWidth {
+        blocks := window.Blocks
+        if blocks > 10 { blocks = 10 }
+        materials.Shade.WindowLightRows = sharedBytes("doomPairedWindowWallRows")
+        materials.Shade.WindowLightOffset = (blocks - 3) * engine.PlaneLightTableOffset
+    } else if window.Blocks < 10 {
+        materials.Shade.WindowLightRows = sharedBytes("doomWindowWallRows")
+        materials.Shade.WindowLightOffset = (window.Blocks - 3) * engine.PlaneLightTableOffset
+    }
+    materials.ExtraLight = weapon.ExtraLight
+    scene := Scene{Level: level, Camera: camera, Materials: materials, Scrolls: scrolls, Lights: lights,
+        Actors: actors, ActorLinks: links, ActorSprites: actorsSprites, ViewHeight: viewHeight}
+    if materials.Textures.Valid { scene.ColumnAngles = previewAnglesForView(camera.View) }
+    border := display.Border
+    if window.Width != Width { border = border.Draw(mounts, display.Shade, level.MapName, window) }
+    projected := engine.RenderBspFrame(scene, camera.View, camera.Heading, camera.X, camera.Y,
+        engine.BspFrame<SpritePass>{Coverage: engine.ColumnCoverage{TrackDrawSegments: actorsSprites.Count > 0 && materials.Shade.Valid},
+            Data: SpritePass{Mapped: display.Mapped, Columns: display.Columns, Geometry: display.Geometry}})
+    result, visible := projected.Coverage, projected.Data.Visible
+    if result.Failed { return CameraDraw{} }
+    columns := walls.DrawPlanesCached(camera, viewHeight, result, materials, scene.ColumnAngles, projected.Data.Columns)
+    masked := walls.MaskedPassResult{Phase: display.FuzzPhase}
+    if result.DrawSegments.Count > 0 || visible.Count > 0 {
+        masked = walls.DrawMaskedPass(result, visible, viewHeight, materials.Shade, masked.Phase)
+    }
+    if drawWeapon {
+        sector := actors.ActorAt(actors.PlayerActors[0] - 1).Sector
+        masked.Phase = DrawWeaponView(weapon, mounts, materials.Shade, lights.LightAt(sector, level.SectorLight(sector)),
+            window, display.Invisible, masked.Phase)
+    }
+    if display.StatusVisible { DrawStatusBar(mounts, display.Shade, display.Inventory, display.Face) }
+    return CameraDraw{Valid: true, FuzzPhase: masked.Phase,
+        FuzzVisible: masked.FuzzVisible || (drawWeapon && display.Invisible && materials.Shade.Valid),
+        Mapped: projected.Data.Mapped, Columns: columns, Geometry: projected.Data.Geometry, Border: border}
+}
+
+map "Original WAD BSP View" {
+    screen at (-Width / 2, -Height / 2) size (Width, Height) with { style = "solid", hold = true, slice = true }
+    place scriptBlock at (-Width / 2 - 2, ControlRow + 2) with { code = previewCameraFocus }
+    expand DoomLightBoard(-Width / 2, ControlRow + 52)
+    input forward bit at (-46, ControlRow + 2) with { key = "W", buffer = true }
+    input reverse bit at (-34, ControlRow + 2) with { key = "S", buffer = true }
+    input toggleStatus bit at (-25, ControlRow + 2) with { key = "H", buffer = true }
+    input turnLeft bit at (-16, ControlRow + 2) with { key = "A", buffer = true }
+    input turnRight bit at (0, ControlRow + 2) with { key = "D", buffer = true }
+    input strafeLeft bit at (18, ControlRow + 2) with { key = "Q", buffer = true }
+    input strafeRight bit at (32, ControlRow + 2) with { key = "E", buffer = true }
+    input use bit at (49, ControlRow + 2) with { key = "F", buffer = true }
+    input fire bit at (61, ControlRow + 2) with { key = "R", buffer = true }
+    input cycleWeapon bit at (-60, ControlRow + 2) with { key = "X", buffer = true }
+    input toggleAutomap bit at (-60, ControlRow + 5) with { key = "M", buffer = true }
+    input toggleMapGrid bit at (-46, ControlRow + 5) with { key = "G", buffer = true }
+    input toggleMapFollow bit at (-32, ControlRow + 5) with { key = "U", buffer = true }
+    input zoomMapIn bit at (-18, ControlRow + 5) with { key = "Z", buffer = true }
+    input zoomMapOut bit at (-4, ControlRow + 5) with { key = "C", buffer = true }
+    input toggleMapFull bit at (10, ControlRow + 5) with { key = "B", buffer = true }
+    input markAutomap bit at (24, ControlRow + 5) with { key = "N", buffer = true }
+    input clearAutomapMarks bit at (38, ControlRow + 5) with { key = "V", buffer = true }
+    input refreshHudMessage bit at (51, ControlRow + 5) with { key = "J", buffer = true }
+    input toggleHudMessages bit at (63, ControlRow + 5) with { key = "K", buffer = true }
+    input run bit at (-60, ControlRow + 8) with { key = "I", buffer = true }
+    input toggleSound bit at (-46, ControlRow + 8) with { key = "O", buffer = true }
+    input togglePause bit at (-32, ControlRow + 8) with { key = "P", buffer = true }
+    input toggleCampaignMenu bit at (-18, ControlRow + 8) with { key = "T", buffer = true }
+    input quickSave bit at (-4, ControlRow + 8) with { key = "Y", buffer = true }
+    input quickLoad bit at (10, ControlRow + 8) with { key = "L", buffer = true }
+    input toggleMouse bit at (24, ControlRow + 8) with { key = "9", buffer = true }
+    input strafeModifier bit at (38, ControlRow + 8) with { key = "0", buffer = true }
+    input weapon1 bit at (-56, ControlRow + 11) with { key = "1", buffer = true }
+    input weapon2 bit at (-40, ControlRow + 11) with { key = "2", buffer = true }
+    input weapon3 bit at (-24, ControlRow + 11) with { key = "3", buffer = true }
+    input weapon4 bit at (-8, ControlRow + 11) with { key = "4", buffer = true }
+    input weapon5 bit at (8, ControlRow + 11) with { key = "5", buffer = true }
+    input weapon6 bit at (24, ControlRow + 11) with { key = "6", buffer = true }
+    input weapon7 bit at (40, ControlRow + 11) with { key = "7", buffer = true }
+    input weapon8 bit at (56, ControlRow + 11) with { key = "8", buffer = true }
+    script {
+        output musicCueBus bits<8> at (-56, ControlRow + 12) with { forward = "down" } = musicCuePhase
+        output weaponCuePacket bits<12> at (-56, ControlRow + 20) = weaponCueNote
+    }
+    // Publish each host callback so the Music Arrow conductor is independent
+    // of a renderer logical tick that can span many host ticks.
+    publish host soundtrackNotes [audio.MusVoiceCount]bits<13> = musicPackets
+    place scriptSource at (-56, ControlRow + 14) facing right with { code = musicCueSource }
+    place music at (-55, ControlRow + 14) facing right with { instrument = 3, octave = 4, note = 0 }
+    expand FixedCue(-48, ControlRow + 12, 8, 5, 7)
+    expand FixedCue(-40, ControlRow + 12, 19, 3, 4)
+    expand FixedCue(-32, ControlRow + 12, 1, 3, 1)
+    expand FixedCue(-24, ControlRow + 12, 18, 3, 7)
+    expand FixedCue(-16, ControlRow + 12, 21, 3, 10)
+    expand FixedCue(-8, ControlRow + 12, 7, 4, 7)
+    expand FixedCue(0, ControlRow + 12, 3, 4, 6)
+    place scriptSource at (16, ControlRow + 16) facing right with { code = soundtrackSource }
+    place music at (17, ControlRow + 16) facing right with { octave = 4 }
+    expand SoundtrackBank(18, ControlRow + 16)
+    expand SoundtrackVoice(21, ControlRow + 16)
+    expand SoundtrackVoice(26, ControlRow + 16)
+    expand SoundtrackVoice(31, ControlRow + 16)
+    expand SoundtrackVoice(36, ControlRow + 16)
+    expand SoundtrackVoice(41, ControlRow + 16)
+    expand SoundtrackVoice(46, ControlRow + 16)
+    expand SoundtrackVoice(51, ControlRow + 16)
+    expand SoundtrackVoice(56, ControlRow + 16)
+    expand SoundtrackVoice(61, ControlRow + 16)
+    expand SoundtrackVoice(66, ControlRow + 16)
+    expand SoundtrackVoice(71, ControlRow + 16)
+    expand SoundtrackVoice(76, ControlRow + 16)
+    expand SoundtrackVoice(81, ControlRow + 16)
+    expand SoundtrackVoice(86, ControlRow + 16)
+    expand SoundtrackVoice(91, ControlRow + 16)
+    register cursor int = 0
+    register marker int = -1
+    register done bit = false
+    register archives wad.Archives = wad.Archives{}
+    register materialSource walls.Materials = walls.Materials{}
+    register blockMap wad.BlockMapInfo = wad.BlockMapInfo{}
+    register animations wad.AnimationSet = wad.AnimationSet{}
+    register scrolls play.LineScrolls = play.LineScrolls{}
+    register soundBounds play.PagedSlots<sectorSoundBounds> = play.PagedSlots<sectorSoundBounds>{}
+    register lightState play.LevelLightStep = play.LevelLightStep{}
+    register doors play.LevelDoors = play.LevelDoors{}
+    register floors play.LevelFloors = play.LevelFloors{}
+    register ceilings play.LevelCeilings = play.LevelCeilings{}
+    register actors play.MapActors = play.MapActors{}
+    register actorLinks play.ActorLinks = play.ActorLinks{}
+    register passiveActors play.PassiveActors = play.PassiveActors{}
+    register actorSprites PreviewSprites = PreviewSprites{}
+    register startTick int = 0
+    register gameTime int = 0
+    register player play.ActorPhysics = play.ActorPhysics{}
+    register inventory play.PlayerInventory = play.PlayerInventory{}
+    register weaponView play.WeaponView = play.WeaponView{}
+    register mapActors int = 0
+    register firstActive int = 0
+    register hearing PreviewHearing = PreviewHearing{}
+    register brain enemy.BrainState = enemy.BrainState{}
+    register levelExited bit = false
+    register restartPending bit = false
+    register advanceMarker int = -1
+    register campaignSkill int = previewCombatSkill
+    register newCampaignMarker int = -1
+    register newCampaignSkill int = previewCombatSkill
+    register campaignMenu play.CampaignMenu = play.CampaignMenu{}
+    register campaignMenuKeys bits<10> = 0
+    register campaignMenuPending bits<10> = 0
+    register mouseSensitivity int = play.DefaultMouseSensitivity
+    register campaignMenuBackdrop string = ""
+    register checkpoint CheckpointSlot = CheckpointSlot{}
+    register checkpointKeys bits<2> = 0
+    register intermission play.IntermissionState = play.IntermissionState{}
+    register intermissionBackdrop play.IntermissionBackdrop = play.IntermissionBackdrop{}
+    register campaignSecret bit = false
+    register previousNextMap int = 0
+    register finale play.FinaleState = play.FinaleState{}
+    register finaleCommandKeys bits<11> = 0
+    register pendingCastPress bit = false
+    register pendingVictory play.CampaignRoute = play.CampaignRoute{}
+    register finaleText wad.LumpRef = wad.LumpRef{}
+    register screenWipe PreviewWipe = PreviewWipe{}
+    register useHeld bit = false
+    // P_AimLineAttack and P_LineAttack share the last range with P_SpawnPuff across levels.
+    register lastAttackRange int = 0
+    register shareware bit = false
+    register eyeZ int = 0
+    register viewOnGround bit = false
+    register screenFuzzPhase int = 0
+    register screenFuzzVisible bit = false
+    register screenShade walls.WadShading = walls.WadShading{}
+    register statusAvailable bit = false
+    register statusHidden bit = false
+    register viewBlocks int = configuredViewBlocks
+    register lowDetail bit = LowDetail
+    register gammaLevel int = engine.DefaultDoomGamma
+    register statusKeyDown bit = false
+    register screenStatusVisible bit = false
+    register statusFace play.StatusFace = play.StatusFace{}
+    register automapActive bit = false
+    register automapReveal automap.RevealState = automap.RevealState{}
+    register keyboardLetters bits<26> = 0
+    register keyboardDigits bits<10> = 0
+    register mapView automap.View = automap.View{}
+    register mapBounds automap.Bounds = automap.Bounds{}
+    register mappedLines MappedLines = MappedLines{}
+    register textureColumns walls.ColumnCache = walls.ColumnCache{Enabled: true}
+    register renderGeometry RenderGeometry = RenderGeometry{}
+    register viewBorder ViewBorderCache = ViewBorderCache{}
+    register mapMarks AutomapMarks = AutomapMarks{}
+    register hudControlKeys bits<8> = 0
+    register hudMessages play.HudMessages = play.HudMessages{}
+    register hudMessagesEnabled bit = true
+    register gamePaused bit = false
+    register pauseKeyDown bit = false
+    register turnHeld int = 0
+    register mouseEnabled bit = false
+    register mouseKeyDown bit = false
+    register pointerX int = -1
+    register pointerY int = -1
+    register musicCuePhase bits<8> = 0
+    register weaponCueNote bits<12> = 0
+    register soundMuted bit = false
+    register soundKeyDown bit = false
+    // The game tick owns requests. The host tick owns the live MUS cursor and
+    // packet phase, so rendering work cannot slow the soundtrack transport.
+    register soundtrack audio.MusPlayer = audio.MusPlayer{}
+    register soundtrackQueue SoundtrackQueue = SoundtrackQueue{}
+    register soundtrackPaused bit = false
+    register soundtrackId int = 0
+    register soundtrackRevision int = 0
+    register soundtrackPlaying bit = false
+    register soundtrackRestore audio.MusPlayer = audio.MusPlayer{}
+    register soundtrackRestoreQueue SoundtrackQueue = SoundtrackQueue{}
+    register soundtrackRestoreId int = 0
+    register soundtrackRestoreRevision int = 0
+    register soundtrackAppliedRevision int = -1
+    register soundtrackAppliedRestore int = 0
+    register soundtrackLastMillis int = 0
+    register soundtrackMillisRemainder int = 0
+    register soundtrackTicDebt int = 0
+    register musicPackets [audio.MusVoiceCount]bits<13> = [audio.MusVoiceCount]bits<13>{}
+    tick {
+        requestedWeapon := previewWeaponNumber([numberedWeaponCount]bit{
+            weapon1, weapon2, weapon3, weapon4, weapon5, weapon6, weapon7, weapon8,
+        })
+        var soundCues bits<8>
+        var weaponSound int
+        requestedTrack := -1
+        musicPaused := soundtrackPaused
+        castActive := finale.Stage == play.FinaleCastStage
+        muted := soundMuted
+        if toggleSound && !soundKeyDown { muted = !muted }
+        next soundMuted = muted
+        next soundKeyDown = toggleSound
+        mouseActive := mouseEnabled != (toggleMouse && !mouseKeyDown && !castActive)
+        if mouseActive != mouseEnabled {
+            if mouseActive { log("Doom mouse enabled") } else { log("Doom mouse disabled") }
+        }
+        next mouseEnabled = mouseActive
+        next mouseKeyDown = toggleMouse
+        // Logic Arrows reports absolute window positions. Track the baseline
+        // while gameplay is paused so interface motion never becomes a command.
+        cursorX, cursorY := mouseX(), mouseY()
+        next pointerX = cursorX
+        next pointerY = cursorY
+        startingNew := newCampaignMarker >= 0
+        levelHalted := floors.PlatformOverflow || doors.Switches.ButtonOverflow
+        var menuKeys bits<10>
+        menuKeys[0], menuKeys[1], menuKeys[2], menuKeys[3] = toggleCampaignMenu, forward, reverse, use
+        menuKeys[4], menuKeys[5] = turnLeft, turnRight
+        menuKeys[6], menuKeys[7] = strafeLeft, strafeRight
+        menuKeys[8] = toggleMapGrid
+        menuKeys[9] = refreshHudMessage
+        menuPressed := (menuKeys & ~campaignMenuKeys) | campaignMenuPending
+        next campaignMenuKeys = menuKeys
+        if screenWipe.Melt.Active {
+            // The wipe presents frames before the next menu or game tic.
+            next campaignMenuPending = menuPressed
+            menuPressed = 0
+        } else { next campaignMenuPending = 0 }
+        menuWasOpen := campaignMenu.Stage != play.CampaignMenuClosed
+        stableCampaign := done && marker >= 0 && !restartPending && advanceMarker < 0 && !startingNew &&
+            !screenWipe.Melt.Active
+        var letters bits<26>
+        var digits bits<10>
+        reveal := automapReveal
+        if automapActive || toggleAutomap || levelExited {
+            // The host buffers physical key states. Compare them at logical tic
+            // boundaries so a held key is seen only once by the responder.
+            letters[0], letters[1], letters[2], letters[3] = turnLeft, toggleMapFull, zoomMapOut, turnRight
+            letters[4], letters[5], letters[6], letters[7] = strafeRight, use, toggleMapGrid, toggleStatus
+            letters[8], letters[9], letters[10], letters[11] = run, refreshHudMessage, toggleHudMessages, quickLoad
+            letters[12], letters[13], letters[14], letters[15] = toggleAutomap, markAutomap, toggleSound, togglePause
+            letters[16], letters[17], letters[18], letters[19] = strafeLeft, fire, reverse, toggleCampaignMenu
+            letters[20], letters[21], letters[22], letters[23] = toggleMapFollow, clearAutomapMarks, forward, cycleWeapon
+            letters[24], letters[25] = quickSave, zoomMapIn
+            digits[0], digits[1], digits[2], digits[3], digits[4] = strafeModifier, weapon1, weapon2, weapon3, weapon4
+            digits[5], digits[6], digits[7], digits[8], digits[9] = weapon5, weapon6, weapon7, weapon8, toggleMouse
+        }
+        freshLetters := letters & ~keyboardLetters
+        freshDigits := digits & ~keyboardDigits
+        if stableCampaign && automapActive && !menuWasOpen && !levelHalted && !levelExited && (freshLetters != 0 || freshDigits != 0) {
+            // Several fresh keys in one sample have no known order.
+            key := -1
+            if freshDigits == 0 {
+                switch freshLetters {
+                case 1 << 8: key = 105
+                case 1 << 3: key = 100
+                case 1 << 19: key = 116
+                }
+            }
+            reveal = automap.RespondReveal(reveal, key)
+        }
+        next keyboardLetters = letters
+        next keyboardDigits = digits
+        next automapReveal = reveal
+        revealChanged := reveal.Mode != automapReveal.Mode
+        if revealChanged { menuPressed[0] = false }
+        var saveKeys bits<2>
+        saveKeys[0], saveKeys[1] = quickSave, quickLoad
+        savePressed := saveKeys & ~checkpointKeys
+        next checkpointKeys = saveKeys
+        checkpointReady := stableCampaign && !menuWasOpen && !menuPressed[0]
+        loadCheckpoint := checkpointReady && savePressed[1]
+        saveCheckpoint := checkpointReady && !loadCheckpoint && savePressed[0] && !levelHalted && !levelExited && !inventory.Dead && blockMap.Valid
+        checkpointHold := saveCheckpoint || (loadCheckpoint && checkpoint.Valid)
+        if loadCheckpoint && !checkpoint.Valid { log("No Doom checkpoint saved") }
+        if checkpointReady && savePressed[0] && !loadCheckpoint && !saveCheckpoint { log("Doom checkpoint requires a living player in an active level") }
+        menuHold := menuWasOpen
+        var menuStep play.CampaignMenuStep
+        if menuWasOpen {
+            menuStep = play.TickCampaignMenu(campaignMenu,
+                play.CampaignMenuInput{Back: menuPressed[0], Up: menuPressed[1], Down: menuPressed[2], Confirm: menuPressed[3]})
+        } else if menuPressed[0] && stableCampaign {
+            currentLevel := wad.LoadBspLevel(Archive, marker)
+            menuStep.Menu = play.OpenCampaignMenu(archives, currentLevel.MapName.Low & 0xffffff == 0x50414d, campaignSkill)
+            menuHold = menuStep.Menu.Stage != play.CampaignMenuClosed
+            menuStep.Changed = menuHold
+            if !menuHold { log("No campaign starting map in the supplied WAD") }
+        }
+        menuVisible := menuHold && menuStep.Menu.Stage != play.CampaignMenuClosed
+        menuBackdrop := campaignMenuBackdrop
+        var menuBackgroundChanged bit
+        hideStatus := statusHidden
+        selectedBlocks := viewBlocks
+        if !checkpointHold && !menuHold && !screenWipe.Melt.Active && toggleStatus && !statusKeyDown && finale.Stage != play.FinaleCastStage {
+            hideStatus = !hideStatus
+        }
+        if menuWasOpen && menuVisible && menuPressed[4] != menuPressed[5] {
+            if menuPressed[4] {
+                if hideStatus { hideStatus = false
+                } else if selectedBlocks > 3 { selectedBlocks = selectedBlocks - 1 }
+            } else if !hideStatus {
+                if selectedBlocks < 10 { selectedBlocks = selectedBlocks + 1
+                } else { hideStatus = true }
+            }
+        }
+        viewChanged := selectedBlocks != viewBlocks
+        selectedDetail := lowDetail != (menuWasOpen && menuVisible && menuPressed[8])
+        detailChanged := selectedDetail != lowDetail
+        selectedGamma := gammaLevel
+        if menuWasOpen && menuVisible && menuPressed[9] { selectedGamma = (gammaLevel + 1) % engine.DoomGammaCount }
+        gammaChanged := selectedGamma != gammaLevel
+        menuBlocks := selectedBlocks
+        if hideStatus { menuBlocks = 11 }
+        sensitivity := mouseSensitivity
+        if menuWasOpen && menuVisible && menuPressed[6] != menuPressed[7] {
+            if menuPressed[6] && sensitivity > 0 { sensitivity = sensitivity - 1 }
+            if menuPressed[7] && sensitivity < play.MaxMouseSensitivity { sensitivity = sensitivity + 1 }
+        }
+        next mouseSensitivity = sensitivity
+        next viewBlocks = selectedBlocks
+        next lowDetail = selectedDetail
+        next gammaLevel = selectedGamma
+        next statusHidden = hideStatus
+        next statusKeyDown = toggleStatus
+        var hudKeys bits<8>
+        hudKeys[0], hudKeys[1], hudKeys[2] = toggleAutomap, toggleMapGrid, toggleMapFollow
+        hudKeys[3], hudKeys[4], hudKeys[5] = toggleMapFull, markAutomap, clearAutomapMarks
+        hudKeys[6], hudKeys[7] = refreshHudMessage, toggleHudMessages
+        hudPressed := hudKeys & ~hudControlKeys
+        if menuHold || checkpointHold { hudPressed = 0 }
+        next hudControlKeys = hudKeys
+        mapOpen := automapActive != hudPressed[0]
+        mapFollowing := mapView.Follow || mapView.Window.Width == 0
+        if hudPressed[2] { mapFollowing = !mapFollowing }
+        mapPanning := mapOpen && !mapFollowing && !menuHold
+        mapCommand := automap.ViewCommand{Grid: hudPressed[1], Follow: hudPressed[2], Full: hudPressed[3],
+            Left: mapPanning && turnLeft, Right: mapPanning && turnRight, Up: mapPanning && forward,
+            Down: mapPanning && reverse, ZoomIn: !menuHold && zoomMapIn, ZoomOut: !menuHold && zoomMapOut}
+        // P_Ticker updates the translations using leveltime before incrementing it.
+        levelTime := currentTick() - startTick - 1
+        repaint := (scrolls.Count > 0 && materialSource.Textures.Valid) || (animations.Count > 0 && levelTime % wad.AnimationTics == 0)
+        pauseCommand := stableCampaign && !levelHalted && !checkpointHold && (!menuHold || (levelExited && !menuStep.Start)) &&
+            !castActive && togglePause && !pauseKeyDown
+        pauseWorld := gamePaused != pauseCommand
+        next gamePaused = pauseWorld
+        next pauseKeyDown = togglePause
+        resumed := !levelExited && gamePaused && pauseCommand
+        if pauseCommand {
+            if pauseWorld { log("Doom paused") } else { log("Doom resumed") }
+            if soundtrack.Active || soundtrackQueue.Notes.Count > 0 { musicPaused = pauseWorld }
+        }
+        var commandKeys bits<11>
+        if levelExited {
+            commandKeys[0], commandKeys[1], commandKeys[2] = fire, use, cycleWeapon
+            commandKeys[3], commandKeys[4], commandKeys[5], commandKeys[6] = weapon1, weapon2, weapon3, weapon4
+            commandKeys[7], commandKeys[8], commandKeys[9], commandKeys[10] = weapon5, weapon6, weapon7, weapon8
+            // G_Responder consumes each new cast key. Only buttons already
+            // down on entering the cast can remain in subsequent commands.
+            if castActive { commandKeys = commandKeys & finaleCommandKeys
+            } else if menuHold { commandKeys[1] = commandKeys[1] && finaleCommandKeys[1] }
+        }
+        next finaleCommandKeys = commandKeys
+        castLetters := freshLetters & ~castHostLetters
+        if menuHold { castLetters = castLetters & ~menuNavigationLetters }
+        castPressed := castActive && !checkpointHold && (pendingCastPress || castLetters != 0 || freshDigits != 0)
+        next pendingCastPress = castPressed && screenWipe.Melt.Active
+        if saveCheckpoint {
+            saved := PreviewCheckpoint{
+                Marker: marker, Skill: campaignSkill, DidSecret: campaignSecret, PreviousNextMap: previousNextMap,
+                IntermissionPointerOn: intermission.PointerOn,
+                LevelTime: levelTime, GameTime: gameTime, Paused: gamePaused, Shareware: shareware, TurnHeld: turnHeld,
+                Player: player, EyeZ: eyeZ, Inventory: inventory, Weapon: weaponView, UseHeld: useHeld, AttackRange: lastAttackRange,
+                ViewOnGround: viewOnGround,
+                BlockMap: blockMap, Actors: actors, ActorLinks: actorLinks, PassiveActors: passiveActors,
+                MapActors: mapActors, FirstActive: firstActive, Hearing: hearing, Brain: brain,
+                Light: lightState, Doors: doors, Floors: floors, Ceilings: ceilings, Scrolls: scrolls, SoundBounds: soundBounds,
+                Materials: materialSource, Animations: animations, ActorSprites: actorSprites, Screen: captureScreen(true),
+                Shade: screenShade, FuzzPhase: screenFuzzPhase, FuzzVisible: screenFuzzVisible,
+                StatusAvailable: statusAvailable, StatusHidden: statusHidden, ViewBlocks: viewBlocks, LowDetail: lowDetail,
+                Gamma: gammaLevel,
+                StatusVisible: screenStatusVisible, StatusFace: statusFace,
+                AutomapActive: automapActive, MapView: mapView, MapBounds: mapBounds, MappedLines: mappedLines, MapMarks: mapMarks,
+                HudMessages: hudMessages, HudMessagesEnabled: hudMessagesEnabled,
+                Soundtrack: soundtrack, SoundtrackQueue: soundtrackQueue, SoundtrackId: soundtrackId,
+            }
+            next checkpoint = CheckpointSlot{Valid: true, Value: saved}
+            next startTick = startTick + 1
+            log("Doom checkpoint saved")
+        } else if checkpointHold {
+            saved := checkpoint.Value.Recall()
+            next marker = saved.Marker
+            next campaignSkill = saved.Skill
+            next campaignSecret = saved.DidSecret
+            next previousNextMap = saved.PreviousNextMap
+            // The next logical callback resumes at the saved level tic.
+            next startTick = currentTick() - saved.LevelTime
+            next gameTime = saved.GameTime
+            next gamePaused = saved.Paused
+            next shareware = saved.Shareware
+            next turnHeld = saved.TurnHeld
+            next levelExited = false
+            next intermission = play.IntermissionState{PointerOn: saved.IntermissionPointerOn}
+            next intermissionBackdrop = play.IntermissionBackdrop{}
+            next finale = play.FinaleState{}
+            next pendingVictory = play.CampaignRoute{}
+            next finaleText = wad.LumpRef{}
+
+            next player = saved.Player
+            next eyeZ = saved.EyeZ
+            next viewOnGround = saved.ViewOnGround
+            next inventory = saved.Inventory
+            next weaponView = saved.Weapon
+            next useHeld = saved.UseHeld || use
+            next lastAttackRange = saved.AttackRange
+            next blockMap = saved.BlockMap
+            next actors = saved.Actors
+            next actorLinks = saved.ActorLinks
+            next passiveActors = saved.PassiveActors
+            next mapActors = saved.MapActors
+            next firstActive = saved.FirstActive
+            next hearing = saved.Hearing
+            next brain = saved.Brain
+            next lightState = saved.Light
+            next doors = saved.Doors
+            next floors = saved.Floors
+            next ceilings = saved.Ceilings
+            next scrolls = saved.Scrolls
+            next soundBounds = saved.SoundBounds
+            if !renderGeometry.Valid || renderGeometry.Marker != saved.Marker {
+                next renderGeometry = loadRenderGeometry(wad.LoadBspLevel(Archive, saved.Marker), saved.Marker)
+            }
+
+            next materialSource = saved.Materials
+            next animations = saved.Animations
+            next actorSprites = saved.ActorSprites
+            next screenShade = saved.Shade
+            next screenFuzzPhase = saved.FuzzPhase
+            next screenFuzzVisible = saved.FuzzVisible
+            next statusAvailable = saved.StatusAvailable
+            next statusHidden = saved.StatusHidden
+            next viewBlocks = saved.ViewBlocks
+            next lowDetail = saved.LowDetail
+            next gammaLevel = saved.Gamma
+            next screenStatusVisible = saved.StatusVisible
+            next statusFace = saved.StatusFace
+            next automapActive = saved.AutomapActive
+            next mapView = saved.MapView
+            next mapBounds = saved.MapBounds
+            next mappedLines = saved.MappedLines
+            next mapMarks = saved.MapMarks
+            next hudMessages = saved.HudMessages
+            next hudMessagesEnabled = saved.HudMessagesEnabled
+            revealScreen(saved.Screen, saved.Screen, [1]int{0}, Width)
+
+            // Keep the physical Music Arrow phase bits so loading is silent.
+            next soundtrackId = saved.SoundtrackId
+            next soundtrackRestore = saved.Soundtrack
+            next soundtrackRestoreQueue = saved.SoundtrackQueue
+            next soundtrackRestoreId = saved.SoundtrackId
+            next soundtrackRestoreRevision = soundtrackRestoreRevision + 1
+            musicPaused = saved.Paused
+            log("Doom checkpoint loaded")
+        } else if screenWipe.Melt.Active {
+            // D_Display finishes the screen wipe before the next game tic.
+            next screenWipe = advancePreviewWipe(screenWipe)
+            if menuWasOpen { drawCampaignMenu(campaignMenu, menuBlocks, sensitivity, selectedDetail, selectedGamma) }
+            if !levelExited { next startTick = startTick + 1 }
+        } else if menuStep.Start || (!levelExited && (menuHold || (stableCampaign && pauseWorld))) {
+            next startTick = startTick + 1
+            enteringPause := pauseWorld && !gamePaused
+            backgroundChanged := enteringPause
+            // G_Ticker still calls ST_Ticker, AM_Ticker and HU_Ticker when
+            // P_Ticker returns early. New Game ticks the new level instead.
+            if !levelHalted && !menuStep.Start {
+                next gameTime = gameTime + 1
+                if !levelExited {
+                    lighting := lightState
+                    roll := play.MRandom(lighting.Random)
+                    lighting.Random = roll.State
+                    face := nextStatusFace(statusFace, inventory, actors, player, weaponView.AttackDown, int(roll.Value))
+                    messages, enabled := updateMessageToggle(hudMessages, hudMessagesEnabled, hudPressed[7])
+                    if mapOpen { messages = queuePreviewAutomapMessages(messages, mapView, mapMarks, mapFollowing, hudPressed) }
+                    messages = play.TickHudMessages(messages, enabled, hudPressed[6])
+                    next lightState = lighting
+                    next statusFace = face
+                    next hudMessages = messages
+                    next hudMessagesEnabled = enabled
+                    displayed := visibleMessage(messages)
+                    shade := screenShade
+                    if gammaChanged {
+                        shade = shade.WithGamma(selectedGamma)
+                        next screenShade = shade
+                        if shade.Valid && shade.PaletteRow == 0 {
+                            materials := materialSource
+                            materials.Shade = shade
+                            next materialSource = materials
+                        } else { next materialSource = previewStageGamma(materialSource, archives, selectedGamma) }
+                    }
+                    showStatus := statusAvailable && (!hideStatus || mapOpen)
+                    var base wad.BspLevel
+                    updatedMapView, updatedMapMarks := mapView, mapMarks
+                    mapChanged := mapOpen != automapActive || revealChanged
+                    if mapOpen {
+                        if mapView.Window.Width == 0 { base = wad.LoadBspLevel(Archive, marker) }
+                        var updatedMapBounds automap.Bounds
+                        updatedMapView, updatedMapBounds, updatedMapMarks =
+                            updatePreviewAutomap(base, mapView, mapBounds, mapMarks, player, automapActive, showStatus, hudPressed, mapCommand)
+                        mapChanged = mapChanged || updatedMapView.Window.X != mapView.Window.X || updatedMapView.Window.Y != mapView.Window.Y ||
+                            updatedMapView.Window.Scale != mapView.Window.Scale || updatedMapView.Grid != mapView.Grid || hudPressed[4] || hudPressed[5]
+                        next mapView = updatedMapView
+                        next mapBounds = updatedMapBounds
+                        next mapMarks = updatedMapMarks
+                    }
+                    if mapOpen != automapActive {
+                        if mapOpen { log("Doom automap opened") } else { log("Doom automap closed") }
+                        next automapActive = mapOpen
+                    }
+                    redraw := gammaChanged || mapChanged || (!mapOpen && (viewChanged || detailChanged)) || showStatus != screenStatusVisible ||
+                        (shade.Valid && displayed != visibleMessage(hudMessages))
+                    redrawFace := showStatus && face.Index != statusFace.Index
+                    backgroundChanged = redraw || redrawFace || enteringPause
+                    if redraw {
+                        if !base.Valid { base = wad.LoadBspLevel(Archive, marker) }
+                        level := play.LevelSpecials{Doors: doors, Floors: floors, Ceilings: ceilings, Lighting: lightState}.ApplyTo(base)
+                        if mapOpen {
+                            drawAutomap(updatedMapView, level, blockMap, mappedLines, player, updatedMapMarks, archives, shade,
+                                inventory.Powers[play.PowerAllMap] != 0, reveal.Mode, actors, actorLinks)
+                            if showStatus { DrawStatusBar(archives, shade, inventory, face.Index) }
+                        } else {
+                            display := CameraDisplay{Shade: shade, Border: viewBorder, Inventory: inventory, StatusVisible: showStatus,
+                                ViewBlocks: selectedBlocks, LowDetail: selectedDetail,
+                                Face: face.Index, Invisible: weaponUsesFuzz(inventory.Powers[play.PowerInvisibility]),
+                                FuzzPhase: screenFuzzPhase, Mapped: mappedLines, Columns: textureColumns, Geometry: renderGeometry}
+                            // Keep the translation chosen by the last P_UpdateSpecials.
+                            painted := drawCamera(level, archives, actors, actorLinks, actorSprites, player.Body.X, player.Body.Y,
+                                eyeZ, player.Angle, previewMaterials(materialSource, animations, levelTime - 1), scrolls, lighting.Lights, weaponView, display)
+                            if painted.Valid {
+                                next screenFuzzPhase = painted.FuzzPhase
+                                next screenFuzzVisible = painted.FuzzVisible
+                                next textureColumns = painted.Columns
+                                next renderGeometry = painted.Geometry
+                                if painted.Border.Blocks != 0 { next viewBorder = painted.Border }
+                            }
+                        }
+                        next screenStatusVisible = showStatus
+                        if displayed != "" { drawHudMessage(archives, shade, displayed) }
+                    } else if backgroundChanged {
+                        if menuWasOpen { revealScreen(menuBackdrop, menuBackdrop, [1]int{0}, Width) } else { preserveScreen() }
+                        if redrawFace { DrawStatusBar(archives, shade, inventory, face.Index) }
+                    }
+                    if backgroundChanged && pauseWorld { drawPause(archives, shade) }
+                    if backgroundChanged && menuVisible { menuBackdrop = captureScreen(false) }
+                }
+            }
+            menuBackgroundChanged = backgroundChanged
+        } else if !done || restartPending || advanceMarker >= 0 || startingNew {
+            mounts := archives
+            if mounts.Count == 0 { mounts = wad.OpenArchive(Archive) }
+            if !mounts.IndexReady() && mounts.CanIndex() { mounts = mounts.BuildIndex(ResourceIndexBatch) }
+            if mounts.IndexReady() && !mounts.SpriteIndexReady() { mounts = mounts.BuildSpriteIndex(ResourceIndexBatch) }
+            next archives = mounts
+            loadMarker := marker
+            advancing := advanceMarker >= 0
+            if advancing { loadMarker = advanceMarker }
+            if startingNew {
+                loadMarker = newCampaignMarker
+                next startTick = startTick + 1
+            }
+            if loadMarker >= 0 && (mounts.IndexReady() && mounts.SpriteIndexReady() || !mounts.CanIndex()) {
+                level := wad.LoadBspLevel(Archive, loadMarker)
+                if !level.Valid {
+                    log("Invalid classic BSP records")
+                    next done = true
+                    next restartPending = false
+                    next advanceMarker = -1
+                    next newCampaignMarker = -1
+                } else {
+                    materials := materialSource
+                    if !materials.Textures.Valid || !mounts.SnapshotIsCurrent(materials.Textures.Mounts) {
+                        materials = walls.LoadMaterials(mounts, wad.SkyTextureName(level.MapName))
+                    }
+                    materials.Shade = materials.Shade.WithGamma(selectedGamma)
+                    if DitherColors { materials.Shade = materials.Shade.WithDithering() }
+                    materials.Textures = materials.Textures.BuildNameIndex(ResourceIndexBatch)
+                    if (advancing || restartPending || startingNew) && materials.Textures.Valid {
+                        materials.Sky = wad.FindWallTexture(materials.Textures, wad.SkyTextureName(level.MapName))
+                    }
+                    if startingNew {
+                        // Warm a shared texture index while retaining the view's sky until the new map loads.
+                        cached := materials
+                        cached.Sky = materialSource.Sky
+                        next materialSource = cached
+                    } else { next materialSource = materials }
+                    if materials.Textures.NameIndexReady() || !materials.Textures.CanIndexNames() {
+                        geometry := renderGeometry
+                        if !geometry.Valid || geometry.Marker != loadMarker { geometry = loadRenderGeometry(level, loadMarker) }
+                        if !geometry.Valid {
+                            log("Invalid classic BSP records")
+                        } else {
+                            commercial := level.MapName.Low & 0xffffff == 0x50414d // MAPxx.
+                            rules := wad.ThingRules{Commercial: commercial, Skill: campaignSkill}
+                            if startingNew { rules.Skill = newCampaignSkill }
+                            rules.Fast = previewFastMonsters || rules.Skill == 4
+                            health := NewPlayerHealth
+                            carry := play.NewPlayerInventory(health[0])
+                            if advancing && !startingNew {
+                                carry = play.CampaignSpawnInventory(inventory)
+                                health[0] = carry.Health
+                            }
+                            random := lightState.Random
+                            if startingNew { random = play.RandomState{} }
+                            spawned := play.SpawnMapActors(level, rules, health, random)
+                            start := spawned.ActorAt(spawned.PlayerActors[0] - 1)
+                            if spawned.Overflow {
+                                log("Level exceeds the actor slot limit")
+                            } else if spawned.Failed {
+                                log("Cannot spawn WAD thing", spawned.RejectedThing)
+                            } else if !start.Valid {
+                                log("No player-one start in the WAD")
+                            } else {
+                                initial := start.Physics
+                                weaponStart := play.WeaponView{AttackDown: true}
+                                useDown := use || restartPending || startingNew || advancing && inventory.Dead
+                                if advancing && !startingNew && !inventory.Dead {
+                                    // P_SpawnPlayer resets the view height and
+                                    // refire, but retains the height delta and
+                                    // psprite coordinates. WI_Ticker owns the latches.
+                                    initial.ViewHeightDelta = player.ViewHeightDelta
+                                    start.Physics = initial
+                                    spawned = spawned.WithActor(spawned.PlayerActors[0], start)
+                                    weaponStart = weaponView
+                                    weaponStart.AttackDown = intermission.AttackDown
+                                    weaponStart.Refire, weaponStart.ExtraLight = 0, 0
+                                    useDown = intermission.UseDown
+                                }
+                                initialEye := initial.Body.Z + initial.ViewHeight
+                                spriteAssets := cachePreviewSprites(mounts, spawned, PreviewSprites{})
+                                blocks := wad.LoadBlockMap(level)
+                                links := play.BuildActorLinks(spawned, blocks)
+                                armed := play.SetupWeaponSprites(carry, weaponStart, start.State, spawned.Random)
+                                shade := materials.Shade
+                                if !shade.Valid { shade = walls.LoadShading(mounts).WithGamma(selectedGamma) }
+                                if DitherColors { shade = shade.WithDithering() }
+                                shade = shade.WithPalette(play.StatusPalette(armed.Inventory))
+                                hasStatus := shade.Valid && StatusBarAvailable(mounts)
+                                face := play.StartStatusFace(statusFace, armed.Inventory)
+                                display := CameraDisplay{Shade: shade, Border: viewBorder, Inventory: armed.Inventory, StatusVisible: hasStatus && !hideStatus,
+                                    ViewBlocks: selectedBlocks, LowDetail: selectedDetail, Face: face.Index,
+                                    FuzzPhase: screenFuzzPhase, Columns: textureColumns, Geometry: geometry}
+                                if mounts.Revision != archives.Revision { display.Columns = walls.ColumnCache{Enabled: true} }
+                                var rendered CameraDraw
+                                if !startingNew || blocks.Valid {
+                                    rendered = drawCamera(level, mounts, spawned, links, spriteAssets, initial.Body.X, initial.Body.Y,
+                                        initialEye, initial.Angle,
+                                        previewMaterials(materials, wad.AnimationSet{}, -1), play.LineScrolls{}, play.LevelLights{},
+                                        armed.View, display)
+                                }
+                                if rendered.Valid {
+                                    menuBackgroundChanged = true
+                                    if menuVisible { menuBackdrop = captureScreen(false) }
+                                    if startingNew {
+                                        next materialSource = materials
+                                        next campaignSkill = newCampaignSkill
+                                        next marker = loadMarker
+                                        next intermissionBackdrop = play.IntermissionBackdrop{}
+                                        log("Doom campaign started", rules.Skill, loadMarker)
+                                    }
+                                    next gamePaused = false
+                                    musicPaused = false
+                                    requestedTrack = previewLevelMusic(level.MapName)
+                                    next screenShade = shade
+                                    next statusAvailable = hasStatus
+                                    next screenStatusVisible = display.StatusVisible
+                                    next statusFace = face
+                                    next screenFuzzPhase = rendered.FuzzPhase
+                                    next screenFuzzVisible = rendered.FuzzVisible
+                                    next textureColumns = rendered.Columns
+                                    next renderGeometry = rendered.Geometry
+                                    if rendered.Border.Blocks != 0 { next viewBorder = rendered.Border }
+                                    next automapActive = false
+                                    next mapView = automap.View{}
+                                    next mappedLines = rendered.Mapped
+                                    next mapMarks = AutomapMarks{}
+                                    next hudMessages = play.HudMessages{}
+                                    if advancing {
+                                        next marker = loadMarker
+                                        log("Doom next level rendered")
+                                    } else if restartPending { log("Doom level restarted") } else if !startingNew {
+                                        log("Classic WAD BSP frame rendered")
+                                    }
+                                    next blockMap = blocks
+                                    spawnedLights := play.LoadLevelLights(level, armed.Random)
+                                    if done && (restartPending || advancing || startingNew) {
+                                        started := beginPreviewWipe(spawnedLights.Random)
+                                        spawnedLights.Random = started.Random
+                                        next screenWipe = started.Wipe
+                                    }
+                                    next lightState = spawnedLights
+                                    if materials.Shade.Valid {
+                                        next animations = wad.LoadAnimations(materials.Flats, materials.Textures)
+                                    }
+                                    next scrolls = play.LoadLineScrolls(level)
+                                    next soundBounds = loadSectorSoundBounds(level)
+                                    next doors = play.LoadTimedDoors(level)
+                                    next actors = spawned
+                                    next mapActors = spawned.Count
+                                    next firstActive = initialPreviewThinker(spawned)
+                                    next actorLinks = links
+                                    next passiveActors = play.SelectPassiveActors(spawned)
+                                    next actorSprites = spriteAssets
+                                    next startTick = currentTick()
+                                    next player = initial
+                                    next inventory = armed.Inventory
+                                    next weaponView = armed.View
+                                    next shareware = !commercial && ((level.MapName.Low >> 8) & 255) == 49 &&
+                                        !mounts.Find(wad.LumpName{Low: 0x314d3245}).Valid &&
+                                        !mounts.Find(wad.LumpName{Low: 0x314d3345}).Valid &&
+                                        !mounts.Find(wad.LumpName{Low: 0x314d3445}).Valid
+                                    next eyeZ = initialEye
+                                    next useHeld = useDown
+                                    if restartPending || advancing || startingNew {
+                                        next floors = play.LevelFloors{}
+                                        next ceilings = play.LevelCeilings{}
+                                        next hearing = PreviewHearing{}
+                                        // Native A_BrainSpit keeps its cadence across level loads. Its target handles belong to this level.
+                                        next brain = enemy.BrainState{EasyTurn: brain.EasyTurn}
+                                        next turnHeld = 0
+                                        next levelExited = false
+                                        next intermission = play.IntermissionState{PointerOn: intermission.PointerOn}
+                                        next finale = play.FinaleState{}
+                                        next pendingVictory = play.CampaignRoute{}
+                                        next finaleText = wad.LumpRef{}
+                                        if restartPending || startingNew || inventory.Dead { next campaignSecret = false }
+                                    }
+                                } else if startingNew && !blocks.Valid {
+                                    log("Doom campaign level has no valid BLOCKMAP")
+                                } else {
+                                    log("Invalid classic BSP records")
+                                }
+                            }
+                        }
+                        next done = true
+                        next restartPending = false
+                        next advanceMarker = -1
+                        next newCampaignMarker = -1
+                    }
+                }
+            } else if marker < 0 {
+                count := wad.DirectoryCount(Archive)
+                if count < 0 {
+                    log("Expected an IWAD or PWAD with a valid directory")
+                    next done = true
+                } else {
+                    found := wad.FindLevel(Archive, wad.LE32(Archive, 8), count, cursor)
+                    if found >= 0 {
+                        if wad.LE32(Archive, 0) == wad.IwadSignature {
+                            commercial := wad.LE32(Archive, found + 8) & 0xdfdfdf == 0x50414d
+                            opening := play.CampaignOpeningMarker(mounts, commercial)
+                            if opening >= 0 { found = opening }
+                        }
+                        next marker = found
+                    } else if cursor + wad.SearchBatch >= count {
+                        log("No classic Doom-format level in WAD")
+                        next done = true
+                    } else {
+                        next cursor = cursor + wad.SearchBatch
+                    }
+                }
+            }
+        } else if levelExited {
+            stageMaterials := materialSource
+            if gammaChanged || (selectedGamma != engine.DefaultDoomGamma && !stageMaterials.Shade.Valid && screenShade.Valid) {
+                stageMaterials = previewStageGamma(stageMaterials, archives, selectedGamma)
+                next materialSource = stageMaterials
+            }
+            if pendingVictory.Valid {
+                log("Doom episode finale requested")
+                opening := openPreviewFinale(archives, stageMaterials, pendingVictory, lightState.Random, pauseWorld)
+                next pendingVictory = play.CampaignRoute{}
+                next finale = opening.State
+                next finaleText = opening.Text
+                next screenWipe = opening.Wipe
+                if opening.Wipe.After != "" {
+                    menuBackgroundChanged = true
+                    if menuVisible { menuBackdrop = opening.Wipe.After }
+                }
+                lighting := lightState
+                lighting.Random = opening.Random
+                next lightState = lighting
+                next gameTime = gameTime + 1
+                requestedTrack = opening.Music
+            } else if intermission.Stage > play.IntermissionInactive && intermission.Stage < play.IntermissionDone {
+                // BTS_PAUSE replaces the command. WI_checkForAccelerate
+                // still reads its low bit as BT_ATTACK.
+                advanced := play.TickIntermission(intermission, commandKeys[0] || pauseCommand, commandKeys[1] && !pauseCommand)
+                if advanced.Sound != 0 { soundCues = soundCues | cueStage }
+                backdrop := play.TickIntermissionBackdrop(intermissionBackdrop, intermission, advanced)
+                next gameTime = gameTime + 1
+                if advanced.BackgroundTics == 1 {
+                    // WI_Ticker selects music on its first tic. Present that
+                    // updated state and start the wipe from the last level frame.
+                    requestedTrack = audio.IntermissionMusic(advanced.Route.Commercial)
+                    if drawIntermission(archives, stageMaterials.Shade, advanced, backdrop, pauseWorld) {
+                        menuBackgroundChanged = true
+                        if menuVisible { menuBackdrop = captureScreen(false) }
+                        started := beginPreviewWipe(backdrop.Random)
+                        backdrop.Random = started.Random
+                        next screenWipe = started.Wipe
+                    }
+                } else if (advanced.Changed || backdrop.Changed || pauseCommand || gammaChanged) && advanced.Stage != play.IntermissionDone {
+                    menuBackgroundChanged = drawIntermission(archives, stageMaterials.Shade, advanced, backdrop, pauseWorld)
+                    if menuVisible && menuBackgroundChanged { menuBackdrop = captureScreen(false) }
+                }
+                // WI_drawNoState forces the pointer on, and WI_initShowNextLoc
+                // preserves that value until the new intermission's first blink.
+                if menuBackgroundChanged && advanced.Stage == play.IntermissionDelay { advanced.PointerOn = true }
+                next intermission = advanced
+                if advanced.Stage == play.IntermissionDone {
+                    route := advanced.Route
+                    next campaignSecret = route.DidSecret || route.SecretExit
+                    switch route.Finale {
+                    case play.CampaignStory, play.CampaignCast:
+                        log("Doom story finale requested")
+                        opening := openPreviewFinale(archives, stageMaterials, route, backdrop.Random, pauseWorld)
+                        requestedTrack = opening.Music
+                        next finale = opening.State
+                        next finaleText = opening.Text
+                        next screenWipe = opening.Wipe
+                        if opening.Wipe.After != "" {
+                            menuBackgroundChanged = true
+                            if menuVisible { menuBackdrop = opening.Wipe.After }
+                        }
+                        backdrop.Random = opening.Random
+                    default:
+                        target := campaignMarker(archives, route)
+                        if target < 0 { log("Doom next level is missing", route.Episode + 1, route.NextMap + 1) }
+                        next advanceMarker = target
+                    }
+                }
+                next intermissionBackdrop = backdrop
+                if backdrop.Random.MenuIndex != lightState.Random.MenuIndex {
+                    menuLight := lightState
+                    menuLight.Random = backdrop.Random
+                    next lightState = menuLight
+                }
+            } else if finale.Stage != play.FinaleInactive {
+                next gameTime = gameTime + 1
+                ending := play.TickFinale(finale, commandKeys != 0 || pauseCommand, castPressed)
+                cue := previewSoundCue(ending.Sound)
+                soundCues = soundCues | cue
+                if cue == cueWeapon { weaponSound = ending.Sound }
+                if ending.Music != 0 {
+                    requestedTrack = ending.Music
+                    if soundtrackId != requestedTrack { soundCues = soundCues | cueStage }
+                }
+                next finale = ending
+                if ending.Stage == play.FinaleCastStage && finale.Stage != play.FinaleCastStage {
+                    log("Doom cast finale requested")
+                }
+                if ending.Changed || pauseCommand || gammaChanged {
+                    drawn := drawFinale(archives, stageMaterials, ending, finaleText, pauseWorld)
+                    menuBackgroundChanged = drawn
+                    if drawn && menuVisible { menuBackdrop = captureScreen(false) }
+                    if drawn && ending.Wipe {
+                        started := beginPreviewWipe(lightState.Random)
+                        menuLight := lightState
+                        menuLight.Random = started.Random
+                        next lightState = menuLight
+                        next screenWipe = started.Wipe
+                    }
+                }
+                if ending.Advance {
+                    route := ending.Route
+                    target := campaignMarker(archives, route)
+                    if target < 0 { log("Doom next level is missing", route.Episode + 1, route.NextMap + 1) }
+                    next advanceMarker = target
+                }
+            }
+        } else if levelHalted {
+            // Freeze the failed tic while input can still load a checkpoint or start a campaign.
+            next startTick = startTick + 1
+        } else if blockMap.Valid || doors.Count > 0 || floors.Count > 0 || ceilings.Count > 0 ||
+            doors.Switches.ButtonCount > 0 || lightState.Lights.ThinkerCount > 0 || passiveActors.Count > 0 || repaint ||
+            scrolls.Count > 0 || screenFuzzVisible || statusAvailable || mapOpen || automapActive || hudMessages.Tics > 0 || hudPressed[6] || hudPressed[7] {
+            // G_BuildTiccmd replaces the buttons with the pause special and keeps movement.
+            commandUse := use && !resumed
+            base := wad.LoadBspLevel(Archive, marker)
+            lighting := lightState
+            lighting.Changed = false
+            state := play.LevelSpecials{Doors: doors, Lighting: lighting, Floors: floors, Ceilings: ceilings}
+            level := state.ApplyTo(base)
+            skill := campaignSkill
+            combatRules := play.CombatRules{Skill: skill, Fast: previewFastMonsters || skill == 4}
+            respawn := previewRespawnMonsters || skill == 4
+            contacts := play.PlayerContacts{Handle: actors.PlayerActors[0], Actors: actors, Links: actorLinks,
+                Inventory: inventory, Rules: play.PickupRules{Skill: skill, Commercial: base.MapName.Low & 0xffffff == 0x50414d},
+                Telefrag: PreviewWalkoverTelefrag{Blocks: blockMap}, CustomTelefrag: true, AttackRange: lastAttackRange}
+            frame := PreviewTick{Valid: true, Actor: player, EyeZ: eyeZ, Level: level, Specials: state, Contacts: contacts}
+            heldWeapon, damaged := weaponView, firstActive
+            heard := hearing
+            bossBrain := brain
+            attackRange := lastAttackRange
+            combatChanged, combatFailed := false, false
+            restartLevel := false
+            onGround := viewOnGround
+            var gameplayCues bits<8>
+            messages, messagesEnabled := updateMessageToggle(hudMessages, hudMessagesEnabled, hudPressed[7])
+            if mapOpen { messages = queuePreviewAutomapMessages(messages, mapView, mapMarks, mapFollowing, hudPressed) }
+            passiveChanged, passiveSpriteChanged, passiveLinksChanged := false, false, false
+            if blockMap.Valid {
+                dx, dy := 0, 0
+                if mouseActive && mouseEnabled && !mapOpen && !automapActive && !resumed &&
+                    pointerX >= 0 && pointerY >= 0 && cursorX >= 0 && cursorY >= 0 {
+                    dx = play.ScalePlayerMouseDelta(cursorX - pointerX, sensitivity)
+                    dy = play.ScalePlayerMouseDelta(pointerY - cursorY, sensitivity)
+                }
+                keys := play.PlayerMoveKeys{Forward: forward && !mapPanning, Reverse: reverse && !mapPanning,
+                    TurnLeft: turnLeft && !mapPanning, TurnRight: turnRight && !mapPanning,
+                    StrafeLeft: strafeLeft, StrafeRight: strafeRight, Run: run, Strafe: strafeModifier}
+                command, held := play.BuildPlayerMoveCommand(keys, turnHeld, dx, dy)
+                next turnHeld = held
+                actor := player
+                playerActor := actors.ActorAt(contacts.Handle - 1)
+                if actor.Body.Flags & play.ActorJustAttacked != 0 {
+                    actor.Body.Flags = actor.Body.Flags & ~play.ActorJustAttacked
+                    command = play.PlayerMoveCommand{Forward: 100}
+                }
+                if !inventory.Dead {
+                    // The body still reads the original command for friction while stunned.
+                    if playerActor.ReactionTime != 0 {
+                        playerActor.ReactionTime = playerActor.ReactionTime - 1
+                    } else {
+                        onGround = actor.Body.Z <= actor.Body.Floor
+                        actor = play.ApplyPlayerMoveCommand(actor, command)
+                        playerActor = play.BeginPlayerWalk(playerActor, command)
+                    }
+                }
+                var view play.PlayerView
+                // P_CalcHeight uses the prior P_MovePlayer result while reaction time expires.
+                if !inventory.Dead { view = play.CalculatePlayerViewOnGround(actor, levelTime, true, inventory.Cheats & play.CheatNoMomentum != 0, onGround) }
+                playerActor.Physics = actor
+                combat := readPreviewCombat(base, frame, actors.WithActor(contacts.Handle, playerActor), heldWeapon,
+                    damaged, mapActors, heard, bossBrain, combatRules, respawn)
+                combat.GameTic, combat.World.AttackRange = gameTime, attackRange
+                if !inventory.Dead {
+                    combat = tickPreviewPlayerSector(combat, blockMap, contacts.Handle, levelTime)
+                    if !combat.Failed && !resumed && requestedWeapon != play.WeaponNoChange {
+                        combat.World.Players[0] = play.SelectPlayerWeapon(combat.World.Players[0], requestedWeapon,
+                            contacts.Rules.Commercial, shareware)
+                    }
+                }
+                if !combat.Failed && commandUse && !useHeld && !inventory.Dead {
+                    combat.Specials = combat.Specials.WithActorOrder(combat.World.Actors)
+                    combat.Specials.Lighting.Random = combat.World.Random
+                    useResult := play.UseLevelSpecialWithInventory(combat.Level, blockMap, combat.Specials, actor, combat.World.Players[0])
+                    combat.Specials = useResult.State
+                    combat.Failed = combat.Specials.LimitExceeded()
+                    combat.World.Actors = combat.World.Actors.WithSectorOrder(combat.Specials)
+                    combat.Level = combat.Specials.ApplyTo(base)
+                    combat.World.Random = combat.Specials.Lighting.Random
+                    gameplayCues = gameplayCues | previewSoundCue(useResult.Sound)
+                    if useResult.MissingKey {
+                        messages = play.QueueHudMessage(messages, missingKeyHudMessage(useResult.Key), false)
+                        switch useResult.Key {
+                        case play.CardBlue: log("Blue key required")
+                        case play.CardYellow: log("Yellow key required")
+                        case play.CardRed: log("Red key required")
+                        }
+                    }
+                }
+                if !combat.Failed {
+                    cycle := cycleWeapon && !resumed && requestedWeapon == play.WeaponNoChange
+                    combat = tickPreviewWeapon(base, combat, blockMap, fire && !resumed, cycle,
+                        levelTime, view.Bob, contacts.Rules.Commercial, shareware)
+                    if !combat.Failed {
+                        if inventory.Dead {
+                            death := play.TickPlayerDeath(combat.World, contacts.Handle, levelTime, commandUse)
+                            combat.World, view, restartLevel, onGround = death.World, death.View, death.Reborn, death.OnGround
+                        } else { combat.World = play.TickLivePlayerCounters(combat.World, contacts.Handle) }
+                    }
+                }
+                if !combat.Failed {
+                    stepped := tickPreviewWorldActors(combat, blockMap, command, view, contacts, passiveActors, levelTime)
+                    combat = stepped.Thinkers.Combat
+                    frame.EyeZ = stepped.EyeZ
+                    frame.Contacts.PickupMessage, frame.Contacts.PickupSound = stepped.PickupMessage, stepped.PickupSound
+                    frame.Contacts.Removed, frame.Contacts.LinksChanged = stepped.Removed, stepped.LinksChanged
+                    passiveChanged, passiveSpriteChanged, passiveLinksChanged =
+                        stepped.Thinkers.Changed, stepped.Thinkers.SpriteChanged, stepped.Thinkers.LinksChanged
+                }
+                frame.Valid, combatFailed = !combat.Failed, combat.Failed
+                if combat.Specials.LimitExceeded() { frame.Specials = combat.Specials }
+                if frame.Valid {
+                    gameplayCues = gameplayCues | combat.Cues
+                    if combat.WeaponSound != 0 { weaponSound = combat.WeaponSound }
+                    frame.Actor = combat.World.Actors.ActorAt(contacts.Handle - 1).Physics
+                    frame.Contacts.Actors, frame.Contacts.Links, frame.Contacts.Inventory =
+                        combat.World.Actors, combat.World.Links, combat.World.Players[0]
+                    combat.Specials.Lighting.Random = combat.World.Random
+                    frame.Level, frame.Specials = combat.Level, combat.Specials
+                    heldWeapon, damaged, combatChanged = combat.View, combat.FirstActive, combat.Changed
+                    heard, bossBrain = combat.Hearing, combat.Brain
+                    attackRange = combat.World.AttackRange
+                    frame.Contacts.AttackRange = attackRange
+                }
+            }
+            if frame.Valid && !blockMap.Valid && passiveActors.Count > 0 {
+                passiveFrame := play.TickPassiveActors(frame.Contacts.Actors, passiveActors, frame.Contacts.Links)
+                frame.Valid, combatFailed = !passiveFrame.Failed, passiveFrame.Failed
+                frame.Contacts.Actors, frame.Contacts.Links = passiveFrame.Actors, passiveFrame.Links
+                passiveChanged, passiveSpriteChanged, passiveLinksChanged = passiveFrame.Changed, passiveFrame.SpriteChanged, passiveFrame.LinksChanged
+            }
+            moved := frame.Actor
+            level = frame.Level
+            used := frame.Specials
+            lighting = frame.Specials.Lighting
+            valid, moverChanged := frame.Valid, false
+            hasMovers := used.Doors.Count > 0 || used.Floors.Count > 0 || used.Ceilings.Count > 0
+            hasSpawnedActors := blockMap.Valid && frame.Contacts.Actors.TransientFirst() != 0
+            if frame.Valid && !used.LimitExceeded() && (hasMovers || hasSpawnedActors || lighting.Lights.ThinkerCount > 0) {
+                if blockMap.Valid && (hasMovers || hasSpawnedActors) {
+                    combat := readPreviewCombat(base, frame, frame.Contacts.Actors, heldWeapon,
+                        damaged, mapActors, heard, bossBrain, combatRules, respawn)
+                    combat.GameTic, combat.World.AttackRange = gameTime, attackRange
+                    stepped := tickPreviewDynamicThinkers(combat, blockMap, levelTime)
+                    combat = stepped.Combat
+                    valid, combatFailed, moverChanged = !combat.Failed, combat.Failed, stepped.MoverChanged
+                    used, level = combat.Specials, combat.Level
+                    if valid {
+                        moved = combat.World.Actors.ActorAt(frame.Contacts.Handle - 1).Physics
+                        frame.Contacts.Actors, frame.Contacts.Links = combat.World.Actors, combat.World.Links
+                        frame.Contacts.Inventory = combat.World.Players[0]
+                        lighting = used.Lighting
+                        lighting.Random = combat.World.Random
+                        heldWeapon, damaged = combat.View, combat.FirstActive
+                        heard, bossBrain = combat.Hearing, combat.Brain
+                        attackRange = combat.World.AttackRange
+                        combatChanged = combatChanged || combat.Changed
+                        if stepped.PickupMessage != 0 { frame.Contacts.PickupMessage = stepped.PickupMessage }
+                        if stepped.PickupSound != 0 { frame.Contacts.PickupSound = stepped.PickupSound }
+                        gameplayCues = gameplayCues | combat.Cues
+                        if combat.WeaponSound != 0 { weaponSound = combat.WeaponSound }
+                        gameplayCues = gameplayCues | previewMoverCues(level, moved, soundBounds, stepped.Sounds)
+                    }
+                } else {
+                    movers := play.TickLevelMoversAt(base, blockMap, used, moved.Body, levelTime)
+                    valid, moverChanged, used = movers.Valid, movers.Changed, movers.State
+                    moved.Body = movers.Player
+                    lighting = used.Lighting
+                    gameplayCues = gameplayCues | previewMoverCues(level, moved, soundBounds, movers.Sounds)
+                }
+            }
+            switchChanged := used.Doors.Switches.Revision != doors.Switches.Revision
+            surfaceChanged := used.Floors.Revision != floors.Revision
+            if moverChanged || switchChanged || surfaceChanged { level = used.ApplyTo(base) }
+            if used.Doors.Switches.ButtonOverflow {
+                log("P_StartButton: no button slots left!")
+                next doors = used.Doors
+                next startTick = startTick + 1
+                levelHalted = true
+            } else if used.Floors.PlatformOverflow {
+                log("Level exceeds Doom's active platform limit")
+                next floors = used.Floors
+                next startTick = startTick + 1
+                levelHalted = true
+            } else if valid {
+                cameraZ := frame.EyeZ
+                if moved.Body.Z != frame.Actor.Body.Z || moved.Body.Ceiling != frame.Actor.Body.Ceiling {
+                    cameraZ = cameraZ + moved.Body.Z - frame.Actor.Body.Z
+                    limit := moved.Body.Ceiling - 4 * engine.FracUnit
+                    if cameraZ > limit { cameraZ = limit }
+                }
+                actorFrame := play.PassiveActorFrame{Actors: frame.Contacts.Actors, Links: frame.Contacts.Links,
+                    Changed: passiveChanged, SpriteChanged: passiveSpriteChanged, LinksChanged: passiveLinksChanged}
+                scrolled := scrolls
+                if !actorFrame.Failed {
+                    // P_UpdateSpecials advances scrolling after the level thinkers.
+                    scrolled = scrolls.Advance()
+                    revision := used.Doors.Switches.Revision
+                    used.Doors = used.Doors.TickButtonTimers(base)
+                    if used.Doors.Switches.Revision != revision { level = used.ApplyTo(base) }
+                }
+                switchChanged = used.Doors.Switches.Revision != doors.Switches.Revision
+                surfaceChanged = used.Floors.Revision != floors.Revision
+                changed := moved.Body.X != player.Body.X || moved.Body.Y != player.Body.Y || moved.Angle != player.Angle || cameraZ != eyeZ
+                weaponChanged := WeaponViewChanged(weaponView, heldWeapon, archives) ||
+                    (materialSource.Shade.Valid && weaponView.ExtraLight != heldWeapon.ExtraLight)
+                invisible := weaponUsesFuzz(frame.Contacts.Inventory.Powers[play.PowerInvisibility])
+                invisibilityChanged := invisible != weaponUsesFuzz(inventory.Powers[play.PowerInvisibility])
+                fixedColormap := frame.Contacts.Inventory.FixedColormap
+                spriteAssets := actorSprites
+                if actorFrame.SpriteChanged || combatChanged { spriteAssets = cachePreviewSprites(archives, actorFrame.Actors, actorSprites) }
+                menuRoll := play.MRandom(lighting.Random)
+                lighting.Random = menuRoll.State
+                face := nextStatusFace(statusFace, frame.Contacts.Inventory, actorFrame.Actors, moved, heldWeapon.AttackDown, int(menuRoll.Value))
+                palette := play.StatusPalette(frame.Contacts.Inventory)
+                if palette >= screenShade.Palettes.Count { palette = 0 }
+                changedPalette := palette != screenShade.PaletteRow
+                shade := screenShade
+                if changedPalette { shade = screenShade.WithPalette(palette) }
+                showStatus := statusAvailable && (!hideStatus || mapOpen)
+                changedStatus := showStatus != screenStatusVisible || (showStatus &&
+                    (face.Index != statusFace.Index || statusValuesChanged(inventory, frame.Contacts.Inventory)))
+                if frame.Contacts.PickupMessage != play.PickupMessageNone {
+                    messages = play.QueueHudMessage(messages, pickupHudMessage(frame.Contacts.PickupMessage), false)
+                }
+                messages = play.TickHudMessages(messages, messagesEnabled, hudPressed[6])
+                previousMessage, displayedMessage := visibleMessage(hudMessages), visibleMessage(messages)
+                redrawCamera := automapActive || changed || repaint || lighting.Changed || moverChanged || switchChanged ||
+                    surfaceChanged || actorFrame.Changed || frame.Contacts.Removed || combatChanged || weaponChanged ||
+                    fixedColormap != inventory.FixedColormap || invisibilityChanged || screenFuzzVisible || changedPalette || changedStatus ||
+                    viewChanged || gamePaused || (shade.Valid && previousMessage != displayedMessage)
+                rendered := CameraDraw{Valid: true, FuzzPhase: screenFuzzPhase, FuzzVisible: screenFuzzVisible, Mapped: mappedLines}
+                updatedMapView, updatedMapBounds, updatedMapMarks := mapView, mapBounds, mapMarks
+                if !actorFrame.Failed && mapOpen {
+                    updatedMapView, updatedMapBounds, updatedMapMarks =
+                        updatePreviewAutomap(level, mapView, mapBounds, mapMarks, moved, automapActive, showStatus, hudPressed, mapCommand)
+                    allMap := frame.Contacts.Inventory.Powers[play.PowerAllMap] != 0
+                    drawAutomap(updatedMapView, level, blockMap, mappedLines, moved, updatedMapMarks, archives, shade, allMap,
+                        reveal.Mode, actorFrame.Actors, actorFrame.Links)
+                    if showStatus { DrawStatusBar(archives, shade, frame.Contacts.Inventory, face.Index) }
+                } else if !actorFrame.Failed && redrawCamera {
+                    display := CameraDisplay{Shade: shade, Border: viewBorder, Inventory: frame.Contacts.Inventory, StatusVisible: showStatus,
+                        ViewBlocks: selectedBlocks, LowDetail: selectedDetail, Face: face.Index,
+                        Invisible: invisible, FuzzPhase: screenFuzzPhase,
+                        Mapped: mappedLines, Columns: textureColumns,
+                        Geometry: renderGeometry}
+                    rendered = drawCamera(level, archives, actorFrame.Actors, actorFrame.Links, spriteAssets,
+                        moved.Body.X, moved.Body.Y, cameraZ, moved.Angle,
+                        previewMaterials(materialSource, animations, levelTime), scrolled, lighting.Lights, heldWeapon, display)
+                    if rendered.Valid {
+                        next textureColumns = rendered.Columns
+                        next renderGeometry = rendered.Geometry
+                        if rendered.Border.Blocks != 0 { next viewBorder = rendered.Border }
+                    }
+                }
+                if !actorFrame.Failed && rendered.Valid {
+                    if scrolls.Count > 0 { next scrolls = scrolled }
+                    gameplayCues = gameplayCues | previewMoverCues(level, moved, soundBounds, used.Doors.Sounds)
+                    soundCues = soundCues | gameplayCues | previewSoundCue(frame.Contacts.PickupSound)
+                    if (mapOpen || redrawCamera) && displayedMessage != "" { drawHudMessage(archives, shade, displayedMessage) }
+                    next hudMessages = messages
+                    next hudMessagesEnabled = messagesEnabled
+                    if mapOpen != automapActive {
+                        if mapOpen { log("Doom automap opened") } else { log("Doom automap closed") }
+                        next automapActive = mapOpen
+                    }
+                    if mapOpen {
+                        next mapView = updatedMapView
+                        next mapBounds = updatedMapBounds
+                        next mapMarks = updatedMapMarks
+                    } else { next mappedLines = rendered.Mapped }
+                    if changedPalette { next screenShade = shade }
+                    next screenStatusVisible = showStatus
+                    next statusFace = face
+                    next screenFuzzPhase = rendered.FuzzPhase
+                    next screenFuzzVisible = rendered.FuzzVisible
+                    next player = moved
+                    next eyeZ = cameraZ
+                    next viewOnGround = onGround
+                    next gameTime = gameTime + 1
+                    next useHeld = commandUse
+                    if blockMap.Valid {
+                        next inventory = frame.Contacts.Inventory
+                        next weaponView = heldWeapon
+                        next firstActive = damaged
+                        next hearing = heard
+                        next brain = bossBrain
+                        next lastAttackRange = attackRange
+                    }
+                    if passiveActors.Count > 0 || blockMap.Valid { next actors = actorFrame.Actors }
+                    if actorFrame.LinksChanged || frame.Contacts.LinksChanged || combatChanged { next actorLinks = actorFrame.Links }
+                    if actorFrame.SpriteChanged || combatChanged { next actorSprites = spriteAssets }
+                    if used.Doors.Count > 0 || used.Doors.UsedCount > 0 || used.Doors.NextMover != doors.NextMover ||
+                        used.Floors.Count > 0 || used.Ceilings.Count > 0 ||
+                        doors.Switches.ButtonCount > 0 || switchChanged { next doors = used.Doors.ClearSounds() }
+                    if used.Floors.Count > 0 || used.Floors.History.LastRelease != floors.History.LastRelease ||
+                        used.Floors.Revision != floors.Revision || used.Floors.ClearedSpecials.Count != floors.ClearedSpecials.Count { next floors = used.Floors }
+                    if used.Ceilings.Count > 0 || ceilings.Count > 0 { next ceilings = used.Ceilings }
+                    if lighting.Lights.Count > 0 ||
+                        lighting.Random.GameplayIndex != lightState.Random.GameplayIndex ||
+                        lighting.Random.MenuIndex != lightState.Random.MenuIndex { next lightState = lighting }
+                    if restartLevel {
+                        next restartPending = true
+                    } else if used.ExitRequested {
+                        soundCues = soundCues | cueStage
+                        if used.SecretExit { log("Doom secret level exit requested") } else { log("Doom level exit requested") }
+                        next levelExited = true
+                        next automapActive = false
+                        route := play.PlanCampaignRoute(base.MapName, used.SecretExit, campaignSecret, previousNextMap)
+                        handle := actorFrame.Actors.PlayerActors[0]
+                        finished := play.FinishCampaignPlayer(frame.Contacts.Inventory, actorFrame.Actors.ActorAt(handle - 1), heldWeapon)
+                        next inventory = finished.Inventory
+                        next weaponView = finished.View
+                        next actors = actorFrame.Actors.WithActor(handle, finished.Actor)
+                        if route.Valid {
+                            if route.Finale == play.CampaignVictory {
+                                next pendingVictory = route
+                            } else {
+                                score := campaignScore(base, actorFrame.Actors, finished.Inventory, levelTime + 1, route.ParTics)
+                                summary := play.StartIntermission(route, score, heldWeapon.AttackDown, commandUse)
+                                summary.PointerOn = intermission.PointerOn
+                                backdrop := play.StartIntermissionBackdrop(summary, lighting.Random)
+                                next intermission = summary
+                                next intermissionBackdrop = backdrop
+                                if backdrop.Random.MenuIndex != lighting.Random.MenuIndex {
+                                    lighting.Random = backdrop.Random
+                                    next lightState = lighting
+                                }
+                                next previousNextMap = route.NextMap
+                            }
+                        }
+                    }
+                } else {
+                    if combatFailed { log("WAD preview combat could not finish the tic") } else {
+                        log("WAD preview could not render the updated frame")
+                    }
+                    next blockMap = wad.BlockMapInfo{}
+                    next animations = wad.AnimationSet{}
+                    next scrolls = play.LineScrolls{}
+                    next lightState = play.LevelLightStep{}
+                    next doors = play.LevelDoors{}
+                    next floors = play.LevelFloors{}
+                    next ceilings = play.LevelCeilings{}
+                    next passiveActors = play.PassiveActors{}
+                }
+            } else {
+                if combatFailed { log("WAD preview combat could not finish the tic") } else {
+                    log("Invalid BLOCKMAP data during player movement")
+                }
+                next blockMap = wad.BlockMapInfo{}
+            }
+        }
+        // D_Display draws the menu over the latest stage, including a melt.
+        // Keep its clean target so dismissal never restores an earlier scene.
+        if menuHold && !screenWipe.Melt.Active {
+            next campaignMenu = menuStep.Menu
+            if !levelExited { next useHeld = use }
+            if !menuWasOpen {
+                if !menuBackgroundChanged { menuBackdrop = captureScreen(true) }
+                log("Doom campaign menu opened")
+            }
+            if menuVisible {
+                next campaignMenuBackdrop = menuBackdrop
+                if menuStep.Changed || menuBackgroundChanged || viewChanged || detailChanged || gammaChanged ||
+                    hideStatus != statusHidden || sensitivity != mouseSensitivity {
+                    if !menuBackgroundChanged { revealScreen(menuBackdrop, menuBackdrop, [1]int{0}, Width) }
+                    drawCampaignMenu(menuStep.Menu, menuBlocks, sensitivity, selectedDetail, selectedGamma)
+                }
+            } else {
+                if !menuBackgroundChanged { revealScreen(menuBackdrop, menuBackdrop, [1]int{0}, Width) }
+                next campaignMenuBackdrop = ""
+                if menuStep.Start {
+                    next advanceMarker = -1
+                    next newCampaignMarker = menuStep.Marker
+                    next newCampaignSkill = menuStep.Skill
+                } else { log("Doom campaign menu closed") }
+            }
+        }
+        if !muted && soundCues != 0 {
+            if soundCues & cueWeapon != 0 { next weaponCueNote = weaponCueTone(weaponSound) }
+            next musicCuePhase = musicCuePhase ^ soundCues
+        }
+        if requestedTrack >= 0 && requestedTrack != soundtrackId {
+            // G_DoCompleted starts episode victory music before processing
+            // BT_SPECIAL. The host applies a fresh request before advancing.
+            musicPaused = pendingVictory.Valid && pauseCommand && pauseWorld && requestedTrack != 0
+            next soundtrackId = requestedTrack
+            next soundtrackRevision = soundtrackRevision + 1
+        }
+        next soundtrackPaused = musicPaused
+        next soundtrackPlaying = !levelHalted && !checkpointHold && !menuStep.Start && !startingNew && !musicPaused
+    }
+
+    host tick {
+        // Date.now() is a signed wrapping value in the host. A negative delta
+        // is therefore a clock discontinuity, not elapsed playback time.
+        now := hostTimeMillis()
+        elapsed := now - soundtrackLastMillis
+        if elapsed < 0 { elapsed = 0 }
+
+        // A checkpoint restore is authoritative over an ordinary track request.
+        // Do not tick on this callback: the next host callback starts exactly
+        // from the saved MUS cursor and leaves existing arrow phase bits quiet.
+        if soundtrackRestoreRevision != soundtrackAppliedRestore {
+            next soundtrack = soundtrackRestore
+            next soundtrackQueue = soundtrackRestoreQueue
+            next soundtrackAppliedRestore = soundtrackRestoreRevision
+            next soundtrackAppliedRevision = soundtrackRevision
+            next soundtrackLastMillis = now
+            next soundtrackMillisRemainder = 0
+            next soundtrackTicDebt = 0
+        } else if soundtrackRevision != soundtrackAppliedRevision {
+            var started audio.MusPlayer
+            if soundtrackId != 0 {
+                track := archives.Find(audio.MusicLumpName(soundtrackId))
+                started = audio.LoadMusPlayer(track, soundtrackId != musicBunny)
+            }
+            next soundtrack = started
+            next soundtrackQueue = SoundtrackQueue{}
+            next soundtrackAppliedRevision = soundtrackRevision
+            next soundtrackLastMillis = now
+            next soundtrackMillisRemainder = 0
+            next soundtrackTicDebt = 0
+        } else if !soundtrackPlaying || soundtrackPaused || (!soundtrack.Active && soundtrackQueue.Notes.Count == 0) {
+            // Paused and inactive time never becomes an audible catch-up burst.
+            if soundMuted && soundtrackQueue.Notes.Count > 0 { next soundtrackQueue = SoundtrackQueue{} }
+            next soundtrackLastMillis = now
+            next soundtrackMillisRemainder = 0
+            next soundtrackTicDebt = 0
+        } else {
+            // Convert elapsed milliseconds to Doom's 35 Hz tic clock without
+            // multiplying a potentially large signed Date.now() delta.
+            wholeSeconds := elapsed / 1000
+            milliseconds := elapsed % 1000
+            fraction := soundtrackMillisRemainder + milliseconds * 35
+            debt := soundtrackTicDebt + wholeSeconds * 35 + fraction / 1000
+            remainder := fraction % 1000
+            advanced := advanceHostMusic(soundtrack, soundtrackQueue, musicPackets, debt, soundMuted)
+            next soundtrack = advanced.Player
+            next soundtrackQueue = advanced.Queue
+            next soundtrackLastMillis = now
+            next soundtrackMillisRemainder = remainder
+            next soundtrackTicDebt = advanced.Debt
+            if advanced.Emitted { next musicPackets = advanced.Packets }
+        }
+    }
+}

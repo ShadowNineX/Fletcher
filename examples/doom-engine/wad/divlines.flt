@@ -1,0 +1,69 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted on 2026-11-21 from linuxdoom-1.10/p_maputl.c at a77dfb96.
+
+package wad
+
+import "numeric"
+
+type DivLine struct {
+    Valid bit
+    X int
+    Y int
+    DeltaX int
+    DeltaY int
+}
+
+func ApproxDistance(dx int, dy int) int {
+    if dx < 0 { dx = -dx }
+    if dy < 0 { dy = -dy }
+    if dx < dy { return dx + dy - (dx >> 1) }
+    return dx + dy - (dy >> 1)
+}
+
+func MakeDivLine(line CollisionLine) DivLine {
+    if !line.Valid { return DivLine{} }
+    return DivLine{Valid: true, X: line.First.X, Y: line.First.Y, DeltaX: line.DeltaX, DeltaY: line.DeltaY}
+}
+
+// PointOnDivLineSide is P_PathTraverse's two-way P_PointOnDivlineSide:
+// front is zero and back is one. Points on a non-axis divline are back.
+func PointOnDivLineSide(line DivLine, x int, y int) int {
+    if !line.Valid { return -1 }
+    if line.DeltaX == 0 {
+        if x <= line.X {
+            if line.DeltaY > 0 { return 1 }
+            return 0
+        }
+        if line.DeltaY < 0 { return 1 }
+        return 0
+    }
+    if line.DeltaY == 0 {
+        if y <= line.Y {
+            if line.DeltaX < 0 { return 1 }
+            return 0
+        }
+        if line.DeltaX > 0 { return 1 }
+        return 0
+    }
+    dx, dy := x - line.X, y - line.Y
+    if (line.DeltaY ^ line.DeltaX ^ dx ^ dy) < 0 {
+        if (line.DeltaY ^ dx) < 0 { return 1 }
+        return 0
+    }
+    left := cport.C_FixedMul(line.DeltaY >> 8, dx >> 8)
+    right := cport.C_FixedMul(dy >> 8, line.DeltaX >> 8)
+    if right < left { return 0 }
+    return 1
+}
+
+// InterceptVector returns the 16.16 intersection fraction along trace, as
+// P_InterceptVector does. Parallel divlines deliberately return zero.
+func InterceptVector(trace DivLine, line DivLine) int {
+    if !trace.Valid || !line.Valid { return 0 }
+    denominator := cport.C_FixedMul(line.DeltaY >> 8, trace.DeltaX) - cport.C_FixedMul(line.DeltaX >> 8, trace.DeltaY)
+    if denominator == 0 { return 0 }
+    numerator := cport.C_FixedMul((line.X - trace.X) >> 8, line.DeltaY) +
+        cport.C_FixedMul((trace.Y - line.Y) >> 8, line.DeltaX)
+    return cport.C_FixedDiv(numerator, denominator)
+}

@@ -1,0 +1,20 @@
+package bitmap
+
+const GlyphWidth = 3
+const GlyphHeight = 5
+
+// DrawText paints a 3×5, one-cell-spaced line of uppercase text.
+func DrawText(x int, y int, text string) {
+    for i, letter := range text {
+        drawGlyph(x + i * (GlyphWidth + 1), y, glyph(letter))
+    }
+}
+
+func drawGlyph(x int, y int, rows [GlyphHeight]int) {
+    for row, mask := range rows {
+        for column := range GlyphWidth {
+            on := (mask & (1 << (GlyphWidth - 1 - column))) != 0
+            pixel(x + column, y + row, on)
+        }
+    }
+}

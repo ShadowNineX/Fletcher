@@ -1,0 +1,102 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
+package walls
+
+import "wad"
+
+// Each directory and leaf holds only boxed references. Replacing an entry
+// copies two 64-reference pages and leaves older render snapshots intact.
+type columnCacheSlot<T> struct {
+    Value T
+    Found bit
+}
+
+type columnCachePage<T> struct {
+    entries [64]T
+    occupied [2]bits<32>
+}
+
+type columnCachePageRef<T> interface {
+    Slot(index int) columnCacheSlot<T>
+    WithSlot(index int, value T) columnCachePage<T>
+}
+
+func (page columnCachePage<T>) Slot(index int) columnCacheSlot<T> {
+    if page.occupied[index >> 5][index & 31] {
+        return columnCacheSlot<T>{Value: page.entries[index], Found: true}
+    }
+    return columnCacheSlot<T>{}
+}
+
+func (page columnCachePage<T>) WithSlot(index int, value T) columnCachePage<T> {
+    page.occupied[index >> 5][index & 31] = true
+    page.entries[index] = value
+    return page
+}
+
+type columnCacheEntry struct {
+    file bytes
+    names bytes
+    offset int
+    namesOffset int
+    column int
+    data TextureColumnRef
+}
+
+type columnCacheEntryRef interface {
+    ColumnFor(texture wad.TextureDef, column int) (TextureColumnRef, bit)
+}
+
+func (entry columnCacheEntry) ColumnFor(texture wad.TextureDef, column int) (TextureColumnRef, bit) {
+    if entry.column == column && entry.offset == texture.Offset && entry.namesOffset == texture.PNames.Offset &&
+        sameFile(entry.file, texture.File) && sameFile(entry.names, texture.PNames.File) {
+        return entry.data, true
+    }
+    var missing TextureColumnRef
+    return missing, false
+}
+
+type columnCacheLeaf = columnCachePageRef<columnCacheEntryRef>
+type columnCacheDirectory = columnCachePage<columnCacheLeaf>
+
+// A cache belongs to one mounted archive snapshot. The renderer resets it
+// when the patch search order or backing archives change.
+type ColumnCache struct {
+    Enabled bit
+    populated bit
+    directory columnCachePageRef<columnCacheLeaf>
+}
+
+func columnCacheIndex(offset int, wrapped int) int {
+    return (((offset ^ (offset >> 12)) * 127) + wrapped) & 4095
+}
+
+// column is already wrapped with the texture's Doom width mask.
+func (cache ColumnCache) Lookup(texture wad.TextureDef, column int) (TextureColumnRef, bit) {
+    if cache.Enabled && cache.populated && texture.Valid {
+        index := columnCacheIndex(texture.Offset, column)
+        page := cache.directory.Slot(index >> 6)
+        if page.Found {
+            slot := page.Value.Slot(index & 63)
+            if slot.Found { return slot.Value.ColumnFor(texture, column) }
+        }
+    }
+    var missing TextureColumnRef
+    return missing, false
+}
+
+func (cache ColumnCache) Store(texture wad.TextureDef, column int, entry TextureColumnRef) ColumnCache {
+    if !cache.Enabled || !texture.Valid { return cache }
+    index := columnCacheIndex(texture.Offset, column)
+    var record columnCacheEntryRef = columnCacheEntry{file: texture.File, names: texture.PNames.File,
+        offset: texture.Offset, namesOffset: texture.PNames.Offset, column: column, data: entry}
+    var directory columnCachePageRef<columnCacheLeaf> = cache.directory
+    if !cache.populated { directory = columnCacheDirectory{} }
+    previous := directory.Slot(index >> 6)
+    var leaf columnCacheLeaf
+    if previous.Found { leaf = previous.Value } else { leaf = columnCachePage<columnCacheEntryRef>{} }
+    leaf = leaf.WithSlot(index & 63, record)
+    cache.directory = directory.WithSlot(index >> 6, leaf)
+    cache.populated = true
+    return cache
+}

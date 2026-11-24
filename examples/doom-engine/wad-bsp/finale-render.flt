@@ -1,0 +1,200 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Presentation from linuxdoom-1.10/f_finale.c using art from the mounted WAD.
+
+package main
+
+import "actorinfo"
+import "play"
+import "wad"
+import "walls"
+
+const finaleMaxTextBytes = 4096
+const finaleStories = [10]bytes{
+    readFileIfPresent("E1TEXT.txt"), readFileIfPresent("E2TEXT.txt"),
+    readFileIfPresent("E3TEXT.txt"), readFileIfPresent("E4TEXT.txt"),
+    readFileIfPresent("C1TEXT.txt"), readFileIfPresent("C2TEXT.txt"),
+    readFileIfPresent("C3TEXT.txt"), readFileIfPresent("C4TEXT.txt"),
+    readFileIfPresent("C5TEXT.txt"), readFileIfPresent("C6TEXT.txt"),
+}
+const finaleCastLabels = [17]bytes{
+    readFileIfPresent("FCAST00.txt"), readFileIfPresent("FCAST01.txt"), readFileIfPresent("FCAST02.txt"),
+    readFileIfPresent("FCAST03.txt"), readFileIfPresent("FCAST04.txt"), readFileIfPresent("FCAST05.txt"),
+    readFileIfPresent("FCAST06.txt"), readFileIfPresent("FCAST07.txt"), readFileIfPresent("FCAST08.txt"),
+    readFileIfPresent("FCAST09.txt"), readFileIfPresent("FCAST10.txt"), readFileIfPresent("FCAST11.txt"),
+    readFileIfPresent("FCAST12.txt"), readFileIfPresent("FCAST13.txt"), readFileIfPresent("FCAST14.txt"),
+    readFileIfPresent("FCAST15.txt"), readFileIfPresent("FCAST16.txt"),
+}
+
+type PreviewFinaleOpening struct {
+    State play.FinaleState
+    Text wad.LumpRef
+    Music int
+    Wipe PreviewWipe
+    Random play.RandomState
+}
+
+func openPreviewFinale(mounts wad.Archives, materials walls.Materials, route play.CampaignRoute,
+    random play.RandomState, paused bit) PreviewFinaleOpening {
+    story := finaleStoryText(mounts, route)
+    first := play.StartFinale(route, finaleTextLength(story))
+    opening := PreviewFinaleOpening{Text: story, Music: first.Music, Random: random}
+    // G_Ticker runs F_Ticker after the queued episode victory. Commercial
+    // finales start inside WI_Ticker and reach F_Ticker on the next game tic.
+    if !route.Commercial { first = play.TickFinale(first, false, false) }
+    opening.State = first
+    if drawFinale(mounts, materials, first, story, paused) {
+        started := beginPreviewWipe(random)
+        opening.Wipe, opening.Random = started.Wipe, started.Random
+    }
+    return opening
+}
+
+func finaleStorySlot(route play.CampaignRoute) int {
+    if !route.Commercial { return route.Episode }
+    switch route.LastMap + 1 {
+    case 6: return 4
+    case 11: return 5
+    case 20: return 6
+    case 30: return 7
+    case 15: return 8
+    case 31: return 9
+    }
+    return -1
+}
+
+func externalFinaleText(mounts wad.Archives, name wad.LumpName, file bytes) wad.LumpRef {
+    length := len(file)
+    if length == 0 { return mounts.Find(name) }
+    return wad.LumpRef{File: file, Size: length, Name: name, Found: true, Valid: true}
+}
+
+func finaleStoryText(mounts wad.Archives, route play.CampaignRoute) wad.LumpRef {
+    slot := finaleStorySlot(route)
+    if slot < 0 || slot >= 10 { return wad.LumpRef{} }
+    letter, digit := 69, slot + 1 // E1TEXT through E4TEXT.
+    if route.Commercial { letter, digit = 67, slot - 3 } // C1TEXT through C6TEXT.
+    name := wad.LumpName{Low: letter | ((48 + digit) << 8) | 0x45540000, High: 0x5458}
+    return externalFinaleText(mounts, name, finaleStories[slot])
+}
+
+func finaleTextLength(lump wad.LumpRef) int {
+    if !lump.Valid { return 0 }
+    length := lump.Size
+    if length > finaleMaxTextBytes { length = finaleMaxTextBytes }
+    for index := range length {
+        if lump.File[lump.Offset + index] == 0 { return index }
+    }
+    return length
+}
+
+func finaleGlyph(mounts wad.Archives, letter int) IntermissionPatch {
+    if letter >= 97 && letter <= 122 { letter = letter - 32 }
+    if letter < 33 || letter > 95 { return IntermissionPatch{} }
+    high := 78 | (48 << 8) | ((48 + letter / 10) << 16) | ((48 + letter % 10) << 24)
+    return readIntermissionPatch(mounts, wad.LumpName{Low: 0x46435453, High: high}) // STCFNnnn
+}
+
+func finaleLineWidth(mounts wad.Archives, lump wad.LumpRef, count int) int {
+    width := 0
+    for index := range count {
+        glyph := finaleGlyph(mounts, int(lump.File[lump.Offset + index]))
+        if glyph.Width == 0 { width = width + 4 } else { width = width + glyph.Width }
+    }
+    return width
+}
+
+func drawFinaleText(mounts wad.Archives, shade walls.WadShading, lump wad.LumpRef,
+    count int, lineStart int, y int, multiline bit) {
+    x := lineStart
+    for index := range count {
+        letter := int(lump.File[lump.Offset + index])
+        if letter == 10 && multiline {
+            x, y = lineStart, y + 11
+            if y >= intermissionHeight { return }
+        } else {
+            glyph := finaleGlyph(mounts, letter)
+            if glyph.Width == 0 {
+                x = x + 4
+            } else {
+                if x + glyph.Width > intermissionWidth { return }
+                drawIntermissionPatch(glyph, shade, x, y)
+                x = x + glyph.Width
+            }
+        }
+    }
+}
+
+func clearFinale() {
+    for y := range Height {
+        for x := range Width { pixel(x, y, true, color.Black) }
+    }
+}
+
+func drawBunnyFinale(mounts wad.Archives, shade walls.WadShading, state play.FinaleState) {
+    left := readIntermissionPatch(mounts, wad.LumpName{Low: 0x42554650, High: 50}) // PFUB2
+    right := readIntermissionPatch(mounts, wad.LumpName{Low: 0x42554650, High: 49}) // PFUB1
+    if left.Width != intermissionWidth || right.Width != intermissionWidth { clearFinale() }
+    if left.Width == intermissionWidth && state.Scroll < intermissionWidth {
+        drawIntermissionPatch(left, shade, left.Left - state.Scroll, left.Top)
+    }
+    if right.Width == intermissionWidth && state.Scroll > 0 {
+        drawIntermissionPatch(right, shade, intermissionWidth - state.Scroll + right.Left, right.Top)
+    }
+    if state.EndFrame >= 0 {
+        name := wad.LumpName{Low: 0x00444e45 | ((48 + state.EndFrame) << 24)} // END0 through END6
+        drawIntermissionPatch(readIntermissionPatch(mounts, name), shade,
+            (intermissionWidth - 13 * 8) / 2, (intermissionHeight - 8 * 8) / 2)
+    }
+}
+
+func drawFinaleArt(mounts wad.Archives, shade walls.WadShading, state play.FinaleState) {
+    art := wad.LumpName{}
+    switch state.Route.Episode {
+    case 0:
+        retail := mounts.Find(wad.LumpName{Low: 0x314d3445}) // E4M1
+        art = wad.LumpName{Low: 0x504c4548, High: 50} // HELP2
+        if retail.Valid && retail.Size == 0 { art = wad.LumpName{Low: 0x44455243, High: 0x5449} } // CREDIT
+    case 1: art = wad.LumpName{Low: 0x54434956, High: 0x3259524f} // VICTORY2
+    case 2:
+        drawBunnyFinale(mounts, shade, state)
+        return
+    case 3: art = wad.LumpName{Low: 0x50444e45, High: 0x4349} // ENDPIC
+    }
+    patch := readIntermissionPatch(mounts, art)
+    if patch.Width != intermissionWidth || patch.Height != intermissionHeight { clearFinale() }
+    drawIntermissionPatch(patch, shade, 0, 0)
+}
+
+func drawFinaleCast(mounts wad.Archives, shade walls.WadShading, cast play.FinaleCast) {
+    background := readIntermissionPatch(mounts, wad.LumpName{Low: 0x53534f42, High: 0x4b434142}) // BOSSBACK
+    if background.Width != intermissionWidth || background.Height != intermissionHeight { clearFinale() }
+    drawIntermissionPatch(background, shade, 0, 0)
+    name := wad.LumpName{Low: 0x53414346, High: 84 | ((48 + cast.Index / 10) << 8) | ((48 + cast.Index % 10) << 16)}
+    label := externalFinaleText(mounts, name, finaleCastLabels[cast.Index])
+    count := finaleTextLength(label)
+    if count > 0 {
+        x := (intermissionWidth - finaleLineWidth(mounts, label, count)) / 2
+        drawFinaleText(mounts, shade, label, count, x, 180, false)
+    }
+    state := actorinfo.StateAt(cast.State)
+    if !state.Valid { return }
+    sprite := wad.LoadSprite(mounts, wad.LumpName{Low: actorinfo.SpriteNameLow(state.Sprite)})
+    frame := wad.SpriteLumpAt(wad.SpriteFrameAt(sprite, state.Frame & 0x7fff), 0)
+    if frame.Valid { drawPatchFrame(decodeIntermissionPatch(frame.Patch), shade, 160, 170, frame.Flip) }
+}
+
+func drawFinale(mounts wad.Archives, materials walls.Materials, state play.FinaleState, story wad.LumpRef, paused bit) bit {
+    if !materials.Shade.Valid { materials.Shade = walls.LoadShading(mounts) }
+    if !materials.Shade.Valid { return false }
+    switch state.Stage {
+    case play.FinaleStory:
+        drawFinaleBackdrop(materials, state.Route)
+        drawFinaleText(mounts, materials.Shade, story, state.Reveal, 10, 10, true)
+    case play.FinaleArt: drawFinaleArt(mounts, materials.Shade, state)
+    case play.FinaleCastStage: drawFinaleCast(mounts, materials.Shade, state.Cast)
+    default: return false
+    }
+    if paused { drawPause(mounts, materials.Shade) }
+    return true
+}

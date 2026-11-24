@@ -1,0 +1,99 @@
+package main
+
+import "actorinfo"
+import "enemy"
+import "engine"
+import "play"
+import "sprites"
+import "wad"
+import "walls"
+
+const PreviewSpriteSlots = 256
+const ActorFrameMask = 0x7fff
+const ActorFullBright = 0x8000
+
+type PreviewSpriteRef interface {
+    FrameAt(index int) wad.SpriteFrame
+}
+
+type PreviewSprite struct {
+    Definition wad.SpriteDef
+}
+
+func (sprite PreviewSprite) FrameAt(index int) wad.SpriteFrame {
+    return wad.SpriteFrameAt(sprite.Definition, index)
+}
+
+type PreviewSprites struct {
+    Assets [PreviewSpriteSlots]PreviewSpriteRef
+    Available [PreviewSpriteSlots]bit
+    Attempted [PreviewSpriteSlots]bit
+    Count int
+}
+
+func cachePreviewSprites(mounts wad.Archives, actors play.MapActors, result PreviewSprites) PreviewSprites {
+    for i := range actors.Count {
+        actor := actors.ActorAt(i)
+        key := actor.Sprite
+        if actor.Valid && i + 1 != actors.PlayerActors[0] && actor.Physics.Body.Flags & play.ActorNoSector == 0 &&
+            key >= 0 && key < PreviewSpriteSlots && !result.Attempted[key] {
+            result.Attempted[key] = true
+            name := actorinfo.SpriteNameLow(key)
+            if name != 0 {
+                sprite := wad.LoadSprite(mounts, wad.LumpName{Low: name})
+                if sprite.Valid {
+                    result.Assets[key] = PreviewSprite{Definition: sprite}
+                    result.Available[key] = true
+                    result.Count = result.Count + 1
+                }
+            }
+        }
+    }
+    return result
+}
+
+type SpritePass struct {
+    Visible sprites.VisibleSprites
+    Visited play.PagedSlots<int>
+    Mapped MappedLines
+    Columns walls.ColumnCache
+    Geometry RenderGeometry
+}
+
+// R_AddSprites visits a sector only once, even when several visible BSP
+// subsectors share it. Each nonempty list head uniquely identifies its sector
+// for this frame.
+func addSectorSprites(scene Scene, pass SpritePass, sector int, heights engine.SectorHeights, light int) SpritePass {
+    if scene.ActorSprites.Count == 0 { return pass }
+    handle := scene.ActorLinks.SectorFirst(sector)
+    if handle == 0 { return pass }
+    word, bitIndex := (handle - 1) / 32, (handle - 1) & 31
+    mask := 1 << bitIndex
+    visited := pass.Visited.At(word)
+    if visited & mask != 0 { return pass }
+    pass.Visited = pass.Visited.With(word, visited | mask)
+    linkedHeights := scene.ActorLinks.HasBlockMap()
+    for range scene.Actors.Count {
+        if handle == 0 { return pass }
+        actor := scene.Actors.ActorAt(handle - 1)
+        body := actor.Physics.Body
+        if actor.Valid && handle != scene.Actors.PlayerActors[0] &&
+            actor.Sprite >= 0 && actor.Sprite < PreviewSpriteSlots && scene.ActorSprites.Available[actor.Sprite] {
+            frame := scene.ActorSprites.Assets[actor.Sprite].FrameAt(actor.Frame & ActorFrameMask)
+            if frame.Valid {
+                z := body.Z
+                if !linkedHeights && !actor.Transient && !actor.Damaged && !enemy.HasMonsterThinker(actor) {
+                    z = heights.Floor
+                    if body.Flags & play.ActorSpawnCeiling != 0 { z = heights.Ceiling - body.Height }
+                }
+                display := sprites.SpriteActor{X: body.X, Y: body.Y, Z: z, Heading: actor.Physics.Angle,
+                    Light: light, ExtraLight: scene.Materials.ExtraLight, FullBright: actor.Frame & ActorFullBright != 0,
+                    Translation: int((body.Flags >> play.ActorTranslationShift) & 3),
+                    Fuzzy: body.Flags & play.ActorShadow != 0}
+                pass.Visible = sprites.AddVisibleSprite(pass.Visible, sprites.ProjectSprite(scene.Camera, display, frame))
+            }
+        }
+        handle = scene.ActorLinks.SectorNext(handle)
+    }
+    return pass
+}

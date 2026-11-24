@@ -1,0 +1,179 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted from R_DrawPSprite and R_DrawPlayerSprites in linuxdoom-1.10/r_things.c.
+
+package main
+
+import "actorinfo"
+import "engine"
+import "numeric"
+import "play"
+import "wad"
+import "walls"
+
+// Psprite positions are authored for Doom's fixed 320x200 framebuffer. The
+// preview is 128x96, so X and Y deliberately use independent scales.
+const weaponBaseWidth = 320
+const weaponBaseHeight = 200
+const weaponBaseCenterX = weaponBaseWidth / 2
+const weaponBaseCenterY = weaponBaseHeight / 2
+const weaponFrameMask = 0x7fff
+const weaponFullBright = 0x8000
+
+func weaponSigned16(value int) int {
+    if value >= 32768 { return value - 65536 }
+    return value
+}
+
+// R_DrawPlayerSprites uses scalelight[MAXLIGHTSCALE-1] for ordinary psprites.
+func weaponLightRow(sectorLight int, extraLight int, scaledWidth int) int {
+    return engine.WallLightRow(sectorLight, extraLight,
+        (engine.MaxLightScale - 1) << engine.LightScaleShift, scaledWidth, 0)
+}
+
+func weaponFrameName(state actorinfo.StateDef) wad.LumpName {
+    name := actorinfo.SpriteNameLow(state.Sprite)
+    if name == 0 { return wad.LumpName{} }
+    // Psprites use their frame letter and rotation 0: PISGA0, PISGB0, ...
+    return wad.LumpName{Low: name, High: 0x00003041 + (state.Frame & weaponFrameMask)}
+}
+
+func weaponPatch(view play.WeaponOverlay, mounts wad.Archives) wad.LumpRef {
+    if view.State == play.ActorNullState { return wad.LumpRef{} }
+    state := actorinfo.StateAt(view.State)
+    if !state.Valid || state.Sprite < 0 { return wad.LumpRef{} }
+    patch := mounts.Find(weaponFrameName(state))
+    if !patch.Valid || patch.Offset < 0 || patch.Size < wad.PatchHeaderSize || patch.Offset > len(patch.File) - patch.Size {
+        return wad.LumpRef{}
+    }
+    width, height := weaponSigned16(wad.U16(patch.File, patch.Offset)), weaponSigned16(wad.U16(patch.File, patch.Offset + 2))
+    if width <= 0 || height <= 0 || wad.PatchHeaderSize + width * 4 > patch.Size { return wad.LumpRef{} }
+    return patch
+}
+
+func overlayVisible(overlay play.WeaponOverlay, mounts wad.Archives) bit {
+    return weaponPatch(overlay, mounts).Valid
+}
+
+// WeaponViewVisible is cheap after the preview has completed its directory
+// index build. It lets the caller skip redraw work for unavailable WAD guns.
+func WeaponViewVisible(view play.WeaponView, mounts wad.Archives) bit {
+    return overlayVisible(view.Weapon, mounts) || overlayVisible(view.Flash, mounts)
+}
+
+func overlayChanged(before play.WeaponOverlay, after play.WeaponOverlay, mounts wad.Archives) bit {
+    if before.State == after.State && before.X == after.X && before.Y == after.Y { return false }
+    beforeVisible, afterVisible := overlayVisible(before, mounts), overlayVisible(after, mounts)
+    if beforeVisible != afterVisible { return true }
+    if !beforeVisible { return false }
+    beforeState, afterState := actorinfo.StateAt(before.State), actorinfo.StateAt(after.State)
+    return beforeState.Sprite != afterState.Sprite || beforeState.Frame != afterState.Frame ||
+        before.X != after.X || before.Y != after.Y
+}
+
+// WeaponViewChanged ignores invisible/absent weapon states so partial WADs do
+// not force repaints. ExtraLight changes are visible whenever either overlay
+// can be drawn.
+func WeaponViewChanged(before play.WeaponView, after play.WeaponView, mounts wad.Archives) bit {
+    return overlayChanged(before.Weapon, after.Weapon, mounts) || overlayChanged(before.Flash, after.Flash, mounts) ||
+        (before.ExtraLight != after.ExtraLight && (WeaponViewVisible(before, mounts) || WeaponViewVisible(after, mounts)))
+}
+
+func weaponColorRow(view play.WeaponOverlay, sectorLight int, extraLight int, scaledWidth int) int {
+    state := actorinfo.StateAt(view.State)
+    if state.Valid && state.Frame & weaponFullBright != 0 { return 0 }
+    return weaponLightRow(sectorLight, extraLight, scaledWidth)
+}
+
+func weaponUsesFuzz(invisibilityTics int) bit { return invisibilityTics > 4 * 32 || invisibilityTics & 8 != 0 }
+
+// Draw one validated post stream using R_DrawMaskedColumn's signed clipping.
+// first/end are half-open target rows and source is sampled with the original
+// 16.16 inverse scale, preserving transparent patch holes.
+func drawWeaponColumn(patch wad.LumpRef, cursor int, x int, topScreen int, textureMid int, scaleY int, inverseY int,
+    colorRow int, shade walls.WadShading, viewHeight int, fuzzy bit, phase int) int {
+    end := patch.Offset + patch.Size
+    for range patch.Size / 4 + 1 {
+        if cursor >= end { return phase }
+        top := int(patch.File[cursor])
+        if top == 255 || cursor > end - 4 { return phase }
+        length := int(patch.File[cursor + 1])
+        if length > end - cursor - 4 { return phase }
+
+        first := (topScreen + top * scaleY + engine.FracUnit - 1) >> 16
+        finish := (topScreen + (top + length) * scaleY + engine.FracUnit - 1) >> 16
+        if first < 0 { first = 0 }
+        if finish > viewHeight { finish = viewHeight }
+        if fuzzy {
+            phase = walls.DrawFuzzColumn(x, first, finish, viewHeight, phase, shade)
+        } else if first < finish {
+            fraction := textureMid - (top << 16) + (first - viewHeight / 2) * inverseY
+            for offset := range finish - first {
+                source := fraction >> 16
+                if source >= 0 && source < length {
+                    sourceIndex := int(patch.File[cursor + 3 + source])
+                    mapped := int(shade.ColorMaps.File[shade.ColorMaps.Offset + colorRow * wad.ColorMapBytes + sourceIndex])
+                    shade.DrawMappedPixel(mapped, x, first + offset)
+                }
+                fraction = fraction + inverseY
+            }
+        }
+        cursor = cursor + length + 4
+    }
+    return phase
+}
+
+func drawWeaponOverlay(overlay play.WeaponOverlay, mounts wad.Archives, shade walls.WadShading,
+    sectorLight int, extraLight int, window ViewWindow, fuzzy bit, phase int) int {
+    patch := weaponPatch(overlay, mounts)
+    if !patch.Valid || !shade.Valid || !shade.ColorMaps.Valid || shade.ColorMaps.Offset < 0 ||
+        shade.ColorMaps.Offset > len(shade.ColorMaps.File) - shade.ColorMaps.Size { return phase }
+    width := weaponSigned16(wad.U16(patch.File, patch.Offset))
+    left := weaponSigned16(wad.U16(patch.File, patch.Offset + 4))
+    top := weaponSigned16(wad.U16(patch.File, patch.Offset + 6))
+    viewWidth, viewHeight := window.Width >> shade.DetailShift, window.Height
+    scaleX, scaleY := engine.FracUnit * viewWidth / weaponBaseWidth, engine.FracUnit * Height / weaponBaseHeight
+    windowed := window.Width != Width
+    if windowed { scaleY = scaleY * window.NativeWidth / weaponBaseWidth }
+    if width <= 0 || scaleX <= 0 || scaleY <= 0 { return phase }
+    inverseY := cport.C_FixedDiv(engine.FracUnit, scaleY)
+    textureMid := (weaponBaseCenterY << 16) + engine.FracUnit / 2 - (overlay.Y - (top << 16))
+    topScreen := (viewHeight / 2 << 16) - cport.C_FixedMul(textureMid, scaleY)
+    tx := overlay.X - (weaponBaseCenterX << 16) - (left << 16)
+    x1 := ((viewWidth / 2 << 16) + cport.C_FixedMul(tx, scaleX)) >> 16
+    tx = tx + (width << 16)
+    x2 := ((viewWidth / 2 << 16) + cport.C_FixedMul(tx, scaleX)) >> 16
+    if x1 >= viewWidth || x2 <= 0 { return phase }
+    first, last := x1, x2
+    if first < 0 { first = 0 }
+    if last > viewWidth { last = viewWidth }
+    lightWidth := engine.DoomScreenWidth
+    if windowed { lightWidth = window.Width }
+    row := weaponColorRow(overlay, sectorLight, extraLight, lightWidth)
+    if row < 0 || row >= engine.NumColorMaps { return phase }
+    row = shade.ColorRow(row)
+    if shade.ColorMaps.Size < (row + 1) * wad.ColorMapBytes { return phase }
+    inverseX := weaponBaseWidth * engine.FracUnit / viewWidth
+    for offset := range last - first {
+        x := first + offset
+        // R_DrawPSprite advances source columns by pspriteiscale. Deriving
+        // from the unclipped left edge keeps clipping signed and symmetric.
+        source := (x - x1) * weaponBaseWidth / viewWidth
+        if windowed { source = ((x - x1) * inverseX) >> 16 }
+        if source >= 0 && source < width {
+            post := wad.PatchPostSource(patch, source)
+            if post.Valid {
+                phase = drawWeaponColumn(patch, post.Offset, x, topScreen, textureMid, scaleY, inverseY, row, shade, viewHeight, fuzzy, phase)
+            }
+        }
+    }
+    return phase
+}
+
+// DrawWeaponView is R_DrawPlayerSprites for Fletcher's first-person overlay.
+// Weapon is drawn before Flash; both patch streams preserve transparent posts.
+func DrawWeaponView(view play.WeaponView, mounts wad.Archives, shade walls.WadShading, sectorLight int,
+    window ViewWindow, fuzzy bit, phase int) int {
+    phase = drawWeaponOverlay(view.Weapon, mounts, shade, sectorLight, view.ExtraLight, window, fuzzy, phase)
+    return drawWeaponOverlay(view.Flash, mounts, shade, sectorLight, view.ExtraLight, window, fuzzy, phase)
+}

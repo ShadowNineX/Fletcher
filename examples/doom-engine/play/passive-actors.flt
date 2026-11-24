@@ -1,0 +1,92 @@
+package play
+
+import "actorinfo"
+
+type PassiveActors struct {
+    handles PagedSlots<int>
+    Count int
+}
+
+func (passive PassiveActors) HandleAt(index int) int { return passive.handles.At(index) }
+
+// Classify the complete reachable path before enabling preview animation.
+// The two cursors stop at a terminal state or an action-free cycle.
+func passiveSuccessor(state int) int {
+    if state == ActorNullState { return ActorNullState }
+    definition := actorinfo.StateAt(state)
+    if !definition.Valid || definition.Action != 0 || definition.Tics < -1 { return -1 }
+    if definition.Tics == -1 { return ActorNullState }
+    return definition.Next
+}
+
+func passivePath(state int) bit {
+    slow, fast := state, state
+    for range actorinfo.ActorStateCount {
+        slow = passiveSuccessor(slow)
+        fast = passiveSuccessor(passiveSuccessor(fast))
+        if slow < 0 || fast < 0 { return false }
+        if fast == ActorNullState || slow == fast { return true }
+    }
+    return false
+}
+
+func SelectPassiveActors(actors MapActors) PassiveActors {
+    var result PassiveActors
+    var eligibility [actorinfo.ActorStateCount]int
+    for index := range actors.Count {
+        actor := actors.ActorAt(index)
+        if actor.Valid && !actor.Physics.Body.Player && actor.Tics > 0 && actor.State >= 0 && actor.State < actorinfo.ActorStateCount {
+            if eligibility[actor.State] == 0 {
+                eligibility[actor.State] = -1
+                // P_SpawnMobj installs the initial state without its action.
+                // The first ordinary transition starts at its successor.
+                initial := actorinfo.StateAt(actor.State)
+                if passivePath(initial.Next) { eligibility[actor.State] = 1 }
+            }
+            if eligibility[actor.State] == 1 {
+                result.handles = result.handles.With(result.Count, index + 1)
+                result.Count = result.Count + 1
+            }
+        }
+    }
+    return result
+}
+
+type PassiveActorFrame struct {
+    Actors MapActors
+    Links ActorLinks
+    Cursor int
+    Changed bit
+    SpriteChanged bit
+    LinksChanged bit
+    Failed bit
+}
+
+// Run action-free thinkers through the slot preceding the next active actor.
+// Callers retain the cursor across groups to keep the original spawn order.
+func (frame PassiveActorFrame) TickBefore(passive PassiveActors, before int) PassiveActorFrame {
+    for range passive.Count - frame.Cursor {
+        handle := passive.HandleAt(frame.Cursor)
+        if handle >= before { return frame }
+        frame.Cursor = frame.Cursor + 1
+        actor := frame.Actors.ActorAt(handle - 1)
+        if actor.Valid && !actor.Damaged && actor.Tics > 0 {
+            step := TickMobjState(actor, 0, false, RandomState{}).Step
+            if step.Failed || step.Action != 0 { frame.Failed = true; return frame }
+            nextActor := step.Actor
+            frame.Actors = frame.Actors.WithActor(handle, nextActor)
+            if step.Removed {
+                frame.Links = frame.Links.UnlinkActor(handle)
+                frame.LinksChanged = true
+            }
+            frame.SpriteChanged = frame.SpriteChanged || (nextActor.Valid && nextActor.Sprite != actor.Sprite)
+            frame.Changed = frame.Changed || !nextActor.Valid || nextActor.Frame != actor.Frame || nextActor.Sprite != actor.Sprite
+        }
+    }
+    return frame
+}
+
+func TickPassiveActors(actors MapActors, passive PassiveActors, links ActorLinks) PassiveActorFrame {
+    frame := PassiveActorFrame{Actors: actors, Links: links}
+    return frame.TickBefore(passive, actors.Count + 1)
+}

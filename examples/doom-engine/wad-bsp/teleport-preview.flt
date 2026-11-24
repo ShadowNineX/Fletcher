@@ -1,0 +1,61 @@
+package main
+
+import "actorinfo"
+import "play"
+import "wad"
+
+type PreviewWalkoverTelefrag struct {
+    Blocks wad.BlockMapInfo
+}
+
+func previewCallbackContext(scene PreviewCombat) play.WalkoverContext {
+    return PreviewActionBox<play.WalkoverMetadata>{Value: play.WalkoverMetadata{
+        Base: scene.Base, View: scene.View, Heard: scene.Hearing.Targets, Brain: scene.Brain,
+        FirstActive: scene.FirstActive, MapActors: scene.MapActors, GameTic: scene.GameTic,
+        Rules: scene.Rules, RespawnMonsters: scene.RespawnMonsters,
+        Cues: scene.Cues, LastSound: scene.LastSound, WeaponSound: scene.WeaponSound, Changed: scene.Changed}}
+}
+
+func resumePreviewCallback(scene PreviewCombat, callback play.WalkoverContext) PreviewCombat {
+    state := callback.Read()
+    scene.Base, scene.View, scene.Hearing.Targets, scene.Brain = state.Base, state.View, state.Heard, state.Brain
+    scene.FirstActive, scene.MapActors, scene.GameTic, scene.Rules = state.FirstActive, state.MapActors, state.GameTic, state.Rules
+    scene.RespawnMonsters = state.RespawnMonsters
+    scene.Cues, scene.LastSound, scene.Changed = state.Cues, state.LastSound, state.Changed
+    scene.WeaponSound = state.WeaponSound
+    return scene
+}
+
+func previewWalkoverState(scene PreviewCombat) play.WalkoverState {
+    return play.WalkoverState{Level: scene.Level, Specials: scene.Specials, World: scene.World,
+        Callback: previewCallbackContext(scene)}
+}
+
+func resumePreviewWalkover(scene PreviewCombat, state play.WalkoverState) PreviewCombat {
+    scene = resumePreviewCallback(scene, state.Callback)
+    scene.Level, scene.Specials, scene.World, scene.Failed = state.Level, state.Specials, state.World, state.Failed
+    return scene
+}
+
+func (handler PreviewWalkoverTelefrag) OnTelefrag(state play.WalkoverState, event play.CombatStep,
+    rules play.CombatRules) play.WalkoverState {
+    // Inner crossings suspend on the combat stack before running their actions.
+    scene := resumePreviewWalkover(PreviewCombat{}, state)
+    previousSound := scene.LastSound
+    scene.LastSound = 0
+    scene = dispatchPreviewCombat(scene, handler.Blocks, event, rules)
+    state.Level, state.Specials, state.World, state.Failed = scene.Level, scene.Specials, scene.World, scene.Failed
+    if scene.LastSound == 0 {
+        scene.LastSound = previousSound
+    } else if scene.LastSound != actorinfo.SoundTeleport {
+        state.DamageSound = scene.LastSound
+    }
+    state.Callback = previewCallbackContext(scene)
+    return state
+}
+
+func afterPreviewTeleport(scene PreviewCombat) PreviewCombat {
+    scene.Changed = true
+    scene.FirstActive = firstActiveMapThinker(scene.World.Actors, scene.FirstActive, scene.MapActors)
+    return scene
+}

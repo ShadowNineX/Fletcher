@@ -1,0 +1,144 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted on 2026-11-21 from R_InstallSpriteLump and R_InitSpriteDefs in
+// linuxdoom-1.10/r_things.c.
+
+package wad
+
+const SpriteFrames = 29
+const SpriteRotations = 8
+
+type SpriteFrame struct {
+    Lumps [SpriteRotations]LumpRef
+    Flips [SpriteRotations]bit
+    Filled [SpriteRotations]bit
+    Used bit
+    Rotate bit
+    Valid bit
+}
+
+type SpriteDef struct {
+    Frames [SpriteFrames]SpriteFrame
+    FrameCount int
+    Valid bit
+}
+
+type SpriteLump struct {
+    Patch LumpRef
+    Flip bit
+    Valid bit
+}
+
+func spriteStartName() LumpName { return LumpName{Low: 0x54535f53, High: 0x00545241} } // S_START
+func spriteEndName() LumpName { return LumpName{Low: 0x4e455f53, High: 0x00000044} } // S_END
+
+func spriteNameByte(name LumpName, index int) int {
+    if index < 4 { return int((name.Low >> (index * 8)) & 255) }
+    return int((name.High >> ((index - 4) * 8)) & 255)
+}
+
+func validSpritePatch(patch LumpRef) bit {
+    if !patch.Valid || patch.Size < PatchHeaderSize { return false }
+    width, height := signed16(U16(patch.File, patch.Offset)), signed16(U16(patch.File, patch.Offset + 2))
+    if width <= 0 || height <= 0 || PatchHeaderSize + width * 4 > patch.Size { return false }
+    directoryEnd := PatchHeaderSize + width * 4
+    for column := range width {
+        offset := LE32(patch.File, patch.Offset + PatchHeaderSize + column * 4)
+        if offset < directoryEnd || offset >= patch.Size { return false }
+    }
+    return true
+}
+
+func installSpriteLump(sprite SpriteDef, frame int, rotation int, patch LumpRef, mirror bit) SpriteDef {
+    if frame < 0 || frame >= SpriteFrames || rotation < 0 || rotation > SpriteRotations || !validSpritePatch(patch) { return SpriteDef{} }
+    current := sprite.Frames[frame]
+    if rotation == 0 {
+        if current.Used { return SpriteDef{} }
+        current.Used, current.Rotate = true, false
+        for index := range SpriteRotations {
+            current.Lumps[index], current.Flips[index], current.Filled[index] = patch, mirror, true
+        }
+    } else {
+        if current.Used && !current.Rotate { return SpriteDef{} }
+        current.Used, current.Rotate = true, true
+        index := rotation - 1
+        if current.Filled[index] { return SpriteDef{} }
+        current.Lumps[index], current.Flips[index], current.Filled[index] = patch, mirror, true
+    }
+    sprite.Frames[frame] = current
+    if frame + 1 > sprite.FrameCount { sprite.FrameCount = frame + 1 }
+    return sprite
+}
+
+func installSpritePairs(mounts Archives, sprite SpriteDef, raw LumpRef) SpriteDef {
+    frame, rotation := spriteNameByte(raw.Name, 4) - 65, spriteNameByte(raw.Name, 5) - 48
+    // The primary pair uses the final mounted lump with that name. The
+    // optional mirrored pair keeps the physical lump in the sprite namespace.
+    sprite = installSpriteLump(sprite, frame, rotation, mounts.Find(raw.Name), false)
+    if sprite.FrameCount != 0 && spriteNameByte(raw.Name, 6) != 0 {
+        frame, rotation = spriteNameByte(raw.Name, 6) - 65, spriteNameByte(raw.Name, 7) - 48
+        sprite = installSpriteLump(sprite, frame, rotation, raw, true)
+    }
+    return sprite
+}
+
+func loadIndexedSprite(mounts Archives, prefix int) SpriteDef {
+    sprite := SpriteDef{}
+    directory := mounts.spriteNames
+    code := directory.Head(prefix)
+    for range mounts.Lumps {
+        if code == 0 { return sprite }
+        entry := directory.At(code)
+        if entry.Prefix == prefix {
+            raw := mounts.LumpAt(entry.Index)
+            if raw.Valid {
+                sprite = installSpritePairs(mounts, sprite, raw)
+                if sprite.FrameCount == 0 { return SpriteDef{} }
+            }
+        }
+        code = entry.Next
+    }
+    return sprite
+}
+
+// LoadSprite reads one four-character sprite within S_START/S_END.
+func LoadSprite(mounts Archives, name LumpName) SpriteDef {
+    sprite := SpriteDef{}
+    if mounts.Lumps > 0 && mounts.SpriteIndexReady() {
+        sprite = loadIndexedSprite(mounts, name.Low)
+    } else {
+        start, end := mounts.Find(spriteStartName()), mounts.Find(spriteEndName())
+        if !start.Valid || !end.Valid || end.Index <= start.Index { return SpriteDef{} }
+        for index := range end.Index - start.Index - 1 {
+            raw := mounts.LumpAt(start.Index + index + 1)
+            if raw.Valid && raw.Name.Low == name.Low {
+                sprite = installSpritePairs(mounts, sprite, raw)
+                if sprite.FrameCount == 0 { return SpriteDef{} }
+            }
+        }
+    }
+    if sprite.FrameCount == 0 { return SpriteDef{} }
+    for frame := range sprite.FrameCount {
+        current := sprite.Frames[frame]
+        if !current.Used { return SpriteDef{} }
+        if current.Rotate {
+            for rotation := range SpriteRotations {
+                if !current.Filled[rotation] { return SpriteDef{} }
+            }
+        }
+        current.Valid = true
+        sprite.Frames[frame] = current
+    }
+    sprite.Valid = true
+    return sprite
+}
+
+func SpriteFrameAt(sprite SpriteDef, frame int) SpriteFrame {
+    if !sprite.Valid || frame < 0 || frame >= sprite.FrameCount { return SpriteFrame{} }
+    return sprite.Frames[frame]
+}
+
+func SpriteLumpAt(frame SpriteFrame, rotation int) SpriteLump {
+    if !frame.Valid || rotation < 0 || rotation >= SpriteRotations || !frame.Filled[rotation] { return SpriteLump{} }
+    return SpriteLump{Patch: frame.Lumps[rotation], Flip: frame.Flips[rotation], Valid: true}
+}

@@ -1,0 +1,130 @@
+package main
+
+import "actorinfo"
+import "play"
+import "wad"
+
+const CombatUnit = 65536
+const Spider = 19
+const Cyberdemon = 21
+const Rocket = 33
+
+func combatActor(kind int, x int, health int, slot int) play.LevelActor {
+    info := actorinfo.KindAt(kind)
+    state := actorinfo.StateAt(info.SpawnState)
+    return play.LevelActor{Valid: true, Kind: kind, Health: health, State: info.SpawnState,
+        Tics: state.Tics, Sprite: state.Sprite, Frame: state.Frame, PlayerSlot: slot, ReactionTime: 8,
+        Physics: play.ActorPhysics{Body: play.MapActor{X: x * CombatUnit, Radius: info.Radius, Height: info.Height,
+            Flags: info.Flags, Player: slot >= 0}}}
+}
+
+func combatBlocks() wad.BlockMapInfo {
+    return wad.BlockMapInfo{Valid: true, OriginX: -128 * CombatUnit, OriginY: -128 * CombatUnit, Width: 4, Height: 4}
+}
+
+test "rocket contact suspends at pain before changing the victim's target" {
+    source := combatActor(actorinfo.ActorPlayer, -120, 100, 0)
+    victim := combatActor(Cyberdemon, 18, 500, -1)
+    missile := combatActor(Rocket, -72, 1000, -1)
+    missile.Target = 1
+    actors := play.MapActors{}.AppendActor(source).AppendActor(victim).AppendActor(missile)
+    blocks := combatBlocks()
+    world := play.CombatWorld{Actors: actors, Links: play.BuildActorLinks(actors, blocks),
+        Random: play.RandomState{GameplayIndex: 255}}
+    scan := play.BeginThingScan(blocks, missile.Physics.Body, 0, 0)
+    impact := play.ScanThingContacts(scan, actors, world.Links, missile, 3, world.Random)
+    assertEqual(impact.Contact.Action, play.ContactDamage)
+    assertEqual(impact.Contact.Target, 2)
+    assertEqual(impact.Contact.Source, 1)
+    assertEqual(impact.Contact.Damage, 20)
+    assertEqual(impact.Random.GameplayIndex, 0)
+
+    level, rules := wad.BspLevel{}, play.CombatRules{Skill: 2}
+    world.Random = impact.Random
+    damage := play.ApplyThingImpact(level, world, 3, impact.Contact, rules)
+    assertEqual(damage.ActorHandle, 2)
+    assertEqual(damage.State.Action, actorinfo.ActionPain)
+    assertEqual(damage.World.Actors.ActorAt(1).Health, 480)
+    assertEqual(damage.World.Actors.ActorAt(1).Target, 0)
+    assertEqual(damage.World.Actors.ActorAt(1).ReactionTime, 8)
+    resumed := play.ResumeMobjCombat(level, damage, rules)
+    assertEqual(resumed.State.Action, 0)
+    assertEqual(resumed.World.Actors.ActorAt(1).Target, 1)
+    assertEqual(resumed.World.Actors.ActorAt(1).ReactionTime, 0)
+    assertEqual(resumed.World.Random.GameplayIndex, 1)
+}
+
+test "skull contact defers the reset until the victim's death action returns" {
+    victim := combatActor(Spider, 18, 2, -1)
+    skull := combatActor(actorinfo.ActorSkull, -72, 100, -1)
+    skull.Physics.Body.Flags = skull.Physics.Body.Flags | play.MoveSkullFly
+    skull.Physics.MomentumX, skull.Physics.MomentumY, skull.Physics.MomentumZ = 21, -13, 5
+    actors := play.MapActors{}.AppendActor(victim).AppendActor(skull)
+    blocks := combatBlocks()
+    world := play.CombatWorld{Actors: actors, Links: play.BuildActorLinks(actors, blocks)}
+    scan := play.BeginThingScan(blocks, skull.Physics.Body, 0, 0)
+    impact := play.ScanThingContacts(scan, actors, world.Links, skull, 2, world.Random)
+    assertEqual(impact.Contact.Action, play.ContactSkull)
+    assertEqual(impact.Contact.Damage, 3)
+
+    level, rules := wad.BspLevel{}, play.CombatRules{Skill: 2}
+    world.Random = impact.Random
+    damage := play.ApplyThingImpact(level, world, 2, impact.Contact, rules)
+    assertEqual(damage.ActorHandle, 1)
+    assert(damage.State.Action != 0)
+    assertEqual(damage.World.Actors.ActorAt(1).Physics.MomentumX, 21)
+    assertEqual(damage.World.Random.GameplayIndex, 1)
+    damage.World.Random = play.PRandom(damage.World.Random).State
+    reset := play.ResumeMobjCombat(level, damage, rules)
+    assertEqual(reset.ActorHandle, 2)
+    assertEqual(reset.State.Action, actorinfo.ActionLook)
+    assertEqual(reset.World.Random.GameplayIndex, 3)
+    skull = reset.World.Actors.ActorAt(1)
+    assertEqual(skull.Physics.Body.Flags & play.MoveSkullFly, bits<32>(0))
+    assertEqual(skull.Physics.MomentumX, 0)
+    assertEqual(skull.Physics.MomentumY, 0)
+    assertEqual(skull.Physics.MomentumZ, 0)
+}
+
+test "rocket explosion stops momentum before its action and draws jitter afterward" {
+    missile := combatActor(Rocket, 0, 1000, -1)
+    missile.Physics.MomentumX, missile.Physics.MomentumY, missile.Physics.MomentumZ = 10, -5, 9
+    world := play.CombatWorld{Actors: play.MapActors{}.AppendActor(missile)}
+    level, rules := wad.BspLevel{}, play.CombatRules{Skill: 2}
+    explosion := play.ExplodeMissile(level, world, 1, rules)
+    assertEqual(explosion.State.Action, actorinfo.ActionExplode)
+    body := explosion.World.Actors.ActorAt(0).Physics
+    assert(body.Body.Flags & play.MoveMissile != 0)
+    assertEqual(body.MomentumX, 0)
+    assertEqual(body.MomentumY, 0)
+    assertEqual(body.MomentumZ, 0)
+    assertEqual(explosion.World.Random.GameplayIndex, 0)
+
+    explosion.World.Random = play.PRandom(explosion.World.Random).State
+    result := play.ResumeMobjCombat(level, explosion, rules)
+    assertEqual(result.State.Action, 0)
+    assertEqual(result.World.Random.GameplayIndex, 2)
+    assertEqual(result.World.Actors.ActorAt(0).Tics, explosion.State.Actor.Tics - 1)
+    assertEqual(result.World.Actors.ActorAt(0).Physics.Body.Flags & play.MoveMissile, bits<32>(0))
+    assertEqual(result.Feedback.Sound, actorinfo.KindAt(Rocket).DeathSound)
+    assertEqual(result.Feedback.SoundOrigin, 1)
+}
+test "expired transient slots are reused at the end of thinker order" {
+    actor := play.LevelActor{Valid: true, Health: 42}
+    roster := play.MapActors{}.AppendActor(actor)
+    roster = roster.AppendTransient(actor).AppendTransient(actor)
+    spawnOrder := roster.TransientFirst()
+    assertEqual(spawnOrder, 2)
+    assertEqual(roster.TransientNext(spawnOrder), 3)
+    assertEqual(roster.ReleaseTransient(0, 2).TransientFirst(), 2, "a live slot cannot be released")
+    expired := roster.ActorAt(spawnOrder - 1)
+    expired.Valid = false
+    roster = roster.WithActor(spawnOrder, expired).ReleaseTransient(0, spawnOrder)
+    assertEqual(roster.NextTransientHandle(), 2)
+    roster = roster.AppendTransient(actor)
+    assertEqual(roster.Count, 3)
+    assertEqual(roster.TransientFirst(), 3)
+    assertEqual(roster.TransientNext(3), 2)
+    assertEqual(roster.TransientNext(2), 0)
+    assertEqual(roster.ActorAt(0).Health, 42)
+}

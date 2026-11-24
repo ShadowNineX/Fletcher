@@ -1,0 +1,14 @@
+root = true
+
+[*.cs]
+dotnet_style_collection_initializer = true
+dotnet_style_prefer_collection_expression = when_types_exactly_match
+dotnet_diagnostic.IDE0028.severity = error
+dotnet_diagnostic.IDE0300.severity = error
+dotnet_diagnostic.IDE0301.severity = error
+dotnet_diagnostic.IDE0302.severity = error
+dotnet_diagnostic.IDE0303.severity = error
+dotnet_diagnostic.IDE0304.severity = error
+dotnet_diagnostic.IDE0305.severity = error
+dotnet_diagnostic.IDE0306.severity = error
+dotnet_diagnostic.IDE0410.severity = error

@@ -1,0 +1,108 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted on 2026-11-21 from R_ProjectSprite in linuxdoom-1.10/r_things.c.
+
+package sprites
+
+import "engine"
+import "numeric"
+import "wad"
+
+const SpriteMinZ = 4 * engine.FracUnit
+const Angle45 bits<32> = 0x20000000
+
+type SpriteActor struct {
+    X int
+    Y int
+    Z int
+    Heading bits<32>
+    FullBright bit
+    Translation int
+    Fuzzy bit
+    Light int
+    ExtraLight int
+}
+
+type ProjectedSprite struct {
+    Valid bit
+    Span engine.ColumnSpan
+    Scale int
+    StartFrac int
+    XStep int
+    TextureMid int
+    Patch wad.LumpRef
+    WorldX int
+    WorldY int
+    WorldZ int
+    TopZ int
+    LightRow int
+    Translation int
+    Fuzzy bit
+}
+
+func spriteSigned16(value int) int {
+    if value >= 32768 { return value - 65536 }
+    return value
+}
+
+func spriteMagnitude(value int) int {
+    if value == -2147483648 { return 2147483647 }
+    if value < 0 { return -value }
+    return value
+}
+
+func spriteHeader(patch wad.LumpRef) [3]int {
+    if !patch.Valid || patch.Size < 8 { return [3]int{} }
+    width := spriteSigned16(wad.U16(patch.File, patch.Offset))
+    if width <= 0 { return [3]int{} }
+    return [3]int{width, spriteSigned16(wad.U16(patch.File, patch.Offset + 4)), spriteSigned16(wad.U16(patch.File, patch.Offset + 6))}
+}
+
+// ProjectSprite is R_ProjectSprite's camera transform, rotation choice, patch
+// offset, edge clipping, and sprite light-row selection. Its span is half-open.
+func ProjectSprite(camera engine.Camera, actor SpriteActor, frame wad.SpriteFrame) ProjectedSprite {
+    if camera.View.Width <= 0 || !frame.Valid { return ProjectedSprite{} }
+    relativeX, relativeY := actor.X - camera.X, actor.Y - camera.Y
+    forward := cport.C_FixedMul(relativeX, engine.AngleCosine(camera.Heading)) + cport.C_FixedMul(relativeY, engine.AngleSine(camera.Heading))
+    if forward < SpriteMinZ { return ProjectedSprite{} }
+    projection := (camera.View.Width / 2) << 16
+    scale := cport.C_FixedDiv(projection, forward)
+    side := -(cport.C_FixedMul(relativeY, engine.AngleCosine(camera.Heading)) - cport.C_FixedMul(relativeX, engine.AngleSine(camera.Heading)))
+    if spriteMagnitude(side) > forward << 2 { return ProjectedSprite{} }
+
+    rotation := 0
+    if frame.Rotate {
+        point := engine.PointToAngle(camera.X, camera.Y, actor.X, actor.Y)
+        rotation = int((point - actor.Heading + (Angle45 >> 1) * 9) >> 29)
+    }
+    selected := wad.SpriteLumpAt(frame, rotation)
+    if !selected.Valid { return ProjectedSprite{} }
+    header := spriteHeader(selected.Patch)
+    width, offset, top := header[0], header[1], header[2]
+    if width <= 0 { return ProjectedSprite{} }
+
+    center := (camera.View.Width / 2) << 16
+    side = side - (offset << 16)
+    first := (center + cport.C_FixedMul(side, scale)) >> 16
+    if first > camera.View.Width { return ProjectedSprite{} }
+    side = side + (width << 16)
+    last := ((center + cport.C_FixedMul(side, scale)) >> 16) - 1
+    if last < 0 { return ProjectedSprite{} }
+    clippedFirst, clippedLast := first, last
+    if clippedFirst < 0 { clippedFirst = 0 }
+    if clippedLast >= camera.View.Width { clippedLast = camera.View.Width - 1 }
+    if clippedFirst > clippedLast { return ProjectedSprite{} }
+
+    inverse := cport.C_FixedDiv(engine.FracUnit, scale)
+    start, step := 0, inverse
+    if selected.Flip { start, step = (width << 16) - 1, -inverse }
+    if clippedFirst > first { start = start + step * (clippedFirst - first) }
+    topZ := actor.Z + (top << 16)
+    verticalScale := scale << camera.View.DetailShift
+    light := engine.WallLightRow(actor.Light, actor.ExtraLight, verticalScale, camera.View.Width, camera.View.DetailShift)
+    if actor.FullBright { light = 0 }
+    return ProjectedSprite{Valid: true, Span: engine.ColumnSpan{First: clippedFirst, End: clippedLast + 1}, Scale: verticalScale,
+        StartFrac: start, XStep: step, TextureMid: topZ - camera.Z, Patch: selected.Patch,
+        WorldX: actor.X, WorldY: actor.Y, WorldZ: actor.Z, TopZ: topZ, LightRow: light,
+        Translation: actor.Translation, Fuzzy: actor.Fuzzy}
+}

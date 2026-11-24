@@ -1,0 +1,120 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// A_VileStart, A_VileTarget, A_Fire and A_VileAttack from p_enemy.c.
+
+package enemy
+
+import "actorinfo"
+import "engine"
+import "numeric"
+import "play"
+import "wad"
+
+const vileFireOffset = 24 * engine.FracUnit
+const VileBlastDamage = 70
+
+func VileStart(world play.CombatWorld, handle int) play.CombatStep {
+    return play.CombatStep{World: world, Feedback: play.CombatFeedback{Sound: actorinfo.SoundVileAttack, SoundOrigin: handle}}
+}
+
+func MoveVileFire(level wad.BspLevel, world play.CombatWorld, handle int, action int) play.CombatStep {
+    result := play.CombatStep{World: world}
+    switch action {
+    case actorinfo.ActionStartFire:
+        result.Feedback.Sound, result.Feedback.SoundOrigin = actorinfo.SoundFireStart, handle
+    case actorinfo.ActionFireCrackle:
+        result.Feedback.Sound, result.Feedback.SoundOrigin = actorinfo.SoundFireCrackle, handle
+    }
+    fire := world.Actors.ActorAt(handle - 1)
+    target := world.Actors.ActorAt(fire.Tracer - 1)
+    vile := world.Actors.ActorAt(fire.Target - 1)
+    if !fire.Valid || !vile.Valid || !monsterCanSee(level, vile, target) { return result }
+
+    body, angle := target.Physics.Body, target.Physics.Angle
+    fire.Physics.Body.X = body.X + cport.C_FixedMul(vileFireOffset, engine.AngleCosine(angle))
+    fire.Physics.Body.Y = body.Y + cport.C_FixedMul(vileFireOffset, engine.AngleSine(angle))
+    fire.Physics.Body.Z = body.Z
+    linked := world.Links.SetActorPosition(level, handle, fire)
+    if !linked.Valid { result.Failed = true; return result }
+    result.World.Actors = world.Actors.WithActor(handle, linked.Actor)
+    result.World.Links = linked.Links
+    result.ActorHandle = handle
+    return result
+}
+
+func TargetVileFire(level wad.BspLevel, world play.CombatWorld, handle int, rules play.CombatRules) play.CombatStep {
+    vile := world.Actors.ActorAt(handle - 1)
+    target := world.Actors.ActorAt(vile.Target - 1)
+    if !vile.Valid || !target.Valid { return play.CombatStep{World: world} }
+
+    world = FaceTarget(world, handle)
+    fireHandle := world.Actors.NextTransientHandle()
+    if fireHandle == 0 { return play.CombatStep{World: world, Failed: true} }
+    body := target.Physics.Body
+    // The original spawn uses the target's X for both coordinates. Its
+    // floor and ceiling are retained when A_Fire relinks the actor.
+    spawn := play.SpawnMobj(level, actorinfo.ActorVileFire, body.X, body.X, body.Z, rules.Skill, world.Random)
+    spawn.Actor.Target, spawn.Actor.Tracer = handle, vile.Target
+    linked := world.Links.SetActorPosition(level, fireHandle, spawn.Actor)
+    if !linked.Valid { return play.CombatStep{World: world, Failed: true} }
+    vile = world.Actors.ActorAt(handle - 1)
+    vile.Tracer = fireHandle
+    world.Actors = world.Actors.WithActor(handle, vile).AppendTransient(linked.Actor)
+    world.Links, world.Random = linked.Links, spawn.Random
+    result := MoveVileFire(level, world, fireHandle, actorinfo.ActionFire)
+    result.ActorHandle = fireHandle
+    return result
+}
+
+type VileAttackStep struct {
+    Combat play.CombatStep
+    Damage play.DamageRequest
+    BlastOrigin int
+    BlastSource int
+    Done bit
+    handle int
+}
+
+func BeginVileAttack(level wad.BspLevel, world play.CombatWorld, handle int, rules play.CombatRules) VileAttackStep {
+    actor := world.Actors.ActorAt(handle - 1)
+    target := world.Actors.ActorAt(actor.Target - 1)
+    if !actor.Valid || !target.Valid { return VileAttackStep{Combat: play.CombatStep{World: world}, Done: true} }
+    world = FaceTarget(world, handle)
+    actor = world.Actors.ActorAt(handle - 1)
+    if !monsterCanSee(level, actor, target) { return VileAttackStep{Combat: play.CombatStep{World: world}, Done: true} }
+
+    damage := play.DamageRequest{Target: actor.Target, Inflictor: handle, Source: handle, Amount: 20}
+    combat := play.DamageMobj(level, world, damage, rules)
+    combat.Feedback.Sound, combat.Feedback.SoundOrigin = actorinfo.SoundBarrelExplosion, handle
+    return VileAttackStep{Combat: combat, Damage: damage, handle: handle}
+}
+
+func ResumeVileAttack(level wad.BspLevel, step VileAttackStep, rules play.CombatRules) VileAttackStep {
+    if step.Done || step.Combat.Failed { return step }
+    step.Damage = play.DamageRequest{}
+    if step.Combat.State.Action != 0 {
+        step.Combat = play.ResumeMobjCombat(level, step.Combat, rules)
+        return step
+    }
+
+    world := step.Combat.World
+    actor := world.Actors.ActorAt(step.handle - 1)
+    target := world.Actors.ActorAt(actor.Target - 1)
+    if target.Valid {
+        target.Physics.MomentumZ = 1000 * engine.FracUnit / actorinfo.KindAt(target.Kind).Mass
+        world.Actors = world.Actors.WithActor(actor.Target, target)
+        fire := world.Actors.ActorAt(actor.Tracer - 1)
+        if fire.Valid && fire.Kind == actorinfo.ActorVileFire {
+            angle := actor.Physics.Angle
+            body := target.Physics.Body
+            // The blast moves the raw origin and uses the fire's old links.
+            fire.Physics.Body.X = body.X - cport.C_FixedMul(vileFireOffset, engine.AngleCosine(angle))
+            fire.Physics.Body.Y = body.Y - cport.C_FixedMul(vileFireOffset, engine.AngleSine(angle))
+            world.Actors = world.Actors.WithActor(actor.Tracer, fire)
+            step.BlastOrigin, step.BlastSource = actor.Tracer, step.handle
+        }
+    }
+    step.Combat = play.CombatStep{World: world, ActorHandle: step.BlastOrigin}
+    step.Done = true
+    return step
+}

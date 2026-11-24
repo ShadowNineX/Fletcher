@@ -1,0 +1,14 @@
+package main
+
+import "play"
+import "wad"
+
+func tickPreviewPlayerSector(scene PreviewCombat, blocks wad.BlockMapInfo, handle int, levelTime int) PreviewCombat {
+    rules := scene.Rules
+    sector := play.TickPlayerSector(scene.Level, scene.Specials, scene.World, handle, levelTime, rules)
+    if sector.Combat.World.Players[0].SecretCount != scene.World.Players[0].SecretCount {
+        scene.Level = sector.State.ApplyTo(scene.Base)
+    }
+    scene.Specials = sector.State
+    return finishPreviewMobjCombat(scene, blocks, sector.Combat, rules)
+}

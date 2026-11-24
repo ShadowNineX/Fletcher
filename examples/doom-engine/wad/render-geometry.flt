@@ -1,0 +1,138 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted on 2026-11-23 from linuxdoom-1.10/r_bsp.c and r_segs.c.
+
+package wad
+
+import "engine"
+
+// CachedWallRef permits immutable decoded SEG records to be kept in paged
+// storage while resolving mutable sector and sidedef state for each frame.
+type CachedWallRef interface {
+    ReadWall(level BspLevel) WallSegment
+    ReadWallMaterial(level BspLevel) SideMaterial
+}
+
+// CachedWall contains only WAD-derived render geometry. Base is safe to use
+// directly when the level has no active changes.
+type CachedWall struct {
+    Base WallSegment
+    material SideMaterial
+    segmentOffsetU int
+    pegTop bit
+    pegBottom bit
+    frontFloorName LumpName
+    backFloorName LumpName
+    ceilingNamesDiffer bit
+}
+
+// A SEG can be clipped using only its two immutable endpoints.
+type WallEdge struct {
+    First engine.Vertex
+    Last engine.Vertex
+    index int
+    valid bit
+}
+
+func (level BspLevel) WallEdgeAt(index int) WallEdge {
+    if index < 0 || index >= level.Segs.Count { return WallEdge{} }
+    file := level.File
+    vertices := LE32(file, level.Segs.Offset + index * SegSize)
+    a, b := vertices & 0xffff, int(bits<32>(vertices) >> 16)
+    if a >= level.Vertices.Count || b >= level.Vertices.Count { return WallEdge{} }
+    return WallEdge{First: VertexAt(file, level.Vertices, a), Last: VertexAt(file, level.Vertices, b), index: index, valid: true}
+}
+
+// CacheWallAt decodes a SEG against its original WAD records. It deliberately
+// does not consult LevelChanges: dynamic sector heights and sidedefs are read
+// by ReadWall and ReadWallMaterial instead.
+func (level BspLevel) CacheWallAt(index int) CachedWall {
+    return level.CacheWallFor(level.WallEdgeAt(index))
+}
+
+// Finish decoding an edge from this level once its wall data is needed.
+func (level BspLevel) CacheWallFor(edge WallEdge) CachedWall {
+    if !edge.valid { return CachedWall{} }
+    refs := level.segmentReferences(edge.index)
+    if !refs.Valid { return CachedWall{} }
+
+    file := level.File
+    offset, front, back := refs.Offset, refs.FrontSector, refs.BackSector
+    base := WallSegment{
+        First: edge.First, Last: edge.Last,
+        Direction: bits<32>(U16(file, offset + 4)) << 16, Front: sectorAt(file, front),
+        RecordOffset: offset, SideOffset: refs.SideOffset, LineOffset: refs.LineOffset,
+        FrontSector: front,
+        FrontSky: skyFlatAt(file, front + 12),
+        Light: (U16(file, front + 20) << 16) >> 16,
+    }
+
+    result := CachedWall{
+        Base: base,
+        material: SideMaterial{
+            Upper: lumpNameAt(file, refs.SideOffset + 4),
+            Lower: lumpNameAt(file, refs.SideOffset + 12),
+            Middle: lumpNameAt(file, refs.SideOffset + 20),
+            OffsetU: signed16(U16(file, refs.SideOffset)) << 16,
+            OffsetV: signed16(U16(file, refs.SideOffset + 2)) << 16,
+        },
+        segmentOffsetU: signed16(U16(file, offset + 10)) << 16,
+    }
+    flags := U16(file, refs.LineOffset + 4)
+    result.pegTop, result.pegBottom = flags & 8 != 0, flags & 16 != 0
+
+    if back >= 0 {
+        result.Base.TwoSided = true
+        result.Base.BackSector = back
+        result.Base.Back = sectorAt(file, back)
+        result.Base.BackLight = signed16(U16(file, back + 20))
+        result.Base.SharedSky = result.Base.FrontSky && skyFlatAt(file, back + 12)
+        frontLow, frontHigh := LE32(file, front + 4), LE32(file, front + 8)
+        backLow, backHigh := LE32(file, back + 4), LE32(file, back + 8)
+        result.frontFloorName = nameFromWords(frontLow, frontHigh)
+        result.backFloorName = nameFromWords(backLow, backHigh)
+        result.ceilingNamesDiffer = nameChanged(file, front + 12, back + 12)
+        lightChanged := result.Base.Light != result.Base.BackLight
+        result.Base.MarkFloor = result.Base.Front.Floor != result.Base.Back.Floor || lightChanged ||
+            frontLow != backLow || frontHigh != backHigh
+        result.Base.MarkCeiling = lightChanged || (!result.Base.SharedSky &&
+            (result.Base.Front.Ceiling != result.Base.Back.Ceiling || result.ceilingNamesDiffer))
+    }
+    result.Base.Valid = true
+    return result
+}
+
+// ReadWall applies current sector state to a WAD-decoded wall. Its immutable
+// Base remains the exact result that SegmentAt would produce for the original
+// level data.
+func (wall CachedWall) ReadWall(level BspLevel) WallSegment {
+    if !wall.Base.Valid || !level.Modified { return wall.Base }
+    result := wall.Base
+    front := sectorId(level, result.FrontSector)
+    result.Front = level.Changes.ReadHeights(front, result.Front)
+    if !result.TwoSided { return result }
+
+    back := sectorId(level, result.BackSector)
+    result.Back = level.Changes.ReadHeights(back, result.Back)
+    lightChanged := result.Light != result.BackLight
+    result.MarkFloor = result.Front.Floor != result.Back.Floor || lightChanged
+    if !result.MarkFloor {
+        frontFloor := level.Changes.ReadFloorName(front, wall.frontFloorName)
+        backFloor := level.Changes.ReadFloorName(back, wall.backFloorName)
+        result.MarkFloor = frontFloor.Low != backFloor.Low || frontFloor.High != backFloor.High
+    }
+    result.MarkCeiling = lightChanged || (!result.SharedSky &&
+        (result.Front.Ceiling != result.Back.Ceiling || wall.ceilingNamesDiffer))
+    return result
+}
+
+// ReadWallMaterial applies a live sidedef override before the immutable SEG
+// offset and linedef peg flags are finalized.
+func (wall CachedWall) ReadWallMaterial(level BspLevel) SideMaterial {
+    if !wall.Base.Valid { return SideMaterial{} }
+    material := wall.material
+    if level.Modified { material = level.Changes.ReadSideMaterial(wall.Base.SideOffset, material) }
+    material.OffsetU = material.OffsetU + wall.segmentOffsetU
+    material.PegTop, material.PegBottom = wall.pegTop, wall.pegBottom
+    return material
+}

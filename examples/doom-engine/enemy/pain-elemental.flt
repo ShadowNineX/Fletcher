@@ -1,0 +1,108 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// A_PainShootSkull, A_PainAttack and A_PainDie from p_enemy.c.
+
+package enemy
+
+import "actorinfo"
+import "engine"
+import "numeric"
+import "play"
+import "wad"
+
+const painSkullCap = 20
+const painQuarterTurn bits<32> = 0x40000000
+const painAttacking = 1
+const painRejected = 2
+
+type PainElementalStep struct {
+    Combat play.CombatStep
+    Done bit
+    remaining int
+    angle bits<32>
+    phase int
+    handle int
+    attack MonsterAttack
+}
+
+func countSkulls(actors play.MapActors) int {
+    count := 0
+    for index := range actors.Count {
+        actor := actors.ActorAt(index)
+        if actor.Valid && actor.Kind == actorinfo.ActorSkull { count = count + 1 }
+    }
+    return count
+}
+
+func spawnPainSkull(level wad.BspLevel, blocks wad.BlockMapInfo, step PainElementalStep, rules play.CombatRules) PainElementalStep {
+    world := step.Combat.World
+    if step.remaining == 0 || countSkulls(world.Actors) > painSkullCap { step.Done = true; return step }
+    actor := world.Actors.ActorAt(step.handle - 1)
+    handle := world.Actors.NextTransientHandle()
+    if !actor.Valid || handle == 0 { step.Combat.Failed = true; return step }
+    angle := step.angle
+    step.angle, step.remaining = angle + painQuarterTurn, step.remaining - 1
+    radius := actorinfo.KindAt(actor.Kind).Radius + actorinfo.KindAt(actorinfo.ActorSkull).Radius
+    prestep := 4 * engine.FracUnit + 3 * radius / 2
+    body := actor.Physics.Body
+    x := body.X + cport.C_FixedMul(prestep, engine.AngleCosine(angle))
+    y := body.Y + cport.C_FixedMul(prestep, engine.AngleSine(angle))
+    spawn := play.SpawnMobj(level, actorinfo.ActorSkull, x, y, body.Z + 8 * engine.FracUnit, rules.Skill, world.Random)
+    linked := world.Links.SetActorPosition(level, handle, spawn.Actor)
+    if !linked.Valid { step.Combat.Failed = true; return step }
+    world.Actors = world.Actors.AppendTransient(linked.Actor)
+    world.Links, world.Random = linked.Links, spawn.Random
+    move := play.TryMovingMobj(level, blocks, world, handle, x, y, rules)
+    world = move.Combat.World
+    if move.Combat.Failed { step.Combat = move.Combat; return step }
+    if !move.Allowed {
+        step.Combat = play.DamageMobj(level, world, play.DamageRequest{Target: handle, Inflictor: step.handle,
+            Source: step.handle, Amount: 10000}, rules)
+        step.phase = painRejected
+        return step
+    }
+    spawned := world.Actors.ActorAt(handle - 1)
+    spawned.Target = actor.Target
+    world.Actors = world.Actors.WithActor(handle, spawned)
+    step.attack = BeginMonsterAttack(level, blocks, world, handle, actorinfo.ActionSkullAttack, rules)
+    step.Combat, step.phase = step.attack.Combat, painAttacking
+    return step
+}
+
+func BeginPainAttack(level wad.BspLevel, blocks wad.BlockMapInfo, world play.CombatWorld, handle int,
+    rules play.CombatRules) PainElementalStep {
+    actor := world.Actors.ActorAt(handle - 1)
+    if !actor.Valid || !world.Actors.ActorAt(actor.Target - 1).Valid {
+        return PainElementalStep{Combat: play.CombatStep{World: world}, Done: true}
+    }
+    world = FaceTarget(world, handle)
+    angle := world.Actors.ActorAt(handle - 1).Physics.Angle
+    return spawnPainSkull(level, blocks, PainElementalStep{Combat: play.CombatStep{World: world},
+        handle: handle, angle: angle, remaining: 1}, rules)
+}
+
+func BeginPainDie(level wad.BspLevel, blocks wad.BlockMapInfo, world play.CombatWorld, handle int,
+    rules play.CombatRules) PainElementalStep {
+    actor := world.Actors.ActorAt(handle - 1)
+    actor.Physics.Body.Flags = actor.Physics.Body.Flags & ~bits<32>(play.ActorSolid)
+    world.Actors = world.Actors.WithActor(handle, actor)
+    return spawnPainSkull(level, blocks, PainElementalStep{Combat: play.CombatStep{World: world}, handle: handle,
+        angle: actor.Physics.Angle + painQuarterTurn, remaining: 3}, rules)
+}
+
+func ResumePainElemental(level wad.BspLevel, blocks wad.BlockMapInfo, step PainElementalStep,
+    rules play.CombatRules) PainElementalStep {
+    if step.Done || step.Combat.Failed { return step }
+    if step.phase == painAttacking && !step.attack.Done {
+        step.attack.Combat = step.Combat
+        step.attack = ResumeMonsterAttack(level, blocks, step.attack, rules)
+        step.Combat = step.attack.Combat
+        return step
+    }
+    if step.phase == painRejected && step.Combat.State.Action != 0 {
+        step.Combat = play.ResumeMobjCombat(level, step.Combat, rules)
+        return step
+    }
+    step.Combat.Feedback = play.CombatFeedback{}
+    return spawnPainSkull(level, blocks, step, rules)
+}

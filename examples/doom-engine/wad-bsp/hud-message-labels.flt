@@ -1,0 +1,62 @@
+package main
+
+import "play"
+
+func pickupHudMessage(message int) string {
+    switch message {
+    case play.PickupMessageArmor: return "ARMOR COLLECTED"
+    case play.PickupMessageMega: return "HEAVY ARMOR COLLECTED"
+    case play.PickupMessageHealthBonus: return "HEALTH BONUS COLLECTED"
+    case play.PickupMessageArmorBonus: return "ARMOR BONUS COLLECTED"
+    case play.PickupMessageSoul: return "SOUL SPHERE COLLECTED"
+    case play.PickupMessageMegaSphere: return "MEGASPHERE COLLECTED"
+    case play.PickupMessageBlueCard: return "BLUE KEYCARD COLLECTED"
+    case play.PickupMessageYellowCard: return "YELLOW KEYCARD COLLECTED"
+    case play.PickupMessageRedCard: return "RED KEYCARD COLLECTED"
+    case play.PickupMessageBlueSkull: return "BLUE SKULL KEY COLLECTED"
+    case play.PickupMessageYellowSkull: return "YELLOW SKULL KEY COLLECTED"
+    case play.PickupMessageRedSkull: return "RED SKULL KEY COLLECTED"
+    case play.PickupMessageStim: return "STIMPACK USED"
+    case play.PickupMessageMedikit: return "MEDIKIT USED"
+    case play.PickupMessageMedikitNeeded: return "MEDIKIT USED AT LOW HEALTH"
+    case play.PickupMessageInvulnerability: return "INVULNERABILITY ACTIVE"
+    case play.PickupMessageBerserk: return "BERSERK ACTIVE"
+    case play.PickupMessageInvisibility: return "PARTIAL INVISIBILITY ACTIVE"
+    case play.PickupMessageSuit: return "RADIATION SUIT ACTIVE"
+    case play.PickupMessageMap: return "COMPUTER MAP COLLECTED"
+    case play.PickupMessageVisor: return "LIGHT VISOR ACTIVE"
+    case play.PickupMessageClip: return "AMMO CLIP COLLECTED"
+    case play.PickupMessageClipBox: return "BULLET BOX COLLECTED"
+    case play.PickupMessageRocket: return "ROCKET COLLECTED"
+    case play.PickupMessageRocketBox: return "ROCKET BOX COLLECTED"
+    case play.PickupMessageCell: return "ENERGY CELL COLLECTED"
+    case play.PickupMessageCellBox: return "ENERGY CELL PACK COLLECTED"
+    case play.PickupMessageShells: return "SHELLS COLLECTED"
+    case play.PickupMessageShellBox: return "SHELL BOX COLLECTED"
+    case play.PickupMessageBackpack: return "AMMO BACKPACK COLLECTED"
+    case play.PickupMessageBfg: return "BFG ACQUIRED"
+    case play.PickupMessageChaingun: return "CHAINGUN ACQUIRED"
+    case play.PickupMessageChainsaw: return "CHAINSAW ACQUIRED"
+    case play.PickupMessageLauncher: return "ROCKET LAUNCHER ACQUIRED"
+    case play.PickupMessagePlasma: return "PLASMA RIFLE ACQUIRED"
+    case play.PickupMessageShotgun: return "SHOTGUN ACQUIRED"
+    case play.PickupMessageSuperShotgun: return "SUPER SHOTGUN ACQUIRED"
+    default: return ""
+    }
+}
+
+func missingKeyHudMessage(key int) string {
+    switch key {
+    case play.CardBlue: return "BLUE KEY REQUIRED"
+    case play.CardYellow: return "YELLOW KEY REQUIRED"
+    case play.CardRed: return "RED KEY REQUIRED"
+    default: return ""
+    }
+}
+
+func markHudMessage(mark int) string {
+    for index, digit := range "0123456789" {
+        if index == mark { return "MAP MARK " + digit + " ADDED" }
+    }
+    return "MAP MARK ADDED"
+}

@@ -1,0 +1,133 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Translated on 2026-11-22 from linuxdoom-1.10/am_map.c.
+package automap
+
+import "numeric"
+
+// ScreenLine is a visible, frame-buffer-space line. Coordinates are inclusive.
+type ScreenLine struct {
+    Valid bit
+    X1 int
+    Y1 int
+    X2 int
+    Y2 int
+}
+
+func mapToFrame(delta int, scale int) int {
+    return cport.C_FixedMul(delta, scale) >> 16
+}
+
+// ScreenX and ScreenY preserve Doom's CXMTOF/CYMTOF rounding and inverted Y axis.
+func ScreenX(window Window, x int) int {
+    return mapToFrame(x - window.X, window.Scale)
+}
+
+func ScreenY(window Window, y int) int {
+    return window.Height - mapToFrame(y - window.Y, window.Scale)
+}
+
+func mapOutcode(window Window, x int, y int) int {
+    outcode := 0
+    if y > window.Y + window.MapHeight { outcode = 8
+    } else if y < window.Y { outcode = 4 }
+    if x < window.X { outcode = outcode | 1
+    } else if x > window.X + window.MapWidth { outcode = outcode | 2 }
+    return outcode
+}
+
+func screenOutcode(window Window, x int, y int) int {
+    outcode := 0
+    if y < 0 { outcode = outcode | 8
+    } else if y >= window.Height { outcode = outcode | 4 }
+    if x < 0 { outcode = outcode | 1
+    } else if x >= window.Width { outcode = outcode | 2 }
+    return outcode
+}
+
+// ClipLine is Doom's AM_clipMline: it rejects in map coordinates, converts to
+// pixels, then applies the same Cohen-Sutherland edge order and integer math.
+func ClipLine(window Window, x1 int, y1 int, x2 int, y2 int) ScreenLine {
+    outcode1 := mapOutcode(window, x1, y1)
+    outcode2 := mapOutcode(window, x2, y2)
+    if outcode1 & outcode2 != 0 { return ScreenLine{} }
+
+    sx1, sy1 := ScreenX(window, x1), ScreenY(window, y1)
+    sx2, sy2 := ScreenX(window, x2), ScreenY(window, y2)
+    outcode1 = screenOutcode(window, sx1, sy1)
+    outcode2 = screenOutcode(window, sx2, sy2)
+    if outcode1 & outcode2 != 0 { return ScreenLine{} }
+
+    // A line can meet at most four edges. The bounded loop is the language-safe
+    // equivalent of the source's while (outcode1 | outcode2).
+    for range 8 {
+        if outcode1 | outcode2 == 0 {
+            return ScreenLine{Valid: true, X1: sx1, Y1: sy1, X2: sx2, Y2: sy2}
+        }
+        outside := outcode2
+        if outcode1 != 0 { outside = outcode1 }
+        tx, ty := 0, 0
+        if outside & 8 != 0 {
+            dy, dx := sy1 - sy2, sx2 - sx1
+            tx, ty = sx1 + dx * sy1 / dy, 0
+        } else if outside & 4 != 0 {
+            dy, dx := sy1 - sy2, sx2 - sx1
+            tx, ty = sx1 + dx * (sy1 - window.Height) / dy, window.Height - 1
+        } else if outside & 2 != 0 {
+            dy, dx := sy2 - sy1, sx2 - sx1
+            tx, ty = window.Width - 1, sy1 + dy * (window.Width - 1 - sx1) / dx
+        } else if outside & 1 != 0 {
+            dy, dx := sy2 - sy1, sx2 - sx1
+            tx, ty = 0, sy1 + dy * -sx1 / dx
+        }
+        if outside == outcode1 {
+            sx1, sy1 = tx, ty
+            outcode1 = screenOutcode(window, sx1, sy1)
+        } else {
+            sx2, sy2 = tx, ty
+            outcode2 = screenOutcode(window, sx2, sy2)
+        }
+        if outcode1 & outcode2 != 0 { return ScreenLine{} }
+    }
+    return ScreenLine{}
+}
+
+func magnitude(value int) int {
+    if value < 0 { return -value }
+    return value
+}
+
+func drawScreenLine(window Window, line ScreenLine, shade color) {
+    dx := line.X2 - line.X1
+    ax := 2 * magnitude(dx)
+    sx := 1
+    if dx < 0 { sx = -1 }
+    dy := line.Y2 - line.Y1
+    ay := 2 * magnitude(dy)
+    sy := 1
+    if dy < 0 { sy = -1 }
+    x, y := line.X1, line.Y1
+    if ax > ay {
+        d := ay - ax / 2
+        for range window.Width {
+            pixel(x, y, true, shade)
+            if x == line.X2 { return }
+            if d >= 0 { y, d = y + sy, d - ax }
+            x, d = x + sx, d + ay
+        }
+    } else {
+        d := ax - ay / 2
+        for range window.Height {
+            pixel(x, y, true, shade)
+            if y == line.Y2 { return }
+            if d >= 0 { x, d = x + sx, d - ay }
+            y, d = y + sy, d + ax
+        }
+    }
+}
+
+// DrawLine clips map-space endpoints then draws the exact Doom framebuffer path.
+func DrawLine(window Window, x1 int, y1 int, x2 int, y2 int, shade color) {
+    line := ClipLine(window, x1, y1, x2, y2)
+    if line.Valid { drawScreenLine(window, line, shade) }
+}

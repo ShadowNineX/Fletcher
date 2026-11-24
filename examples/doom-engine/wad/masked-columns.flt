@@ -1,0 +1,58 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted on 2026-11-21 from R_RenderMaskedSegRange in
+// linuxdoom-1.10/r_segs.c.
+
+package wad
+
+// PostSource identifies one checked patch-column stream. Offset is the
+// absolute file offset of its first post header; it may name a terminal 255
+// byte for a transparent column.
+type PostSource struct {
+    Valid bit
+    Patch LumpRef
+    Offset int
+}
+
+func checkedPatchPostOffset(patch LumpRef, column int) int {
+    if !patch.Valid || column < 0 || patch.Offset < 0 || patch.Size < PatchHeaderSize ||
+        patch.Offset > len(patch.File) - patch.Size { return -1 }
+    width, height := signed16(U16(patch.File, patch.Offset)), signed16(U16(patch.File, patch.Offset + 2))
+    if width <= 0 || height <= 0 || PatchHeaderSize + width * 4 > patch.Size || column >= width { return -1 }
+    directoryEnd := PatchHeaderSize + width * 4
+    relative := LE32(patch.File, patch.Offset + PatchHeaderSize + column * 4)
+    if relative < directoryEnd || relative >= patch.Size { return -1 }
+
+    cursor, end := patch.Offset + relative, patch.Offset + patch.Size
+    first := cursor
+    // A source passed to the masked drawer must have a complete sequence of
+    // posts ending in 255. This preserves empty transparent columns while
+    // rejecting a stream that could escape its lump during rendering.
+    for range patch.Size / 4 + 1 {
+        if cursor >= end { return -1 }
+        top := int(patch.File[cursor])
+        if top == 255 { return first }
+        if cursor > end - 4 { return -1 }
+        length := int(patch.File[cursor + 1])
+        if length > end - cursor - 4 { return -1 }
+        cursor = cursor + length + 4
+    }
+    return -1
+}
+
+// PatchPostSource resolves and validates a sprite patch column. A valid
+// zero-post column returns its readable 255 terminator as Offset.
+func PatchPostSource(patch LumpRef, column int) PostSource {
+    offset := checkedPatchPostOffset(patch, column)
+    if offset < 0 { return PostSource{} }
+    return PostSource{Valid: true, Patch: patch, Offset: offset}
+}
+
+// TextureSheetPostSource resolves a raw single-patch wall column after the
+// caller applies R_GetColumn's texture-width wrapping.
+func TextureSheetPostSource(sheet TextureSheet, wrapped int) PostSource {
+    if !sheet.Valid { return PostSource{} }
+    column := wrapped - sheet.OriginX
+    if column < 0 || column >= sheet.Width { return PostSource{} }
+    return PatchPostSource(sheet.Patch, column)
+}

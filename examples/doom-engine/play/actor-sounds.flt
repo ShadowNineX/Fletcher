@@ -1,0 +1,40 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Actor sound actions from linuxdoom-1.10/p_enemy.c.
+
+package play
+
+import "actorinfo"
+
+// A zero origin plays at full volume. A zero sound ID requests silence.
+func ActorActionSound(actor LevelActor, handle int, action int, commercial bit, random RandomState) (int, int, RandomState) {
+    if !actor.Valid { return 0, 0, random }
+    sound := 0
+    switch action {
+    case actorinfo.ActionPain:
+        sound = actorinfo.KindAt(actor.Kind).PainSound
+    case actorinfo.ActionXScream:
+        sound = actorinfo.SoundSlop
+    case actorinfo.ActionHoof:
+        sound = actorinfo.SoundCyberdemonStep
+    case actorinfo.ActionMetal:
+        sound = actorinfo.SoundSpiderStep
+    case actorinfo.ActionBabyMetal:
+        sound = actorinfo.SoundArachnotronStep
+    case actorinfo.ActionPlayerScream:
+        sound = actorinfo.SoundPlayerDeath
+        if commercial && actor.Health < -50 { sound = actorinfo.SoundPlayerHighDeath }
+    case actorinfo.ActionScream:
+        sound = actorinfo.KindAt(actor.Kind).DeathSound
+        if sound >= actorinfo.SoundDeathHuman && sound < actorinfo.SoundDeathHuman + 3 {
+            roll := PRandom(random)
+            sound, random = actorinfo.SoundDeathHuman + int(roll.Value) % 3, roll.State
+        } else if sound >= actorinfo.SoundDeathDemon && sound < actorinfo.SoundDeathDemon + 2 {
+            roll := PRandom(random)
+            sound, random = actorinfo.SoundDeathDemon + int(roll.Value) % 2, roll.State
+        }
+        if actor.Kind == actorinfo.ActorSpider || actor.Kind == actorinfo.ActorCyborg { handle = 0 }
+    }
+    if sound == 0 { return 0, 0, random }
+    return sound, handle, random
+}

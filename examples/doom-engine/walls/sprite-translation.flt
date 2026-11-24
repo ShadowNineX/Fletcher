@@ -1,0 +1,21 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// R_InitTranslationTables from linuxdoom-1.10/r_draw.c.
+
+package walls
+
+const spriteGreenRampFirst = 0x70
+const spriteGreenRampLast = 0x7f
+
+// TranslateSpriteIndex maps Doom's green player ramp for the three nonzero
+// MF_TRANSLATION values. Translation zero retains the original palette index.
+func TranslateSpriteIndex(index int, translation int) int {
+    if index < spriteGreenRampFirst || index > spriteGreenRampLast { return index }
+    offset := index & 15
+    switch translation {
+    case 1: return 0x60 + offset
+    case 2: return 0x40 + offset
+    case 3: return 0x20 + offset
+    }
+    return index
+}

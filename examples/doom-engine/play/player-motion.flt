@@ -1,0 +1,89 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted from P_Thrust, P_MovePlayer and P_CalcHeight in linuxdoom-1.10/p_user.c.
+
+package play
+
+import "actorinfo"
+import "engine"
+import "numeric"
+
+const quarterTurn bits<32> = 0x40000000
+const maxBob = 0x100000
+
+type PlayerMoveCommand struct {
+    Forward int
+    Side int
+    Turn int
+}
+
+type PlayerView struct {
+    Height int
+    Delta int
+    Z int
+    Bob int
+}
+
+func playerThrust(actor ActorPhysics, angle bits<32>, move int) ActorPhysics {
+    actor.MomentumX = actor.MomentumX + cport.C_FixedMul(move, engine.AngleCosine(angle))
+    actor.MomentumY = actor.MomentumY + cport.C_FixedMul(move, engine.AngleSine(angle))
+    return actor
+}
+
+func ApplyPlayerMoveCommand(actor ActorPhysics, command PlayerMoveCommand) ActorPhysics {
+    actor.Angle = actor.Angle + (bits<32>(command.Turn) << 16)
+    if actor.Body.Z > actor.Body.Floor { return actor }
+    if command.Forward != 0 { actor = playerThrust(actor, actor.Angle, command.Forward * 2048) }
+    if command.Side != 0 { actor = playerThrust(actor, actor.Angle - quarterTurn, command.Side * 2048) }
+    return actor
+}
+
+// Movement commands animate a ready body even while it is airborne.
+func BeginPlayerWalk(actor LevelActor, command PlayerMoveCommand) LevelActor {
+    if actor.State == actorinfo.StatePlayerReady && (command.Forward != 0 || command.Side != 0) {
+        return SetMobjState(actor, actorinfo.StatePlayerRunFirst).Actor
+    }
+    return actor
+}
+
+// P_XYMovement can stop the walking animation before the body state timer.
+func StopPlayerWalk(actor LevelActor) LevelActor {
+    if actor.State >= actorinfo.StatePlayerRunFirst && actor.State <= actorinfo.StatePlayerRunLast {
+        return SetMobjState(actor, actorinfo.StatePlayerReady).Actor
+    }
+    return actor
+}
+
+// The player thinker calls this before the actor's XY/Z movement.
+func CalculatePlayerView(actor ActorPhysics, levelTime int, live bit, noMomentum bit) PlayerView {
+    return CalculatePlayerViewOnGround(actor, levelTime, live, noMomentum, actor.Body.Z <= actor.Body.Floor)
+}
+
+func CalculatePlayerViewOnGround(actor ActorPhysics, levelTime int, live bit, noMomentum bit, onGround bit) PlayerView {
+    x, y := actor.MomentumX, actor.MomentumY
+    bob := (cport.C_FixedMul(x, x) + cport.C_FixedMul(y, y)) >> 2
+    if bob > maxBob { bob = maxBob }
+    view := PlayerView{Height: actor.ViewHeight, Delta: actor.ViewHeightDelta, Z: actor.Body.Z + actor.ViewHeight, Bob: bob}
+    if noMomentum || !onGround { return view }
+
+    angle := bits<32>(levelTime * (8192 / 20)) << engine.FineAngleShift
+    bobOffset := cport.C_FixedMul(bob / 2, engine.AngleSine(angle))
+    if live {
+        view.Height = view.Height + view.Delta
+        if view.Height > NormalViewHeight {
+            view.Height, view.Delta = NormalViewHeight, 0
+        }
+        if view.Height < NormalViewHeight / 2 {
+            view.Height = NormalViewHeight / 2
+            if view.Delta <= 0 { view.Delta = 1 }
+        }
+        if view.Delta != 0 {
+            view.Delta = view.Delta + engine.FracUnit / 4
+            if view.Delta == 0 { view.Delta = 1 }
+        }
+    }
+    view.Z = actor.Body.Z + view.Height + bobOffset
+    viewCeiling := actor.Body.Ceiling - 4 * engine.FracUnit
+    if view.Z > viewCeiling { view.Z = viewCeiling }
+    return view
+}

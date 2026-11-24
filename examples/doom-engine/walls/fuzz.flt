@@ -1,0 +1,41 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// R_DrawFuzzColumn from linuxdoom-1.10/r_draw.c.
+
+package walls
+
+import "wad"
+
+const FuzzLength = 50
+const fuzzColorRow = 6
+const fuzzRowOffsets = [FuzzLength]int{
+    1, -1, 1, -1, 1, 1, -1,
+    1, 1, -1, 1, 1, 1, -1,
+    1, 1, 1, -1, -1, -1, -1,
+    1, -1, -1, 1, 1, 1, 1, -1,
+    1, -1, 1, 1, -1, -1, 1,
+    1, -1, -1, -1, -1, 1, 1,
+    1, 1, -1, 1, 1, -1, 1,
+}
+
+// Read the indexed framebuffer as it is being drawn. The -1 entries can
+// sample a pixel already overwritten by this column, just like Doom.
+func DrawFuzzColumn(x int, first int, end int, height int, phase int, shade WadShading) int {
+    if first < 1 { first = 1 }
+    if end >= height { end = height - 1 }
+    table := shade.ColorMaps.Offset + fuzzColorRow * wad.ColorMapBytes
+    if !shade.Valid || !shade.ColorMaps.Valid || shade.ColorMaps.Offset < 0 ||
+        shade.ColorMaps.Size < (fuzzColorRow + 1) * wad.ColorMapBytes ||
+        shade.ColorMaps.Offset > len(shade.ColorMaps.File) - shade.ColorMaps.Size { return phase }
+    sampleColumn := shade.ScreenX + (x << shade.DetailShift)
+    for offset := range end - first {
+        row := first + offset
+        source := pixelIndexAt(sampleColumn, shade.ScreenY + row + fuzzRowOffsets[phase])
+        if source < 0 { source = 0 }
+        index := int(shade.ColorMaps.File[table + source])
+        shade.DrawMappedPixel(index, x, row)
+        phase = phase + 1
+        if phase == FuzzLength { phase = 0 }
+    }
+    return phase
+}

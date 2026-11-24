@@ -1,0 +1,22 @@
+package main
+
+// x,y is the forwarding phase lamp. A transition on either edge requests
+// one note. Stretch the edge to two ticks so a request during a pulse can
+// sound on the first available tick.
+macro FixedCue(x int, y int, instrument int, octave int, note int) {
+    place blueISplitter at (x, y + 1) facing right
+    place arrow at (x + 1, y + 1) facing right
+    place xor at (x + 2, y + 1) facing right
+    place blueISplitter at (x + 3, y + 1) facing right
+    place arrow at (x + 4, y + 1) facing right
+    place blueLSplitter at (x + 5, y + 1) facing right
+
+    // With stretched request I, pulse[t] = I[t] && (!I[t-1] || pulse[t-2]).
+    // The feedback and output ANDs receive the same two signals.
+    place not at (x + 5, y + 2) facing right
+    place and at (x + 6, y + 1) facing down
+    place lSplitter at (x + 6, y + 2) facing right flipped
+    place lSplitter at (x + 7, y + 1) facing left flipped
+    place and at (x + 7, y + 2) facing down
+    place music at (x + 7, y + 3) facing right with { instrument = instrument, octave = octave, note = note }
+}

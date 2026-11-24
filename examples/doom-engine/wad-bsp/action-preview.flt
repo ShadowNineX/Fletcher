@@ -1,0 +1,272 @@
+package main
+
+import "actorinfo"
+import "enemy"
+import "play"
+import "wad"
+
+const resumeState = 1
+const resumeRadius = 2
+const resumeBfg = 3
+const resumeVolley = 4
+const resumePain = 5
+const resumeVile = 6
+const resumeBrainSpit = 7
+const resumeBrainArrival = 8
+const resumeMonsterWalk = 9
+
+type PreviewActionRef<T> interface {
+    Read() T
+}
+
+type PreviewActionBox<T> struct {
+    Value T
+}
+
+func (box PreviewActionBox<T>) Read() T { return box.Value }
+
+type PreviewStateAction struct {
+    Handle int
+    Step play.ActorStateStep
+    Missile bit
+}
+
+type PreviewPendingAction struct {
+    Kind int
+    State PreviewActionRef<PreviewStateAction>
+    Radius PreviewActionRef<play.RadiusAttackStep>
+    Bfg PreviewActionRef<play.BfgSprayStep>
+    Volley PreviewActionRef<enemy.MonsterAttack>
+    Pain PreviewActionRef<enemy.PainElementalStep>
+    Vile PreviewActionRef<enemy.VileAttackStep>
+    Spit PreviewActionRef<enemy.BrainSpitStep>
+    Arrival PreviewActionRef<enemy.BrainArrival>
+    Walk PreviewActionRef<PreviewMonsterWalk>
+}
+
+type PreviewActionStep struct {
+    Scene PreviewCombat
+    Handle int
+    Action int
+    Pending PreviewPendingAction
+}
+
+func previewActionEvent(scene PreviewCombat, event play.CombatStep) PreviewActionStep {
+    return PreviewActionStep{Scene: observePreviewCombat(scene, event), Handle: event.ActorHandle, Action: event.State.Action}
+}
+
+func pendingRadius(scene PreviewCombat, blast play.RadiusAttackStep) PreviewActionStep {
+    progress := previewActionEvent(scene, blast.Combat)
+    if !blast.Done {
+        progress.Pending.Kind, progress.Pending.Radius = resumeRadius, PreviewActionBox<play.RadiusAttackStep>{Value: blast}
+    }
+    return progress
+}
+
+func pendingBfg(scene PreviewCombat, spray play.BfgSprayStep) PreviewActionStep {
+    progress := previewActionEvent(scene, spray.Combat)
+    if !spray.Done {
+        progress.Pending.Kind, progress.Pending.Bfg = resumeBfg, PreviewActionBox<play.BfgSprayStep>{Value: spray}
+    }
+    return progress
+}
+
+func pendingVolley(scene PreviewCombat, attack enemy.MonsterAttack) PreviewActionStep {
+    progress := previewActionEvent(scene, attack.Combat)
+    if !attack.Done {
+        progress.Pending.Kind, progress.Pending.Volley = resumeVolley, PreviewActionBox<enemy.MonsterAttack>{Value: attack}
+    }
+    return progress
+}
+
+func pendingPain(scene PreviewCombat, step enemy.PainElementalStep) PreviewActionStep {
+    progress := previewActionEvent(scene, step.Combat)
+    if !step.Done {
+        progress.Pending.Kind, progress.Pending.Pain = resumePain, PreviewActionBox<enemy.PainElementalStep>{Value: step}
+    }
+    return progress
+}
+
+func pendingVile(scene PreviewCombat, attack enemy.VileAttackStep) PreviewActionStep {
+    progress := previewActionEvent(scene, attack.Combat)
+    if !attack.Done || attack.BlastOrigin != 0 {
+        progress.Pending.Kind, progress.Pending.Vile = resumeVile, PreviewActionBox<enemy.VileAttackStep>{Value: attack}
+    }
+    return progress
+}
+
+func pendingBrainSpit(scene PreviewCombat, shot enemy.BrainSpitStep) PreviewActionStep {
+    progress := previewActionEvent(scene, shot.Combat)
+    if !shot.Done {
+        progress.Pending.Kind, progress.Pending.Spit = resumeBrainSpit, PreviewActionBox<enemy.BrainSpitStep>{Value: shot}
+    }
+    return progress
+}
+
+func pendingBrainArrival(scene PreviewCombat, arrival enemy.BrainArrival) PreviewActionStep {
+    progress := previewActionEvent(scene, arrival.Combat)
+    if !arrival.Done {
+        progress.Pending.Kind, progress.Pending.Arrival = resumeBrainArrival, PreviewActionBox<enemy.BrainArrival>{Value: arrival}
+    }
+    return progress
+}
+
+func pendingActorState(scene PreviewCombat, state PreviewStateAction) PreviewActionStep {
+    actor := state.Step.Actor
+    if state.Step.Action == 0 && state.Missile {
+        actor.Physics.Body.Flags = actor.Physics.Body.Flags | play.ActorJustAttacked
+    }
+    scene.World.Actors = scene.World.Actors.WithActor(state.Handle, actor)
+    if state.Step.Removed { scene.World.Links = scene.World.Links.UnlinkActor(state.Handle) }
+    scene.Failed = state.Step.Failed
+    progress := PreviewActionStep{Scene: scene, Handle: state.Handle, Action: state.Step.Action}
+    if state.Step.Action != 0 {
+        progress.Pending.Kind, progress.Pending.State = resumeState, PreviewActionBox<PreviewStateAction>{Value: state}
+    }
+    return progress
+}
+
+func beginPreviewAction(scene PreviewCombat, blocks wad.BlockMapInfo, handle int, action int,
+    rules play.CombatRules) PreviewActionStep {
+    switch action {
+    case actorinfo.ActionLook, actorinfo.ActionChase, actorinfo.ActionVileChase, actorinfo.ActionHoof,
+        actorinfo.ActionMetal, actorinfo.ActionBabyMetal, actorinfo.ActionCPosRefire, actorinfo.ActionSpidRefire:
+        return beginPreviewMonsterAction(scene, blocks, handle, action, rules)
+    case actorinfo.ActionExplode:
+        return pendingRadius(scene, play.BeginExplodeAction(scene.Level, blocks, scene.World, handle, rules))
+    case actorinfo.ActionBFGSpray:
+        return pendingBfg(scene, play.BeginBfgSpray(scene.Level, blocks, scene.World, handle, rules))
+    case actorinfo.ActionPosAttack, actorinfo.ActionSPosAttack, actorinfo.ActionCPosAttack,
+        actorinfo.ActionTroopAttack, actorinfo.ActionSargAttack, actorinfo.ActionHeadAttack,
+        actorinfo.ActionBruisAttack, actorinfo.ActionBspiAttack, actorinfo.ActionCyberAttack, actorinfo.ActionSkullAttack,
+        actorinfo.ActionSkelWhoosh, actorinfo.ActionSkelFist, actorinfo.ActionSkelMissile, actorinfo.ActionFatRaise,
+        actorinfo.ActionFatAttack1, actorinfo.ActionFatAttack2, actorinfo.ActionFatAttack3:
+        return pendingVolley(scene, enemy.BeginMonsterAttack(scene.Level, blocks, scene.World, handle, action, rules))
+    case actorinfo.ActionPainAttack:
+        return pendingPain(scene, enemy.BeginPainAttack(scene.Level, blocks, scene.World, handle, rules))
+    case actorinfo.ActionPainDie:
+        return pendingPain(scene, enemy.BeginPainDie(scene.Level, blocks, scene.World, handle, rules))
+    case actorinfo.ActionVileAttack:
+        return pendingVile(scene, enemy.BeginVileAttack(scene.Level, scene.World, handle, rules))
+    case actorinfo.ActionBrainSpit:
+        shot := enemy.BeginBrainSpit(scene.Level, scene.World, scene.Brain, handle, rules)
+        scene.Brain = shot.Brain
+        return pendingBrainSpit(scene, shot)
+    case actorinfo.ActionSpawnFly, actorinfo.ActionSpawnSound:
+        return pendingBrainArrival(scene, enemy.BeginBrainArrival(scene.World, handle, action))
+    case actorinfo.ActionTracer:
+        scene = observePreviewCombat(scene, enemy.RunTracer(scene.Level, scene.World, handle, scene.GameTic, rules))
+    case actorinfo.ActionFire, actorinfo.ActionStartFire, actorinfo.ActionFireCrackle:
+        scene = observePreviewCombat(scene, enemy.MoveVileFire(scene.Level, scene.World, handle, action))
+    case actorinfo.ActionFaceTarget:
+        scene.World = enemy.FaceTarget(scene.World, handle)
+    case actorinfo.ActionVileStart:
+        scene = observePreviewCombat(scene, enemy.VileStart(scene.World, handle))
+    case actorinfo.ActionVileTarget:
+        scene = observePreviewCombat(scene, enemy.TargetVileFire(scene.Level, scene.World, handle, rules))
+    case actorinfo.ActionBrainAwake:
+        scene.Brain = enemy.AwakenBrain(scene.World, scene.Brain)
+        scene = observePreviewCombat(scene, play.CombatStep{World: scene.World, Feedback: play.CombatFeedback{Sound: actorinfo.SoundBossAwake}})
+    case actorinfo.ActionBrainScream, actorinfo.ActionBrainExplode:
+        scene = observePreviewCombat(scene, enemy.BrainFireworks(scene.Level, scene.World, handle, action, rules))
+    case actorinfo.ActionBrainPain:
+        scene = observePreviewCombat(scene, play.CombatStep{World: scene.World, Feedback: play.CombatFeedback{Sound: actorinfo.SoundBossPain}})
+    default:
+        scene = previewActorStateAction(scene, handle, action)
+    }
+    return PreviewActionStep{Scene: scene}
+}
+
+func resumePreviewAction(scene PreviewCombat, blocks wad.BlockMapInfo, pending PreviewPendingAction,
+    rules play.CombatRules) PreviewActionStep {
+    switch pending.Kind {
+    case resumeState:
+        state := pending.State.Read()
+        actor := scene.World.Actors.ActorAt(state.Handle - 1)
+        state.Step = play.ResumeMobjStateWithFast(state.Step, actor, rules.Fast)
+        return pendingActorState(scene, state)
+    case resumeRadius:
+        blast := pending.Radius.Read()
+        blast.Combat.World = scene.World
+        return pendingRadius(scene, play.ResumeRadiusAttack(scene.Level, blast, rules))
+    case resumeBfg:
+        spray := pending.Bfg.Read()
+        spray.Combat.World = scene.World
+        return pendingBfg(scene, play.ResumeBfgSpray(scene.Level, blocks, spray, rules))
+    case resumeVolley:
+        attack := pending.Volley.Read()
+        if attack.SpecialLine >= 0 {
+            scene.Specials = scene.Specials.WithActorOrder(scene.World.Actors)
+            scene.Specials.Lighting.Random = scene.World.Random
+            scene.Specials = play.ShootLevelSpecial(scene.Level, scene.Specials, attack.SpecialLine, false)
+            if scene.Specials.LimitExceeded() {
+                scene.Failed = true
+                return PreviewActionStep{Scene: scene}
+            }
+            scene.World.Actors = scene.World.Actors.WithSectorOrder(scene.Specials)
+            scene.Level = scene.Specials.ApplyTo(scene.Base)
+            scene.World.Random = scene.Specials.Lighting.Random
+        }
+        attack.Combat.World = scene.World
+        return pendingVolley(scene, enemy.ResumeMonsterAttack(scene.Level, blocks, attack, rules))
+    case resumePain:
+        step := pending.Pain.Read()
+        step.Combat.World = scene.World
+        return pendingPain(scene, enemy.ResumePainElemental(scene.Level, blocks, step, rules))
+    case resumeVile:
+        attack := pending.Vile.Read()
+        if attack.Done {
+            return pendingRadius(scene, play.BeginRadiusAttack(scene.Level, blocks, scene.World, attack.BlastOrigin,
+                attack.BlastSource, enemy.VileBlastDamage, rules))
+        }
+        attack.Combat.World = scene.World
+        return pendingVile(scene, enemy.ResumeVileAttack(scene.Level, attack, rules))
+    case resumeBrainSpit:
+        shot := pending.Spit.Read()
+        shot.Combat.World = scene.World
+        return pendingBrainSpit(scene, enemy.ResumeBrainSpit(scene.Level, blocks, shot, rules))
+    case resumeBrainArrival:
+        arrival := pending.Arrival.Read()
+        arrival.Combat.World = scene.World
+        number := play.BossMapNumber(scene.Level.MapName)
+        return pendingBrainArrival(scene, enemy.ResumeBrainArrival(scene.Level, blocks, arrival, number, rules))
+    case resumeMonsterWalk:
+        walk := pending.Walk.Read()
+        walk.Step.Move.Level, walk.Step.Move.Specials, walk.Step.Move.World = scene.Level, scene.Specials, scene.World
+        walk.Step = enemy.ResumeMonsterWalk(scene.Base, blocks, walk.Step, rules)
+        return previewMonsterWalkProgress(scene, blocks, walk, rules)
+    }
+    scene.Failed = true
+    return PreviewActionStep{Scene: scene}
+}
+
+// Doom enters nested state actions synchronously. Resume a suspended attack
+// with the world left by its callback before moving on to another thinker.
+func dispatchPreviewCombat(scene PreviewCombat, blocks wad.BlockMapInfo, event play.CombatStep, rules play.CombatRules) PreviewCombat {
+    scene = observePreviewCombat(scene, event)
+    if scene.Failed || event.State.Action == 0 { return scene }
+    progress := beginPreviewAction(scene, blocks, event.ActorHandle, event.State.Action, rules)
+    if progress.Action == 0 && progress.Pending.Kind == 0 { return progress.Scene }
+
+    var parents play.PagedSlots<PreviewActionRef<PreviewPendingAction>>
+    depth := 0
+    for range play.ThinkerIterationLimit {
+        scene = progress.Scene
+        if scene.Failed { return scene }
+        if progress.Action != 0 {
+            if progress.Pending.Kind != 0 {
+                parents = parents.With(depth, PreviewActionBox<PreviewPendingAction>{Value: progress.Pending})
+                depth = depth + 1
+            }
+            progress = beginPreviewAction(scene, blocks, progress.Handle, progress.Action, rules)
+        } else if progress.Pending.Kind != 0 {
+            progress = resumePreviewAction(scene, blocks, progress.Pending, rules)
+        } else {
+            if depth == 0 { return scene }
+            depth = depth - 1
+            progress = resumePreviewAction(scene, blocks, parents.At(depth).Read(), rules)
+        }
+    }
+    scene.Failed = true
+    return scene
+}

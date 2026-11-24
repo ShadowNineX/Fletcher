@@ -1,0 +1,77 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
+package wad
+
+import "engine"
+
+const spriteBuckets = 1024
+const emptySpriteHeads = [spriteBuckets]int{}
+
+type spriteDirectoryRef interface {
+    Complete() bit
+    Head(prefix int) int
+    At(code int) spriteDirectoryEntry
+    Extend(source nameIndexSource, batch int) spriteDirectory
+}
+
+type spriteDirectoryEntry struct {
+    Prefix int
+    Index int
+    Next int
+}
+
+type spriteDirectory struct {
+    heads [spriteBuckets]int
+    entries engine.PagedSlots<spriteDirectoryEntry>
+    start int
+    remaining int
+}
+
+func (directory spriteDirectory) Complete() bit { return directory.remaining == 0 }
+
+func (directory spriteDirectory) At(code int) spriteDirectoryEntry { return directory.entries.At(code - 1) }
+
+func spriteBucket(prefix int) int { return nameBucket(LumpName{Low: prefix}) & (spriteBuckets - 1) }
+
+func (directory spriteDirectory) Head(prefix int) int { return directory.heads[spriteBucket(prefix)] }
+
+func (directory spriteDirectory) Extend(source nameIndexSource, batch int) spriteDirectory {
+    count := directory.remaining
+    if batch < count { count = batch }
+    // Prepend entries from the end so matching prefixes are visited in their
+    // original S_START/S_END order, including two-pair and duplicate names.
+    for delta := range count {
+        code := directory.remaining - delta
+        index := directory.start + code - 1
+        key := source.IndexKey(index)
+        bucket := spriteBucket(key.Name.Low)
+        directory.entries = directory.entries.With(code - 1,
+            spriteDirectoryEntry{Prefix: key.Name.Low, Index: index, Next: directory.heads[bucket]})
+        directory.heads[bucket] = code
+    }
+    directory.remaining = directory.remaining - count
+    return directory
+}
+
+func (mounts Archives) SpriteIndexReady() bit {
+    return !mounts.Failed && (mounts.Lumps == 0 ||
+        mounts.spriteRevision == mounts.Revision && mounts.spriteNames.Complete())
+}
+
+// BuildSpriteIndex is optional. LoadSprite scans the directory until the
+// index for the current mounted archive has been completed.
+func (mounts Archives) BuildSpriteIndex(batch int) Archives {
+    if !mounts.IndexReady() || mounts.SpriteIndexReady() || batch <= 0 { return mounts }
+    directory := mounts.spriteNames
+    if mounts.spriteRevision != mounts.Revision {
+        start, end := mounts.Find(spriteStartName()), mounts.Find(spriteEndName())
+        fresh := spriteDirectory{heads: emptySpriteHeads}
+        if start.Valid && end.Valid && end.Index > start.Index {
+            fresh.start, fresh.remaining = start.Index + 1, end.Index - start.Index - 1
+        }
+        directory = fresh
+        mounts.spriteRevision = mounts.Revision
+    }
+    mounts.spriteNames = directory.Extend(mounts, batch)
+    return mounts
+}

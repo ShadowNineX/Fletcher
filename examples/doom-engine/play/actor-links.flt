@@ -1,0 +1,133 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Sector and BLOCKMAP thing lists from linuxdoom-1.10/p_maputl.c.
+
+package play
+
+import "wad"
+
+const ActorNoBlockMap = 0x10
+
+// Handles and sector/cell keys are one-based. Zero denotes an unlinked actor.
+type actorLink struct {
+    Key int
+    Previous int
+    Following int
+}
+
+type ActorList struct {
+    heads PagedSlots<int>
+    entries PagedSlots<actorLink>
+}
+
+type ActorLinks struct {
+    sectors ActorList
+    cells ActorList
+    blockMap wad.BlockMapInfo
+}
+
+func (list ActorList) first(key int) int {
+    if key <= 0 { return 0 }
+    return list.heads.At(key - 1)
+}
+
+func (list ActorList) successor(handle int) int {
+    if handle <= 0 { return 0 }
+    return list.entries.At(handle - 1).Following
+}
+
+func sectorLinkKey(actor LevelActor) int {
+    if !actor.Valid || actor.Sector < 0 || actor.Physics.Body.Flags & ActorNoSector != 0 { return 0 }
+    return actor.Sector + 1
+}
+
+func (links ActorLinks) blockKey(x int, y int) int {
+    if !links.blockMap.Valid || x < 0 || y < 0 || x >= links.blockMap.Width || y >= links.blockMap.Height { return 0 }
+    return y * links.blockMap.Width + x + 1
+}
+
+func actorBlockKey(blockMap wad.BlockMapInfo, actor LevelActor) int {
+    body := actor.Physics.Body
+    if !actor.Valid || body.Flags & ActorNoBlockMap != 0 { return 0 }
+    cell := wad.BlockCellAt(blockMap, body.X, body.Y)
+    if !cell.Valid { return 0 }
+    return cell.Y * blockMap.Width + cell.X + 1
+}
+
+func (list ActorList) prepend(handle int, key int) ActorList {
+    if key == 0 { return list }
+    head := list.heads.At(key - 1)
+    if head != 0 {
+        entry := list.entries.At(head - 1)
+        entry.Previous = handle
+        list.entries = list.entries.With(head - 1, entry)
+    }
+    list.entries = list.entries.With(handle - 1, actorLink{Key: key, Following: head})
+    list.heads = list.heads.With(key - 1, handle)
+    return list
+}
+
+func BuildActorLinks(actors MapActors, blockMap wad.BlockMapInfo) ActorLinks {
+    links := ActorLinks{blockMap: blockMap}
+    for index := range actors.Count {
+        actor := actors.ActorAt(index)
+        links.sectors = links.sectors.prepend(index + 1, sectorLinkKey(actor))
+        links.cells = links.cells.prepend(index + 1, actorBlockKey(blockMap, actor))
+    }
+    return links
+}
+
+// A successful P_TryMove removes and prepends the thing even if its sector
+// and block are unchanged. Relinking also accepts a previously unused slot.
+func replaceActorLink(list ActorList, handle int, key int) ActorList {
+    index := handle - 1
+    old := list.entries.At(index)
+    if old.Key == 0 { return list.prepend(handle, key) }
+    if old.Key == key && old.Previous == 0 { return list }
+    if old.Previous == 0 {
+        list.heads = list.heads.With(old.Key - 1, old.Following)
+    } else {
+        before := list.entries.At(old.Previous - 1)
+        before.Following = old.Following
+        list.entries = list.entries.With(old.Previous - 1, before)
+    }
+    if old.Following != 0 {
+        after := list.entries.At(old.Following - 1)
+        after.Previous = old.Previous
+        list.entries = list.entries.With(old.Following - 1, after)
+    }
+    if key == 0 {
+        list.entries = list.entries.With(index, actorLink{})
+        return list
+    }
+    return list.prepend(handle, key)
+}
+
+func (links ActorLinks) UnlinkActor(handle int) ActorLinks {
+    if handle <= 0 { return links }
+    return ActorLinks{sectors: replaceActorLink(links.sectors, handle, 0), cells: replaceActorLink(links.cells, handle, 0), blockMap: links.blockMap}
+}
+
+type ActorPosition struct {
+    Valid bit
+    Actor LevelActor
+    Links ActorLinks
+}
+
+func (links ActorLinks) SetActorPosition(level wad.BspLevel, handle int, actor LevelActor) ActorPosition {
+    if !actor.Valid || handle <= 0 { return ActorPosition{Actor: actor, Links: links} }
+    sector := level.SectorAtPoint(actor.Physics.Body.X, actor.Physics.Body.Y)
+    if !sector.Valid { return ActorPosition{Actor: actor, Links: links} }
+    actor.Sector, actor.Subsector = sector.Index, sector.Subsector
+    return ActorPosition{Valid: true, Actor: actor, Links: ActorLinks{
+        sectors: replaceActorLink(links.sectors, handle, sectorLinkKey(actor)),
+        cells: replaceActorLink(links.cells, handle, actorBlockKey(links.blockMap, actor)),
+        blockMap: links.blockMap,
+    }}
+}
+
+func (links ActorLinks) SectorFirst(sector int) int { return links.sectors.first(sector + 1) }
+func (links ActorLinks) SectorNext(handle int) int { return links.sectors.successor(handle) }
+func (links ActorLinks) HasBlockMap() bit { return links.blockMap.Valid }
+func (links ActorLinks) BlockFirst(x int, y int) int { return links.cells.first(links.blockKey(x, y)) }
+func (links ActorLinks) BlockNext(handle int) int { return links.cells.successor(handle) }

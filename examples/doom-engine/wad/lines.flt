@@ -1,0 +1,103 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted on 2026-11-21 from linuxdoom-1.10/p_setup.c and p_maputl.c.
+
+package wad
+
+import "engine"
+
+const LineSlopeHorizontal = 0
+const LineSlopeVertical = 1
+const LineSlopePositive = 2
+const LineSlopeNegative = 3
+
+type CollisionLine struct {
+    Valid bit
+    First engine.Vertex
+    Last engine.Vertex
+    DeltaX int
+    DeltaY int
+    Slope int
+    Bounds engine.Box
+    FrontSector int
+    BackSector int
+    Flags bits<32>
+    Action int
+    Tag int
+}
+
+type Opening struct {
+    Valid bit
+    TwoSided bit
+    OpenTop int
+    OpenBottom int
+    LowFloor int
+    Range int
+}
+
+func recordLumpInFile(file bytes, lump Lump, recordSize int) bit {
+    return lump.Valid && lump.Offset >= 0 && lump.Count >= 0 && recordSize > 0 && lump.Offset <= len(file) &&
+        lump.Count <= (len(file) - lump.Offset) / recordSize
+}
+
+func sectorId(level BspLevel, offset int) int {
+    if offset < level.Sectors.Offset || offset > level.Sectors.Offset + (level.Sectors.Count - 1) * SectorSize { return -1 }
+    if (offset - level.Sectors.Offset) % SectorSize != 0 { return -1 }
+    return (offset - level.Sectors.Offset) / SectorSize
+}
+
+func lineSlope(dx int, dy int) int {
+    if dx == 0 { return LineSlopeVertical }
+    if dy == 0 { return LineSlopeHorizontal }
+    if dx < 0 && dy < 0 || dx > 0 && dy > 0 { return LineSlopePositive }
+    return LineSlopeNegative
+}
+
+// LineAt decodes and validates a classic LINEDEFS record for collision. Its
+// front/back sectors follow Doom's sidedef order, independent of rendering.
+func (level BspLevel) LineAt(index int) CollisionLine {
+    if index < 0 || index >= level.Lines.Count || !recordLumpInFile(level.File, level.Lines, LineSize) ||
+        !recordLumpInFile(level.File, level.Vertices, VertexSize) || !recordLumpInFile(level.File, level.Sides, SideSize) ||
+        !recordLumpInFile(level.File, level.Sectors, SectorSize) { return CollisionLine{} }
+    offset := level.Lines.Offset + index * LineSize
+    firstIndex, lastIndex := U16(level.File, offset), U16(level.File, offset + 2)
+    if firstIndex >= level.Vertices.Count || lastIndex >= level.Vertices.Count { return CollisionLine{} }
+    first, last := VertexAt(level.File, level.Vertices, firstIndex), VertexAt(level.File, level.Vertices, lastIndex)
+    frontSide := sideOffset(level, offset, 0)
+    front := sectorId(level, sideSector(level, frontSide))
+    if front < 0 { return CollisionLine{} }
+
+    back := -1
+    backIndex := U16(level.File, offset + 12)
+    if backIndex != 0xffff {
+        backSide := sideOffset(level, offset, 1)
+        back = sectorId(level, sideSector(level, backSide))
+        if back < 0 { return CollisionLine{} }
+    }
+
+    bounds := engine.Box{Top: first.Y, Bottom: first.Y, Left: first.X, Right: first.X}
+    bounds = engine.AddPointToBox(bounds, last.X, last.Y)
+    action := signed16(U16(level.File, offset + 6))
+    if level.Modified { action = level.Changes.ReadLineAction(index, action) }
+    return CollisionLine{
+        Valid: true, First: first, Last: last, DeltaX: last.X - first.X, DeltaY: last.Y - first.Y,
+        Slope: lineSlope(last.X - first.X, last.Y - first.Y), Bounds: bounds,
+        FrontSector: front, BackSector: back, Flags: bits<32>(U16(level.File, offset + 4)),
+        Action: action, Tag: signed16(U16(level.File, offset + 8)),
+    }
+}
+
+// LineOpening is P_LineOpening with explicit result state. A valid one-sided
+// line has Range zero and TwoSided false; malformed records stay invalid.
+func LineOpening(level BspLevel, line CollisionLine) Opening {
+    if !line.Valid || !recordLumpInFile(level.File, level.Sectors, SectorSize) ||
+        line.FrontSector < 0 || line.FrontSector >= level.Sectors.Count ||
+        line.BackSector < -1 || line.BackSector >= level.Sectors.Count { return Opening{} }
+    if line.BackSector < 0 { return Opening{Valid: true} }
+    front := level.sectorHeightsAtOffset(level.Sectors.Offset + line.FrontSector * SectorSize)
+    back := level.sectorHeightsAtOffset(level.Sectors.Offset + line.BackSector * SectorSize)
+    top, bottom, low := front.Ceiling, front.Floor, back.Floor
+    if back.Ceiling < top { top = back.Ceiling }
+    if back.Floor > bottom { bottom, low = back.Floor, front.Floor }
+    return Opening{Valid: true, TwoSided: true, OpenTop: top, OpenBottom: bottom, LowFloor: low, Range: top - bottom}
+}

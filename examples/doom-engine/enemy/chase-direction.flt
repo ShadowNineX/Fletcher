@@ -1,0 +1,144 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Resumable P_NewChaseDir candidate selection from linuxdoom-1.10/p_enemy.c.
+
+package enemy
+
+import "engine"
+import "play"
+
+const ChaseEast = 0
+const ChaseNorthEast = 1
+const ChaseNorth = 2
+const ChaseNorthWest = 3
+const ChaseWest = 4
+const ChaseSouthWest = 5
+const ChaseSouth = 6
+const ChaseSouthEast = 7
+const ChaseNoDir = 8
+
+type ChaseDirectionRequest struct {
+    ActorX int
+    ActorY int
+    OldDirection int
+    TargetX int
+    TargetY int
+    Random play.RandomState
+}
+
+type ChaseDirectionTrace struct {
+    Valid bit
+    Done bit
+    Direction int
+    MoveCount int
+    Random play.RandomState
+    first int
+    second int
+    oldDirection int
+    turnaround int
+    cursor int
+    scanStep int
+    phase int
+    deltaX int
+    deltaY int
+}
+
+func chaseAbs(value int) int { if value < 0 { return -value }; return value }
+
+func oppositeDirection(direction int) int {
+    switch direction {
+    case ChaseEast: return ChaseWest
+    case ChaseNorthEast: return ChaseSouthWest
+    case ChaseNorth: return ChaseSouth
+    case ChaseNorthWest: return ChaseSouthEast
+    case ChaseWest: return ChaseEast
+    case ChaseSouthWest: return ChaseNorthEast
+    case ChaseSouth: return ChaseNorth
+    case ChaseSouthEast: return ChaseNorthWest
+    default: return ChaseNoDir
+    }
+}
+
+func diagonalDirection(dy int, dx int) int {
+    if dy < 0 { if dx > 0 { return ChaseSouthEast }; return ChaseSouthWest }
+    if dx > 0 { return ChaseNorthEast }
+    return ChaseNorthWest
+}
+
+func BeginChaseDirection(request ChaseDirectionRequest) ChaseDirectionTrace {
+    if request.OldDirection < ChaseEast || request.OldDirection > ChaseNoDir { return ChaseDirectionTrace{} }
+    dx, dy := request.TargetX - request.ActorX, request.TargetY - request.ActorY
+    first, second := ChaseNoDir, ChaseNoDir
+    if dx > 10 * engine.FracUnit { first = ChaseEast
+    } else if dx < -10 * engine.FracUnit { first = ChaseWest }
+    if dy < -10 * engine.FracUnit { second = ChaseSouth
+    } else if dy > 10 * engine.FracUnit { second = ChaseNorth }
+    turnaround := oppositeDirection(request.OldDirection)
+    result := ChaseDirectionTrace{Valid: true, Random: request.Random, first: first, second: second,
+        oldDirection: request.OldDirection, turnaround: turnaround, Direction: ChaseNoDir, deltaX: dx, deltaY: dy}
+    if first != ChaseNoDir && second != ChaseNoDir {
+        diagonal := diagonalDirection(dy, dx)
+        if diagonal != turnaround { result.Direction = diagonal; return result }
+    }
+    return ResumeChaseDirection(result, false)
+}
+
+// ResumeChaseDirection consumes one P_TryWalk result and returns the next
+// native candidate. Set moved=true when the caller's real move succeeds.
+func ResumeChaseDirection(trace ChaseDirectionTrace, moved bit) ChaseDirectionTrace {
+    if !trace.Valid || trace.Done { return trace }
+    if moved {
+        roll := play.PRandom(trace.Random)
+        trace.Random, trace.MoveCount, trace.Done = roll.State, int(roll.Value & 15), true
+        return trace
+    }
+    for range 16 {
+        switch trace.phase {
+        case 0:
+            roll := play.PRandom(trace.Random)
+            trace.Random = roll.State
+            if int(roll.Value) > 200 || chaseAbs(trace.deltaY) > chaseAbs(trace.deltaX) {
+                trace.first, trace.second = trace.second, trace.first
+            }
+            trace.phase = 1
+        case 1:
+            trace.phase = 2
+            if trace.first != ChaseNoDir && trace.first != trace.turnaround {
+                trace.Direction = trace.first
+                return trace
+            }
+        case 2:
+            trace.phase = 3
+            if trace.second != ChaseNoDir && trace.second != trace.turnaround {
+                trace.Direction = trace.second
+                return trace
+            }
+        case 3:
+            trace.phase = 4
+            if trace.oldDirection != ChaseNoDir { trace.Direction = trace.oldDirection; return trace }
+        case 4:
+            roll := play.PRandom(trace.Random)
+            trace.Random = roll.State
+            trace.cursor, trace.scanStep = ChaseSouthEast, -1
+            if roll.Value & 1 != 0 { trace.cursor, trace.scanStep = ChaseEast, 1 }
+            trace.phase = 5
+        case 5:
+            candidate := trace.cursor
+            if candidate < ChaseEast || candidate > ChaseSouthEast {
+                trace.phase = 6
+            } else {
+                trace.cursor = candidate + trace.scanStep
+                if candidate != trace.turnaround { trace.Direction = candidate; return trace }
+            }
+        case 6:
+            trace.phase = 7
+            if trace.turnaround != ChaseNoDir { trace.Direction = trace.turnaround; return trace }
+        default:
+            trace.Direction, trace.Done = ChaseNoDir, true
+            return trace
+        }
+    }
+    trace.Valid = false
+    return trace
+}
+

@@ -1,0 +1,140 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Visible sprite order and clipping from linuxdoom-1.10/r_things.c.
+
+package sprites
+
+import "engine"
+
+type VisibleSpriteRef interface {
+    ReadVisibleSprite() ProjectedSprite
+}
+
+func (sprite ProjectedSprite) ReadVisibleSprite() ProjectedSprite { return sprite }
+
+type visibleSpriteEntry struct {
+    scale int
+    sprite VisibleSpriteRef
+}
+
+type VisibleSprites struct {
+    Count int
+    entries engine.PagedSlots<visibleSpriteEntry>
+    lastScale int
+    needsSort bit
+}
+
+func (list VisibleSprites) At(index int) ProjectedSprite {
+    return list.entries.At(index).sprite.ReadVisibleSprite()
+}
+
+func AddVisibleSprite(list VisibleSprites, sprite ProjectedSprite) VisibleSprites {
+    if !sprite.Valid { return list }
+    if list.Count > 0 && sprite.Scale < list.lastScale { list.needsSort = true }
+    list.entries = list.entries.With(list.Count, visibleSpriteEntry{scale: sprite.Scale, sprite: sprite})
+    list.Count = list.Count + 1
+    list.lastScale = sprite.Scale
+    return list
+}
+
+// Merge far-to-near, consuming the earlier run first for equal scales.
+// A positive int count needs at most 31 passes of doubled run widths.
+func SortVisibleSprites(list VisibleSprites) VisibleSprites {
+    if !list.needsSort { return list }
+    var scratch engine.PagedSlots<visibleSpriteEntry>
+    width := 1
+    for range 31 {
+        runs := ((list.Count - 1) / width) / 2 + 1
+        for run := range runs {
+            start := run * 2 * width
+            middle := list.Count
+            if list.Count - start > width { middle = start + width }
+            end := list.Count
+            if list.Count - middle > width { end = middle + width }
+            left, right := start, middle
+            first, second := list.entries.At(left), list.entries.At(right)
+            for offset := range end - start {
+                index := start + offset
+                if left < middle && (right == end || first.scale <= second.scale) {
+                    scratch = scratch.With(index, first)
+                    left = left + 1
+                    if left < middle { first = list.entries.At(left) }
+                } else {
+                    scratch = scratch.With(index, second)
+                    right = right + 1
+                    if right < end { second = list.entries.At(right) }
+                }
+            }
+        }
+        list.entries, scratch = scratch, list.entries
+        if width >= list.Count - width {
+            list.lastScale = list.entries.At(list.Count - 1).scale
+            list.needsSort = false
+            return list
+        }
+        width = width * 2
+    }
+    return list
+}
+
+func SegmentOccludesSprite(segment engine.DrawSegment, sprite ProjectedSprite) bit {
+    near, far := segment.ScaleFirst, segment.ScaleLast
+    if near < far { near, far = far, near }
+    return near >= sprite.Scale && (far >= sprite.Scale ||
+        engine.PointOnSegSide(sprite.WorldX, sprite.WorldY, segment.First.X, segment.First.Y, segment.Last.X, segment.Last.Y) != 0)
+}
+
+// Each edge uses the first clipping segment in the backward scan, separately
+// for the upper and lower silhouette. Clip words are half-open row ranges.
+func ClipSprite(sprite ProjectedSprite, coverage engine.ColumnCoverage, height int) [engine.MaxViewWidth]bits<32> {
+    var tops [engine.MaxViewWidth]int
+    var bottoms [engine.MaxViewWidth]int
+    var result [engine.MaxViewWidth]bits<32>
+    if !sprite.Valid || height <= 0 || sprite.Span.First < 0 || sprite.Span.End > engine.MaxViewWidth { return result }
+
+    // Each page summarizes its silhouette range and largest endpoint. Reject
+    // pages that cannot clip this sprite before reading their segment records.
+    pages := coverage.DrawSegments.PageCount()
+    for reversePage := range pages {
+        page := coverage.DrawSegments.PageAt(pages - 1 - reversePage)
+        if page.CanClip(sprite.Span, sprite.Scale) {
+            count := page.Count()
+            for reverse := range count {
+                segment := page.At(count - 1 - reverse)
+                first, end := sprite.Span.First, sprite.Span.End
+                if segment.Span.First > first { first = segment.Span.First }
+                if segment.Span.End < end { end = segment.Span.End }
+                top := segment.Top && sprite.TopZ > segment.TopHeight
+                bottom := segment.Bottom && sprite.WorldZ < segment.BottomHeight
+                if first < end && (top || bottom) && SegmentOccludesSprite(segment, sprite) {
+                    var rows [engine.MaxViewWidth]bits<32>
+                    if (top && !segment.TopClosed) || (bottom && !segment.BottomClosed) {
+                        rows = segment.ClipRows.ReadRows()
+                    }
+                    for offset := range end - first {
+                        x := first + offset
+                        if top && tops[x] == 0 {
+                            tops[x] = 1
+                            if segment.TopClosed { tops[x] = height + 1 } else if rows[x] != 0 { tops[x] = int(rows[x] >> 16) }
+                        }
+                        if bottom && bottoms[x] == 0 {
+                            bottoms[x] = height + 1
+                            if segment.BottomClosed { bottoms[x] = 1 } else if rows[x] != 0 { bottoms[x] = int(rows[x] & 0xffff) + 1 }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for offset := range sprite.Span.End - sprite.Span.First {
+        x := sprite.Span.First + offset
+        if tops[x] != 0 || bottoms[x] != 0 {
+            top, bottom := tops[x], bottoms[x] - 1
+            if top == 0 { top = 1 }
+            if bottom < 0 { bottom = height }
+            result[x] = (bits<32>(top) << 16) | bits<32>(bottom)
+        }
+    }
+    return result
+}

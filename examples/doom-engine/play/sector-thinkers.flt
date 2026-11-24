@@ -1,0 +1,106 @@
+package play
+
+type sectorThinkerEntry interface {
+    sectorIndex() int
+    registrationOrder() int
+}
+
+type sectorThinkerSlot<T> struct {
+    Entry T
+    Previous int
+    Following int
+    OlderInSector int
+    NewerInSector int
+}
+
+// The live list keeps registration order independently of recycled handles.
+// The sector index also links overlapping movers on the same plane.
+type sectorThinkerList<T extends sectorThinkerEntry> struct {
+    slots PagedSlots<sectorThinkerSlot<T>>
+    sectorHeads PagedSlots<int>
+    first int
+    last int
+    allocated int
+    free int
+}
+
+func (list sectorThinkerList<T>) findSector(sector int) int { return list.sectorHeads.At(sector) }
+func (list sectorThinkerList<T>) slotAt(handle int) sectorThinkerSlot<T> { return list.slots.At(handle) }
+
+func (list sectorThinkerList<T>) withEntry(handle int, entry T) sectorThinkerList<T> {
+    slot := list.slotAt(handle)
+    slot.Entry = entry
+    list.slots = list.slots.With(handle, slot)
+    return list
+}
+
+func (list sectorThinkerList<T>) append(entry T) sectorThinkerList<T> {
+    handle := list.free
+    if handle == 0 {
+        list.allocated = list.allocated + 1
+        handle = list.allocated
+    } else {
+        list.free = list.slotAt(handle).Following
+    }
+    sector := entry.sectorIndex()
+    slot := sectorThinkerSlot<T>{Entry: entry, Previous: list.last, OlderInSector: list.findSector(sector)}
+    if slot.Previous > 0 {
+        previous := list.slotAt(slot.Previous)
+        previous.Following = handle
+        list.slots = list.slots.With(slot.Previous, previous)
+    } else {
+        list.first = handle
+    }
+    if slot.OlderInSector > 0 {
+        older := list.slotAt(slot.OlderInSector)
+        older.NewerInSector = handle
+        list.slots = list.slots.With(slot.OlderInSector, older)
+    }
+    list.slots = list.slots.With(handle, slot)
+    list.sectorHeads = list.sectorHeads.With(sector, handle)
+    list.last = handle
+    return list
+}
+
+func (list sectorThinkerList<T>) remove(handle int) sectorThinkerList<T> {
+    slot := list.slotAt(handle)
+    if slot.Previous > 0 {
+        previous := list.slotAt(slot.Previous)
+        previous.Following = slot.Following
+        list.slots = list.slots.With(slot.Previous, previous)
+    } else {
+        list.first = slot.Following
+    }
+    if slot.Following > 0 {
+        following := list.slotAt(slot.Following)
+        following.Previous = slot.Previous
+        list.slots = list.slots.With(slot.Following, following)
+    } else {
+        list.last = slot.Previous
+    }
+    if slot.NewerInSector > 0 {
+        newer := list.slotAt(slot.NewerInSector)
+        newer.OlderInSector = slot.OlderInSector
+        list.slots = list.slots.With(slot.NewerInSector, newer)
+    } else {
+        list.sectorHeads = list.sectorHeads.With(slot.Entry.sectorIndex(), slot.OlderInSector)
+    }
+    if slot.OlderInSector > 0 {
+        older := list.slotAt(slot.OlderInSector)
+        older.NewerInSector = slot.NewerInSector
+        list.slots = list.slots.With(slot.OlderInSector, older)
+    }
+    list.slots = list.slots.With(handle, sectorThinkerSlot<T>{Following: list.free})
+    list.free = handle
+    return list
+}
+
+func (list sectorThinkerList<T>) afterOrder(order int, count int) int {
+    handle := list.first
+    for range count {
+        slot := list.slotAt(handle)
+        if slot.Entry.registrationOrder() > order { return handle }
+        handle = slot.Following
+    }
+    return 0
+}

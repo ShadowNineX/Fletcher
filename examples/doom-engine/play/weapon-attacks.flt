@@ -1,0 +1,152 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// The attack parts of the player psprite actions from p_pspr.c.
+
+package play
+
+import "actorinfo"
+import "engine"
+import "wad"
+
+const weaponMeleeRange = 64 * engine.FracUnit
+const sawFacingStep bits<32> = 0x40000000 / 20
+const sawFacingOffset bits<32> = 0x40000000 / 21
+const ActorJustAttacked bits<32> = 0x80
+
+// Resolve each line special or combat callback before resuming. Shotgun
+// pellets share the initial slope and draw their spread from the live world.
+type WeaponAttackStep struct {
+    Combat CombatStep
+    Done bit
+    SpecialLine int
+    Impact ShotImpact
+    Hit DamageRequest
+    source int
+    action int
+    slope int
+    pellets int
+    accurate bit
+    meleeTarget int
+    projectile bit
+    shot LineAttackStep
+    launch MissileLaunch
+}
+
+func recordWeaponShot(step WeaponAttackStep, shot LineAttackStep) WeaponAttackStep {
+    step.shot, step.Combat = shot, shot.Combat
+    step.Impact, step.Hit, step.SpecialLine = shot.Impact, shot.Hit, -1
+    if shot.Event == ShotSpecial { step.SpecialLine = shot.SpecialLine }
+    return step
+}
+
+func shootWeaponPellet(level wad.BspLevel, blocks wad.BlockMapInfo, step WeaponAttackStep, rules CombatRules) WeaponAttackStep {
+    world := step.Combat.World
+    step.pellets = step.pellets - 1
+    if step.action != actorinfo.ActionFireShotgun2 {
+        return recordWeaponShot(step, BeginGunShot(level, blocks, world, step.source, step.slope, step.accurate, rules))
+    }
+    body := world.Actors.ActorAt(step.source - 1).Physics
+    damage := PRandom(world.Random)
+    left := PRandom(damage.State)
+    right := PRandom(left.State)
+    up := PRandom(right.State)
+    down := PRandom(up.State)
+    world.Random = down.State
+    heading := body.Angle + bits<32>((int(left.Value) - int(right.Value)) << 19)
+    slope := step.slope + ((int(up.Value) - int(down.Value)) << 5)
+    amount := 5 * (int(damage.Value) % 3 + 1)
+    return recordWeaponShot(step, BeginLineAttack(level, blocks, world, step.source, heading, gunAttackRange, slope, amount, rules))
+}
+
+func beginWeaponMelee(level wad.BspLevel, blocks wad.BlockMapInfo, step WeaponAttackStep, rules CombatRules) WeaponAttackStep {
+    world := step.Combat.World
+    actor := world.Actors.ActorAt(step.source - 1)
+    damage := PRandom(world.Random)
+    left := PRandom(damage.State)
+    right := PRandom(left.State)
+    world.Random = right.State
+    distance := weaponMeleeRange
+    amount := 2 * (int(damage.Value) % 10 + 1)
+    if step.action == actorinfo.ActionSaw {
+        distance = distance + 1
+    } else if world.Players[actor.PlayerSlot].Powers[PowerStrength] != 0 {
+        amount = amount * 10
+    }
+    heading := actor.Physics.Angle + bits<32>((int(left.Value) - int(right.Value)) << 18)
+    aim := AimLineAttack(level, blocks, world, step.source, heading, distance)
+    if !aim.Valid { step.Combat.Failed = true; return step }
+    step.meleeTarget = aim.Target
+    return recordWeaponShot(step, BeginLineAttack(level, blocks, world, step.source, heading, distance, aim.Slope, amount, rules))
+}
+
+func finishWeaponMelee(step WeaponAttackStep) WeaponAttackStep {
+    sound := 0
+    target := step.Combat.World.Actors.ActorAt(step.meleeTarget - 1).Physics.Body
+    if step.action == actorinfo.ActionSaw { sound = actorinfo.SoundSawMiss }
+    if step.meleeTarget > 0 {
+        sound = actorinfo.SoundPunch
+        actor := step.Combat.World.Actors.ActorAt(step.source - 1)
+        body := actor.Physics.Body
+        angle := engine.PointToAngle(body.X, body.Y, target.X, target.Y)
+        if step.action == actorinfo.ActionSaw {
+            sound = actorinfo.SoundSawHit
+            delta := angle - actor.Physics.Angle
+            if delta > 0x80000000 {
+                if delta < -sawFacingStep { angle = angle + sawFacingOffset } else { angle = actor.Physics.Angle - sawFacingStep }
+            } else {
+                if delta > sawFacingStep { angle = angle - sawFacingOffset } else { angle = actor.Physics.Angle + sawFacingStep }
+            }
+            actor.Physics.Body.Flags = body.Flags | ActorJustAttacked
+        }
+        actor.Physics.Angle = angle
+        step.Combat.World.Actors = step.Combat.World.Actors.WithActor(step.source, actor)
+    }
+    if sound != 0 { step.Combat.Feedback.Sound, step.Combat.Feedback.SoundOrigin = sound, step.source }
+    return step
+}
+
+func BeginWeaponAttack(level wad.BspLevel, blocks wad.BlockMapInfo, world CombatWorld, source int, action int,
+    refire int, rules CombatRules) WeaponAttackStep {
+    step := WeaponAttackStep{Combat: CombatStep{World: world}, source: source, action: action, SpecialLine: -1}
+    if combatPlayer(world.Actors.ActorAt(source - 1)) < 0 { step.Combat.Failed = true; return step }
+    kind := -1
+    switch action {
+    case actorinfo.ActionFireMissile: kind = actorinfo.ActorRocket
+    case actorinfo.ActionFirePlasma: kind = actorinfo.ActorPlasma
+    case actorinfo.ActionFireBFG: kind = actorinfo.ActorBfg
+    case actorinfo.ActionPunch, actorinfo.ActionSaw: return beginWeaponMelee(level, blocks, step, rules)
+    case actorinfo.ActionFirePistol, actorinfo.ActionFireCGun: step.pellets, step.accurate = 1, refire == 0
+    case actorinfo.ActionFireShotgun: step.pellets = 7
+    case actorinfo.ActionFireShotgun2: step.pellets = 20
+    default: step.Combat.Failed = true; return step
+    }
+    if kind >= 0 {
+        step.launch = BeginPlayerMissile(level, blocks, world, source, kind, rules)
+        step.Combat, step.projectile = step.launch.Combat, true
+        return step
+    }
+    aim := AimPlayerAttack(level, blocks, world, source)
+    if !aim.Valid { step.Combat.Failed = true; return step }
+    step.slope = aim.Slope
+    return shootWeaponPellet(level, blocks, step, rules)
+}
+
+func ResumeWeaponAttack(level wad.BspLevel, blocks wad.BlockMapInfo, step WeaponAttackStep, rules CombatRules) WeaponAttackStep {
+    if step.Done || step.Combat.Failed { return step }
+    if step.projectile {
+        step.launch.Combat = step.Combat
+        step.launch = ResumeMissileLaunch(level, blocks, step.launch, rules)
+        step.Combat, step.Done = step.launch.Combat, step.launch.Done
+        return step
+    }
+    if !step.shot.Done {
+        step.shot.Combat = step.Combat
+        return recordWeaponShot(step, ResumeLineAttack(level, step.shot, rules))
+    }
+    if step.pellets > 0 { return shootWeaponPellet(level, blocks, step, rules) }
+    step.Combat.Feedback = CombatFeedback{}
+    step.Impact, step.Hit, step.SpecialLine = ShotImpact{}, DamageRequest{}, -1
+    if step.action == actorinfo.ActionPunch || step.action == actorinfo.ActionSaw { step = finishWeaponMelee(step) }
+    step.Done = true
+    return step
+}

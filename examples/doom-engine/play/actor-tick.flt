@@ -1,0 +1,208 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Moving actor steps from P_XYMovement, P_ZMovement, and P_MobjThinker.
+
+package play
+
+import "actorinfo"
+import "wad"
+
+const actorTickXY = 1
+const actorTickBlocked = 2
+const actorTickZ = 3
+const actorTickState = 4
+const actorTickDone = 5
+
+// Each result carries one batch of crossings or combat effects. The caller
+// dispatches them before resuming. State actions may update Combat.World,
+// including the shared RNG and actor roster.
+type MobjTick struct {
+    Combat CombatStep
+    Done bit
+    Respawn bit
+    CrossingCount int
+    Crossings PagedSlots<SpecialCrossing>
+    MovePosition MapPositionCheck
+    OldX int
+    OldY int
+    handle int
+    phase int
+    xmove int
+    ymove int
+    levelTime int
+    respawnMonsters bit
+}
+
+type MobjMoveAttempt struct {
+    Combat CombatStep
+    Allowed bit
+    Position MapPositionCheck
+    FloatOK bit
+    CrossingCount int
+    Crossings PagedSlots<SpecialCrossing>
+}
+
+// A state with no actions can still need P_MobjThinker's movement, for
+// example when a rising floor has just passed a hanging actor's feet.
+func (actor LevelActor) NeedsMobjMotion() bit {
+    physics := actor.Physics
+    body := physics.Body
+    if physics.MomentumX != 0 || physics.MomentumY != 0 || physics.MomentumZ != 0 || body.Flags & MoveSkullFly != 0 { return true }
+    if body.Z == body.Floor { return false }
+    if body.Flags & MoveFloat != 0 && body.Flags & MoveInFloat == 0 && actor.Target != 0 { return true }
+    top := body.Z + body.Height
+    if body.Z < body.Floor {
+        // If already against the ceiling, the two clamps cancel out.
+        return top != body.Ceiling || body.Flags & MoveMissile != 0
+    }
+    return top > body.Ceiling || body.Flags & MoveNoGravity == 0
+}
+
+func TryMovingMobj(level wad.BspLevel, blocks wad.BlockMapInfo, world CombatWorld, handle int, x int, y int,
+    rules CombatRules) MobjMoveAttempt {
+    result := MobjMoveAttempt{Combat: CombatStep{World: world}}
+    actor := world.Actors.ActorAt(handle - 1)
+    body := actor.Physics.Body
+    position := BeginMapPositionCheck(level, blocks, body, x, y)
+    if !position.Valid { result.Combat.Failed = true; return result }
+    scan := BeginThingScan(blocks, body, x, y)
+    contact := ScanThingContacts(scan, world.Actors, world.Links, actor, handle, world.Random)
+    world.Random = contact.Random
+    if contact.Contact.Action == ContactDamage || contact.Contact.Action == ContactSkull {
+        world = world.WithPositionCheck(handle, x, y, position)
+        result.Combat = ApplyThingImpact(level, world, handle, contact.Contact, rules)
+        return result
+    }
+    if !contact.Scan.Done { result.Combat.Failed = true; return result }
+    position.Clear = !contact.Scan.Blocked
+    position = FinishMapPositionCheck(level, blocks, body, x, y, position)
+    if !position.Valid { result.Combat.Failed = true; return result }
+    result.Combat.World = world.WithPositionCheck(handle, x, y, position)
+
+    move := finishTryMapMove(level, body, x, y, position)
+    result.Position, result.FloatOK = position, move.FloatOK
+    if !move.Allowed { return result }
+    actor.Physics.Body = move.Actor
+    linked := world.Links.SetActorPosition(level, handle, actor)
+    if !linked.Valid { result.Combat.Failed = true; return result }
+    result.Combat.World.Links = linked.Links
+    result.Combat.World.Actors = world.Actors.WithActor(handle, linked.Actor)
+    result.Allowed, result.Crossings, result.CrossingCount = true, move.Crossings, move.CrossingCount
+    return result
+}
+
+func beginActorHorizontal(level wad.BspLevel, blocks wad.BlockMapInfo, step MobjTick, rules CombatRules) MobjTick {
+    actor := step.Combat.World.Actors.ActorAt(step.handle - 1)
+    // Keep the remaining half separate because callbacks can change actor momentum.
+    split := splitMomentum(step.xmove, step.ymove)
+    step.xmove, step.ymove = split.RemainingX, split.RemainingY
+    body := actor.Physics.Body
+    move := TryMovingMobj(level, blocks, step.Combat.World, step.handle, body.X + split.X, body.Y + split.Y, rules)
+    step.Combat, step.Crossings, step.CrossingCount = move.Combat, move.Crossings, move.CrossingCount
+    if move.Allowed { step.MovePosition, step.OldX, step.OldY = move.Position, body.X, body.Y }
+    if !move.Allowed { step.phase = actorTickBlocked }
+    return step
+}
+
+func afterBlockedActor(level wad.BspLevel, step MobjTick, actor LevelActor, rules CombatRules) MobjTick {
+    step.phase = actorTickXY
+    if actor.Physics.Body.Flags & MoveMissile != 0 {
+        // P_XYMovement reads ceilingline after any impact action has returned.
+        blocker := level.LineAt(step.Combat.World.Position.CeilingLine)
+        if blocker.Valid && level.SectorHasSkyCeiling(blocker.BackSector) {
+            actor.Valid = false
+            step.Combat.World.Actors = step.Combat.World.Actors.WithActor(step.handle, actor)
+            step.Combat.World.Links = step.Combat.World.Links.UnlinkActor(step.handle)
+            step.Done = true
+        } else {
+            step.Combat = ExplodeMissile(level, step.Combat.World, step.handle, rules)
+        }
+    } else {
+        actor.Physics.MomentumX, actor.Physics.MomentumY = 0, 0
+        step.Combat.World.Actors = step.Combat.World.Actors.WithActor(step.handle, actor)
+    }
+    return step
+}
+
+func actorVertical(level wad.BspLevel, step MobjTick, actor LevelActor, rules CombatRules) MobjTick {
+    step.phase = actorTickState
+    if actor.Physics.Body.Z == actor.Physics.Body.Floor && actor.Physics.MomentumZ == 0 { return step }
+    other := step.Combat.World.Actors.ActorAt(actor.Target - 1)
+    body := other.Physics.Body
+    target := FloatTarget{Valid: other.Valid, X: body.X, Y: body.Y, Z: body.Z}
+    vertical := MoveVertically(actor.Physics, target)
+    actor.Physics = vertical.Actor
+    if vertical.Event == MotionExplodeMissile {
+        // MoveVertically reports the final missile bit for terrain-only callers.
+        // The state action in P_ExplodeMissile still sees it set.
+        actor.Physics.Body.Flags = actor.Physics.Body.Flags | MoveMissile
+    }
+    step.Combat.World.Actors = step.Combat.World.Actors.WithActor(step.handle, actor)
+    if vertical.Event == MotionExplodeMissile { step.Combat = ExplodeMissile(level, step.Combat.World, step.handle, rules) }
+    return step
+}
+
+// Starts the non-player path of P_MobjThinker. Player commands, pickups, and
+// wall sliding use MovePlayerWithContacts.
+func BeginMobjTick(level wad.BspLevel, blocks wad.BlockMapInfo, world CombatWorld, handle int,
+    levelTime int, respawnMonsters bit, rules CombatRules) MobjTick {
+    actor := world.Actors.ActorAt(handle - 1)
+    step := MobjTick{Combat: CombatStep{World: world}, handle: handle, levelTime: levelTime,
+        respawnMonsters: respawnMonsters, phase: actorTickZ}
+    if !actor.Valid { step.Done = true; return step }
+    if actor.Physics.Body.Player || actor.Physics.Body.Flags & ActorPickup != 0 {
+        step.Combat.Failed = true
+        return step
+    }
+    if actor.Physics.MomentumX == 0 && actor.Physics.MomentumY == 0 {
+        if actor.Physics.Body.Flags & MoveSkullFly != 0 {
+            actor.Physics.Body.Flags = actor.Physics.Body.Flags & ~bits<32>(MoveSkullFly)
+            actor.Physics.MomentumZ = 0
+            state := SetMobjStateWithFast(actor, actorinfo.KindAt(actor.Kind).SpawnState, rules.Fast)
+            step.Combat = publishCombatState(step.Combat, handle, state, 0)
+            return step
+        }
+    } else {
+        actor.Physics.MomentumX, actor.Physics.MomentumY = capMomentum(actor.Physics.MomentumX), capMomentum(actor.Physics.MomentumY)
+        step.xmove, step.ymove = actor.Physics.MomentumX, actor.Physics.MomentumY
+        step.Combat.World.Actors = world.Actors.WithActor(handle, actor)
+        step.phase = actorTickXY
+    }
+    return ResumeMobjTick(level, blocks, step, rules)
+}
+
+func ResumeMobjTick(level wad.BspLevel, blocks wad.BlockMapInfo, step MobjTick, rules CombatRules) MobjTick {
+    if step.Done || step.Combat.Failed { return step }
+    step.CrossingCount = 0
+    step.MovePosition = MapPositionCheck{}
+    if step.Combat.State.Action != 0 {
+        step.Combat = ResumeMobjCombat(level, step.Combat, rules)
+        return step
+    }
+    step.Combat.Feedback = CombatFeedback{}
+    actor := step.Combat.World.Actors.ActorAt(step.handle - 1)
+    if !actor.Valid { step.Done = true; return step }
+    switch step.phase {
+    case actorTickBlocked:
+        return afterBlockedActor(level, step, actor, rules)
+    case actorTickXY:
+        if step.xmove != 0 || step.ymove != 0 { return beginActorHorizontal(level, blocks, step, rules) }
+        friction := applyGroundFriction(HorizontalMove{Valid: true, Actor: actor.Physics, Level: level}, PlayerMoveCommand{}, false)
+        if !friction.Valid { step.Combat.Failed = true; return step }
+        actor.Physics = friction.Actor
+        step.Combat.World.Actors = step.Combat.World.Actors.WithActor(step.handle, actor)
+        return actorVertical(level, step, actor, rules)
+    case actorTickZ:
+        return actorVertical(level, step, actor, rules)
+    case actorTickState:
+        state := TickMobjStateWithFast(actor, step.levelTime, step.respawnMonsters, rules.Fast, step.Combat.World.Random)
+        step.Combat.World.Random = state.Random
+        step.Combat = publishCombatState(step.Combat, step.handle, state.Step, 0)
+        step.phase, step.Respawn = actorTickDone, state.Respawn
+        if step.Combat.State.Action == 0 { step.Done = true }
+        return step
+    default:
+        step.Done = true
+        return step
+    }
+}

@@ -1,0 +1,98 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted on 2026-11-21 from T_PlatRaise and EV_DoPlat in
+// linuxdoom-1.10/p_plats.c.
+
+package play
+
+import "engine"
+
+const PlatformPerpetual = 1
+const PlatformDownWaitUpStay = 2
+const PlatformRaiseAndChange = 3
+const PlatformRaiseNearestAndChange = 4
+const PlatformBlazeDownWaitUpStay = 5
+
+const PlatformUp = 0
+const PlatformDown = 1
+const PlatformWaiting = 2
+const PlatformStasis = 3
+
+const PlatformSpeed = engine.FracUnit
+const PlatformWait = 35 * 3
+
+// PlatformState is a pure T_PlatRaise thinker. OldStatus is retained for the
+// level layer's EV_StopPlat/P_ActivateInStasis handling.
+type PlatformState struct {
+    Active bit
+    Height int
+    Low int
+    High int
+    Speed int
+    Wait int
+    Count int
+    Status int
+    OldStatus int
+    Mode int
+}
+
+// StartPlatform resolves EV_DoPlat's geometry queries for one target sector.
+// random is the P_Random result supplied by the caller for perpetualRaise.
+func StartPlatform(mode int, height int, lowest int, highest int, nearest int, amount int, random int) PlatformState {
+    platform := PlatformState{Active: true, Height: height, Mode: mode}
+    switch mode {
+    case PlatformPerpetual:
+        platform.Speed, platform.Low, platform.High, platform.Wait = PlatformSpeed, lowest, highest, PlatformWait
+        if platform.Low > height { platform.Low = height }
+        if platform.High < height { platform.High = height }
+        platform.Status = random & 1
+    case PlatformDownWaitUpStay:
+        platform.Speed, platform.Low, platform.High, platform.Wait, platform.Status = PlatformSpeed * 4, lowest, height, PlatformWait, PlatformDown
+        if platform.Low > height { platform.Low = height }
+    case PlatformRaiseAndChange:
+        platform.Speed, platform.High, platform.Wait, platform.Status = PlatformSpeed / 2, height + amount * engine.FracUnit, 0, PlatformUp
+    case PlatformRaiseNearestAndChange:
+        platform.Speed, platform.High, platform.Wait, platform.Status = PlatformSpeed / 2, nearest, 0, PlatformUp
+    case PlatformBlazeDownWaitUpStay:
+        platform.Speed, platform.Low, platform.High, platform.Wait, platform.Status = PlatformSpeed * 8, lowest, height, PlatformWait, PlatformDown
+        if platform.Low > height { platform.Low = height }
+    default:
+        return PlatformState{Height: height}
+    }
+    return platform
+}
+
+// TickPlatform is T_PlatRaise without sounds and active-list bookkeeping.
+func TickPlatform(state PlatformState, blocked bit) PlatformState {
+    if !state.Active { return state }
+    switch state.Status {
+    case PlatformUp:
+        moved := MoveSectorPlane(state.Height, state.Speed, state.High, 1, false, false, blocked)
+        state.Height = moved.Height
+        if moved.Result == PlaneCrushed {
+            state.Count, state.Status = state.Wait, PlatformDown
+        } else if moved.Result == PlanePastDestination {
+            state.Count, state.Status = state.Wait, PlatformWaiting
+            switch state.Mode {
+            case PlatformBlazeDownWaitUpStay, PlatformDownWaitUpStay, PlatformRaiseAndChange, PlatformRaiseNearestAndChange:
+                state.Active = false
+            }
+        }
+    case PlatformDown:
+        moved := MoveSectorPlane(state.Height, state.Speed, state.Low, -1, false, false, blocked)
+        state.Height = moved.Height
+        if moved.Result == PlanePastDestination { state.Count, state.Status = state.Wait, PlatformWaiting }
+    case PlatformWaiting:
+        state.Count = state.Count - 1
+        if state.Count == 0 {
+            if state.Height == state.Low {
+                state.Status = PlatformUp
+            } else {
+                state.Status = PlatformDown
+            }
+        }
+    case PlatformStasis:
+        return state
+    }
+    return state
+}

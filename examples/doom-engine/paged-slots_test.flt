@@ -1,0 +1,28 @@
+package main
+
+import "play"
+
+test "paged slots preserve sparse addresses and older copies" {
+    var empty play.PagedSlots<int>
+    base := empty.With(0, 10).With(31, 11).With(32, 12).With(1023, 13)
+    deep := base.With(1024, 14).With(1056, 15).With(65535, 16).With(2147483647, 17)
+    changed := deep.With(31, 21).With(1023, 23).With(1024, 24).With(2147483647, 27)
+
+    assertEqual(empty.At(0), 0)
+    assertEqual(base.At(0), 10)
+    assertEqual(base.At(31), 11)
+    assertEqual(base.At(32), 12)
+    assertEqual(base.At(1023), 13)
+    assertEqual(base.At(1024), 0)
+    assertEqual(deep.At(1024), 14)
+    assertEqual(deep.At(1056), 15)
+    assertEqual(deep.At(65535), 16)
+    assertEqual(deep.At(2147483647), 17)
+    assertEqual(deep.At(2147483646), 0)
+    assertEqual(changed.At(31), 21)
+    assertEqual(changed.At(1023), 23)
+    assertEqual(changed.At(1024), 24)
+    assertEqual(changed.At(1056), 15)
+    assertEqual(changed.At(2147483647), 27)
+    assertEqual(changed.With(-1, 99).At(-1), 0)
+}

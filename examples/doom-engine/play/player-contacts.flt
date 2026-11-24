@@ -1,0 +1,66 @@
+package play
+
+import "wad"
+
+type PlayerContacts struct {
+    Handle int
+    Actors MapActors
+    Links ActorLinks
+    Inventory PlayerInventory
+    Rules PickupRules
+    Telefrag WalkoverTelefrag
+    Callback WalkoverContext
+    CustomTelefrag bit
+    FastMonsters bit
+    AttackRange int
+    PickupMessage int
+    PickupSound int
+    Removed bit
+    LinksChanged bit
+}
+
+type PlayerPositionCheck struct {
+    Body MapActor
+    Position MapPositionCheck
+    Contacts PlayerContacts
+}
+
+// Resolve touches while the block iterator is suspended. They remain effective
+// even if a later solid thing or line rejects the same position attempt.
+func checkPlayerPosition(level wad.BspLevel, blocks wad.BlockMapInfo, body MapActor, contacts PlayerContacts,
+    x int, y int) PlayerPositionCheck {
+    position := BeginMapPositionCheck(level, blocks, body, x, y)
+    if !position.Clear { return PlayerPositionCheck{Body: body, Position: position, Contacts: contacts} }
+    moving := contacts.Actors.ActorAt(contacts.Handle - 1)
+    moving.Physics.Body = body
+    scan := BeginThingScan(blocks, body, x, y)
+    for range contacts.Actors.Count + 1 {
+        if scan.Done {
+            position.Clear = !scan.Blocked
+            position = FinishMapPositionCheck(level, blocks, moving.Physics.Body, x, y, position)
+            return PlayerPositionCheck{Body: moving.Physics.Body, Position: position, Contacts: contacts}
+        }
+        step := ScanThingContacts(scan, contacts.Actors, contacts.Links, moving, contacts.Handle, RandomState{})
+        scan = step.Scan
+        if step.Contact.Action == ContactTouch {
+            handle := step.Contact.Target
+            special := contacts.Actors.ActorAt(handle - 1)
+            pickup := TouchPickup(contacts.Inventory, special, moving, contacts.Rules)
+            contacts.Inventory, moving = pickup.Inventory, pickup.Actor
+            if pickup.Message != PickupMessageNone { contacts.PickupMessage = pickup.Message }
+            if pickup.Sound != PickupSoundNone { contacts.PickupSound = pickup.Sound }
+            contacts.Actors = contacts.Actors.WithActor(contacts.Handle, moving)
+            if pickup.Removed {
+                special.Valid = false
+                contacts.Actors = contacts.Actors.WithActor(handle, special)
+                contacts.Links = contacts.Links.UnlinkActor(handle)
+                contacts.Removed, contacts.LinksChanged = true, true
+            }
+        } else if step.Contact.Action != 0 {
+            position.Valid, position.Clear = false, false
+            return PlayerPositionCheck{Body: body, Position: position, Contacts: contacts}
+        }
+    }
+    position.Valid, position.Clear = false, false
+    return PlayerPositionCheck{Body: body, Position: position, Contacts: contacts}
+}

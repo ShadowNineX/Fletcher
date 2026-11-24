@@ -1,0 +1,113 @@
+package main
+
+import "engine"
+import "wad"
+
+const Width = 160
+const Height = 112
+const InnerWidth = Width - 9
+const InnerHeight = Height - 9
+const MaxRasterSteps = 18000
+const MaxLines = 256
+
+type Projection struct {
+    Bounds engine.Box
+    Numerator int
+    Denominator int
+    OriginX int
+    OriginY int
+}
+
+type Point struct {
+    X int
+    Y int
+}
+
+type Segment struct {
+    A Point
+    B Point
+}
+
+func abs(value int) int {
+    if value < 0 { return -value }
+    return value
+}
+
+func max(a int, b int) int {
+    if a > b { return a }
+    return b
+}
+
+func project(box engine.Box) Projection {
+    xSpan := box.Right - box.Left
+    ySpan := box.Top - box.Bottom
+    numerator, denominator := InnerWidth, max(1, xSpan)
+    if xSpan * InnerHeight < ySpan * InnerWidth {
+        numerator, denominator = InnerHeight, max(1, ySpan)
+    }
+    return Projection{
+        Bounds: box, Numerator: numerator, Denominator: denominator,
+        OriginX: (Width - 1 - xSpan * numerator / denominator) / 2,
+        OriginY: (Height - 1 - ySpan * numerator / denominator) / 2,
+    }
+}
+
+func screenPoint(view Projection, point engine.Vertex) Point {
+    return Point{
+        X: view.OriginX + ((point.X >> 16) - view.Bounds.Left) * view.Numerator / view.Denominator,
+        Y: view.OriginY + (view.Bounds.Top - (point.Y >> 16)) * view.Numerator / view.Denominator,
+    }
+}
+
+func segmentAt(file bytes, vertices wad.Lump, offset int, view Projection) Segment {
+    a := screenPoint(view, wad.VertexAt(file, vertices, wad.U16(file, offset)))
+    b := screenPoint(view, wad.VertexAt(file, vertices, wad.U16(file, offset + 2)))
+    return Segment{A: a, B: b}
+}
+
+func drawLine(segment Segment, shade color) {
+    x, y := segment.A.X, segment.A.Y
+    targetX, targetY := segment.B.X, segment.B.Y
+    dx, dy := abs(targetX - x), abs(targetY - y)
+    dirX, dirY := 1, 1
+    if x > targetX { dirX = -1 }
+    if y > targetY { dirY = -1 }
+    error := dx - dy
+    for range max(dx, dy) + 1 {
+        pixel(x, y, true, shade)
+        twice := 2 * error
+        if twice > -dy { error = error - dy; x = x + dirX }
+        if twice < dx { error = error + dx; y = y + dirY }
+    }
+}
+
+// Validate and cost the complete frame before writing any pixels.
+func drawLevel(file bytes, geometry wad.Geometry) int {
+    if geometry.Lines.Count == 0 || geometry.Vertices.Count == 0 { return 1 }
+    if geometry.Lines.Count > MaxLines { return 2 }
+
+    box := engine.ClearBox()
+    for i := range geometry.Lines.Count {
+        offset := geometry.Lines.Offset + i * wad.LineSize
+        first, last := wad.U16(file, offset), wad.U16(file, offset + 2)
+        if first >= geometry.Vertices.Count || last >= geometry.Vertices.Count { return 1 }
+        a := wad.VertexAt(file, geometry.Vertices, first)
+        b := wad.VertexAt(file, geometry.Vertices, last)
+        box = engine.AddPointToBox(box, a.X >> 16, a.Y >> 16)
+        box = engine.AddPointToBox(box, b.X >> 16, b.Y >> 16)
+    }
+    view := project(box)
+    steps := 0
+    for i := range geometry.Lines.Count {
+        segment := segmentAt(file, geometry.Vertices, geometry.Lines.Offset + i * wad.LineSize, view)
+        steps = steps + 1 + max(abs(segment.A.X - segment.B.X), abs(segment.A.Y - segment.B.Y))
+        if steps > MaxRasterSteps { return 2 }
+    }
+    for i := range geometry.Lines.Count {
+        offset := geometry.Lines.Offset + i * wad.LineSize
+        shade := color.White
+        if wad.U16(file, offset + 4) & 4 != 0 { shade = color.Blue }
+        drawLine(segmentAt(file, geometry.Vertices, offset, view), shade)
+    }
+    return 0
+}

@@ -1,0 +1,214 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// P_Move and P_TryWalk from linuxdoom-1.10/p_enemy.c.
+
+package enemy
+
+import "actorinfo"
+import "engine"
+import "play"
+import "wad"
+
+const full = engine.FracUnit
+const walkX = [8]int{full, 47000, 0, -47000, -full, -47000, 0, 47000}
+const walkY = [8]int{0, 47000, full, 47000, 0, -47000, -full, -47000}
+
+type MonsterMove struct {
+    World play.CombatWorld
+    Specials play.LevelSpecials
+    Level wad.BspLevel
+    Moved bit
+    Failed bit
+    Teleported bit
+    DamageSound int
+    Telefrag play.WalkoverTelefrag
+    Callback play.WalkoverContext
+    CustomTelefrag bit
+}
+
+type MonsterCrossingRef interface {
+    Read() play.ActorCrossingStep
+}
+
+type MonsterCrossingBox struct {
+    Step play.ActorCrossingStep
+}
+
+func (box MonsterCrossingBox) Read() play.ActorCrossingStep { return box.Step }
+
+// A move can yield to a line's combat callback before snapping to the
+// destination floor. A direction search retains its current candidate.
+type MonsterWalkStep struct {
+    Move MonsterMove
+    Event play.CombatStep
+    Pending bit
+    Done bit
+    handle int
+    search bit
+    choice ChaseDirectionTrace
+    attempts int
+    crossing MonsterCrossingRef
+}
+
+func finishMonsterStep(step MonsterWalkStep) MonsterWalkStep {
+    step.Move.World.Random = step.Move.Specials.Lighting.Random
+    step.Done = true
+    return step
+}
+
+func commitMonsterStep(step MonsterWalkStep) MonsterWalkStep {
+    actor := step.Move.World.Actors.ActorAt(step.handle - 1)
+    actor.Physics.Body.Flags = actor.Physics.Body.Flags & ~bits<32>(play.MoveInFloat)
+    if actor.Physics.Body.Flags & play.MoveFloat == 0 { actor.Physics.Body.Z = actor.Physics.Body.Floor }
+    step.Move.World.Actors = step.Move.World.Actors.WithActor(step.handle, actor)
+    step.Move.Moved = true
+    return finishMonsterStep(step)
+}
+
+func suspendMonsterCrossing(step MonsterWalkStep, crossing play.ActorCrossingStep) MonsterWalkStep {
+    state := crossing.State
+    step.Move.Level, step.Move.Specials, step.Move.World = state.Level, state.Specials, state.World
+    step.Move.Callback = state.Callback
+    if state.DamageSound != 0 { step.Move.DamageSound = state.DamageSound }
+    step.Move.Teleported = step.Move.Teleported || state.Teleported
+    step.Pending = crossing.Pending
+    if state.Failed {
+        step.Move.Failed, step.Done = true, true
+        return step
+    }
+    if crossing.Pending {
+        step.Event, step.crossing = crossing.Event, MonsterCrossingBox{Step: crossing}
+        return step
+    }
+    return commitMonsterStep(step)
+}
+
+func tryMonsterWalk(base wad.BspLevel, blocks wad.BlockMapInfo, step MonsterWalkStep, rules play.CombatRules) MonsterWalkStep {
+    step.Move.Moved, step.Done = false, false
+    actor := step.Move.World.Actors.ActorAt(step.handle - 1)
+    direction := actor.MoveDirection
+    if direction == ChaseNoDir { step.Done = true; return step }
+    if direction < ChaseEast || direction > ChaseSouthEast {
+        step.Move.Failed, step.Done = true, true
+        return step
+    }
+    speed := actorinfo.KindAt(actor.Kind).Speed
+    body := actor.Physics.Body
+    x, y := body.X + speed * walkX[direction], body.Y + speed * walkY[direction]
+    move := play.TryMovingMobj(step.Move.Level, blocks, step.Move.World, step.handle, x, y, rules)
+    step.Move.World = move.Combat.World
+    if move.Combat.Failed || move.Combat.State.Action != 0 {
+        step.Move.Failed, step.Done = true, true
+        return step
+    }
+    step.Move.Specials.Lighting.Random = step.Move.World.Random
+    if move.Allowed {
+        if move.Position.SpecialCount > 0 {
+            state := play.WalkoverState{Level: step.Move.Level, Specials: step.Move.Specials, World: step.Move.World,
+                Callback: step.Move.Callback}
+            crossing := play.BeginActorCrossing(blocks, state, step.handle, body.X, body.Y, move.Position, rules)
+            return suspendMonsterCrossing(step, crossing)
+        }
+        return commitMonsterStep(step)
+    }
+    if actor.Physics.Body.Flags & play.MoveFloat != 0 && move.FloatOK {
+        offset := -4 * full
+        if body.Z < move.Position.Floor { offset = 4 * full }
+        actor.Physics.Body.Z = body.Z + offset
+        actor.Physics.Body.Flags = body.Flags | play.MoveInFloat
+        step.Move.World.Actors = step.Move.World.Actors.WithActor(step.handle, actor)
+        step.Move.Moved = true
+    } else if move.Position.SpecialCount > 0 {
+        actor.MoveDirection = ChaseNoDir
+        step.Move.World.Actors = step.Move.World.Actors.WithActor(step.handle, actor)
+        step.Move.Specials = step.Move.Specials.WithActorOrder(step.Move.World.Actors)
+        for i := range move.Position.SpecialCount {
+            index := move.Position.Specials.At(move.Position.SpecialCount - 1 - i)
+            used := play.UseMonsterLine(step.Move.Level, step.Move.Specials, index)
+            if used.Used {
+                step.Move.Specials = used.State
+                step.Move.Level = step.Move.Specials.ApplyTo(base)
+                step.Move.Moved = true
+            }
+        }
+        step.Move.World.Actors = step.Move.World.Actors.WithSectorOrder(step.Move.Specials)
+    }
+    return finishMonsterStep(step)
+}
+
+func advanceMonsterSearch(base wad.BspLevel, blocks wad.BlockMapInfo, step MonsterWalkStep,
+    rules play.CombatRules) MonsterWalkStep {
+    for range step.attempts {
+        step.attempts = step.attempts - 1
+        step.Move.World.Random = step.choice.Random
+        if !step.choice.Valid { step.Move.Failed, step.Done = true, true; return step }
+        actor := step.Move.World.Actors.ActorAt(step.handle - 1)
+        if step.choice.Done {
+            if step.Move.Moved { actor.MoveCount = step.choice.MoveCount } else { actor.MoveDirection = ChaseNoDir }
+            step.Move.World.Actors = step.Move.World.Actors.WithActor(step.handle, actor)
+            step.Done = true
+            return step
+        }
+        actor.MoveDirection = step.choice.Direction
+        step.Move.World.Actors = step.Move.World.Actors.WithActor(step.handle, actor)
+        step = tryMonsterWalk(base, blocks, step, rules)
+        if step.Pending || step.Move.Failed { return step }
+        step.choice.Random = step.Move.World.Random
+        step.choice = ResumeChaseDirection(step.choice, step.Move.Moved)
+    }
+    step.Move.Failed, step.Done = true, true
+    return step
+}
+
+func BeginMonsterWalk(base wad.BspLevel, blocks wad.BlockMapInfo, context MonsterMove, handle int,
+    newDirection bit, rules play.CombatRules) MonsterWalkStep {
+    step := MonsterWalkStep{Move: context, handle: handle, search: newDirection}
+    if !newDirection { return tryMonsterWalk(base, blocks, step, rules) }
+    actor := context.World.Actors.ActorAt(handle - 1)
+    target := context.World.Actors.ActorAt(actor.Target - 1)
+    if !target.Valid { step.Move.Failed, step.Done = true, true; return step }
+    a, b := actor.Physics.Body, target.Physics.Body
+    step.choice = BeginChaseDirection(ChaseDirectionRequest{ActorX: a.X, ActorY: a.Y, OldDirection: actor.MoveDirection,
+        TargetX: b.X, TargetY: b.Y, Random: context.World.Random})
+    step.attempts = 16
+    return advanceMonsterSearch(base, blocks, step, rules)
+}
+
+func ResumeMonsterWalk(base wad.BspLevel, blocks wad.BlockMapInfo, step MonsterWalkStep, rules play.CombatRules) MonsterWalkStep {
+    if !step.Pending { return step }
+    crossing := step.crossing.Read()
+    crossing.State.Level, crossing.State.Specials, crossing.State.World = step.Move.Level, step.Move.Specials, step.Move.World
+    crossing.State.Callback, crossing.State.Failed = step.Move.Callback, step.Move.Failed
+    crossing.State.DamageSound = step.Move.DamageSound
+    step = suspendMonsterCrossing(step, play.ResumeActorCrossing(blocks, crossing, rules))
+    if step.Pending || step.Move.Failed || !step.search { return step }
+    step.choice.Random = step.Move.World.Random
+    step.choice = ResumeChaseDirection(step.choice, step.Move.Moved)
+    return advanceMonsterSearch(base, blocks, step, rules)
+}
+
+func finishMonsterWalk(base wad.BspLevel, blocks wad.BlockMapInfo, step MonsterWalkStep, rules play.CombatRules) MonsterMove {
+    var actions play.WalkoverTelefrag = play.DefaultWalkoverTelefrag{}
+    if step.Move.CustomTelefrag { actions = step.Move.Telefrag }
+    for range play.ThinkerIterationLimit {
+        if step.Done { return step.Move }
+        if !step.Pending { step.Move.Failed = true; return step.Move }
+        crossing := step.crossing.Read()
+        state := actions.OnTelefrag(crossing.State, step.Event, rules)
+        step.Move.Level, step.Move.Specials, step.Move.World = state.Level, state.Specials, state.World
+        step.Move.Callback, step.Move.Failed = state.Callback, state.Failed
+        if state.DamageSound != 0 { step.Move.DamageSound = state.DamageSound }
+        step = ResumeMonsterWalk(base, blocks, step, rules)
+    }
+    if !step.Done { step.Move.Failed = true }
+    return step.Move
+}
+
+func Move(base wad.BspLevel, blocks wad.BlockMapInfo, context MonsterMove, handle int, rules play.CombatRules) MonsterMove {
+    return finishMonsterWalk(base, blocks, BeginMonsterWalk(base, blocks, context, handle, false, rules), rules)
+}
+
+func NewChaseDirection(base wad.BspLevel, blocks wad.BlockMapInfo, context MonsterMove, handle int,
+    rules play.CombatRules) MonsterMove {
+    return finishMonsterWalk(base, blocks, BeginMonsterWalk(base, blocks, context, handle, true, rules), rules)
+}

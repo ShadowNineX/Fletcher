@@ -1,0 +1,14 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Key checks from EV_VerticalDoor and EV_DoLockedDoor in p_doors.c.
+
+package play
+
+func requiredDoorKey(action int) int {
+    switch action {
+    case 26, 32, 99, 133: return CardBlue
+    case 27, 34, 136, 137: return CardYellow
+    case 28, 33, 134, 135: return CardRed
+    }
+    return -1
+}

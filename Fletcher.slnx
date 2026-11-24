@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Fletcher.Compiler/Fletcher.Compiler.csproj" />
+    <Project Path="src/Fletcher.Cli/Fletcher.Cli.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Fletcher.Compiler.Tests/Fletcher.Compiler.Tests.csproj" />
+  </Folder>
+</Solution>

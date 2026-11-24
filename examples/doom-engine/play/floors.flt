@@ -1,0 +1,124 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted on 2026-11-21 from T_MovePlane, T_MoveFloor, and EV_DoFloor in
+// linuxdoom-1.10/p_floor.c.
+
+package play
+
+import "engine"
+
+const FloorLower = 1
+const FloorLowerLowest = 2
+const FloorTurboLower = 3
+const FloorRaise = 4
+const FloorRaiseCrush = 5
+const FloorRaiseTurbo = 6
+const FloorRaiseNearest = 7
+const FloorRaise24 = 8
+const FloorRaise512 = 9
+const FloorRaise24Change = 10
+const FloorRaiseTexture = 11
+const FloorLowerChange = 12
+
+const FloorSpeed = engine.FracUnit
+
+const PlaneMoved = 0
+const PlaneCrushed = 1
+const PlanePastDestination = 2
+
+// FloorSetup contains EV_DoFloor's resolved sector-neighbor queries. Texture
+// and special assignment is deliberately left to the level layer.
+type FloorSetup struct {
+    Height int
+    Ceiling int
+    HighestFloor int
+    LowestFloor int
+    NextFloor int
+    LowestCeiling int
+    ShortestTexture int
+}
+
+// FloorState is T_MoveFloor's pure mutable state. Direction is -1 down or 1
+// up; Height is the sector floor height owned by the caller.
+type FloorState struct {
+    Active bit
+    Height int
+    Destination int
+    Speed int
+    Direction int
+    Mode int
+    Crush bit
+}
+
+type PlaneStep struct {
+    Height int
+    Result int
+    RolledBack bit
+}
+
+// MoveSectorPlane is T_MovePlane with P_ChangeSector represented by blocked.
+// A strict crossing reports pastdest even when the attempted endpoint rolls
+// back because of an obstruction. Equality is an ordinary one-speed move.
+func MoveSectorPlane(height int, speed int, destination int, direction int, ceiling bit, crush bit, blocked bit) PlaneStep {
+    if direction != -1 && direction != 1 { return PlaneStep{Height: height, Result: PlaneMoved} }
+    target := height + direction * speed
+    if (direction < 0 && target < destination) || (direction > 0 && target > destination) {
+        if blocked { return PlaneStep{Height: height, Result: PlanePastDestination, RolledBack: true} }
+        return PlaneStep{Height: destination, Result: PlanePastDestination}
+    }
+    // On a non-terminal step, a rising ceiling keeps moving despite P_ChangeSector.
+    if blocked && (!ceiling || direction < 0) {
+        if !crush || (!ceiling && direction < 0) {
+            return PlaneStep{Height: height, Result: PlaneCrushed, RolledBack: true}
+        }
+        return PlaneStep{Height: target, Result: PlaneCrushed}
+    }
+    return PlaneStep{Height: target, Result: PlaneMoved}
+}
+
+// StartFloor resolves the pure EV_DoFloor switch. Callers must have already
+// skipped sectors with specialdata and supplied the original neighbor results.
+func StartFloor(mode int, levels FloorSetup) FloorState {
+    floor := FloorState{Height: levels.Height, Speed: FloorSpeed, Mode: mode}
+    switch mode {
+    case FloorLower:
+        floor.Direction, floor.Destination = -1, levels.HighestFloor
+    case FloorLowerLowest:
+        floor.Direction, floor.Destination = -1, levels.LowestFloor
+    case FloorTurboLower:
+        floor.Direction, floor.Speed, floor.Destination = -1, FloorSpeed * 4, levels.HighestFloor
+        if floor.Destination != levels.Height { floor.Destination = floor.Destination + 8 * engine.FracUnit }
+    case FloorRaise, FloorRaiseCrush:
+        floor.Direction, floor.Destination = 1, levels.LowestCeiling
+        if floor.Destination > levels.Ceiling { floor.Destination = levels.Ceiling }
+        if mode == FloorRaiseCrush {
+            floor.Crush = true
+            floor.Destination = floor.Destination - 8 * engine.FracUnit
+        }
+    case FloorRaiseTurbo:
+        floor.Direction, floor.Speed, floor.Destination = 1, FloorSpeed * 4, levels.NextFloor
+    case FloorRaiseNearest:
+        floor.Direction, floor.Destination = 1, levels.NextFloor
+    case FloorRaise24, FloorRaise24Change:
+        floor.Direction, floor.Destination = 1, levels.Height + 24 * engine.FracUnit
+    case FloorRaise512:
+        floor.Direction, floor.Destination = 1, levels.Height + 512 * engine.FracUnit
+    case FloorRaiseTexture:
+        floor.Direction, floor.Destination = 1, levels.Height + levels.ShortestTexture
+    case FloorLowerChange:
+        floor.Direction, floor.Destination = -1, levels.LowestFloor
+    default:
+        return FloorState{Height: levels.Height}
+    }
+    floor.Active = true
+    return floor
+}
+
+// TickFloor is T_MoveFloor without sound or final floor texture/special work.
+func TickFloor(state FloorState, blocked bit) FloorState {
+    if !state.Active { return state }
+    moved := MoveSectorPlane(state.Height, state.Speed, state.Destination, state.Direction, false, state.Crush, blocked)
+    state.Height = moved.Height
+    if moved.Result == PlanePastDestination { state.Active = false }
+    return state
+}

@@ -1,0 +1,227 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted on 2026-11-21 from R_InitTextures and R_DrawColumnInCache in
+// linuxdoom-1.10/r_data.c.
+
+package wad
+
+const PatchHeaderSize = 8
+const TextureHeaderSize = 22
+const TexturePatchSize = 10
+const TextureDirectoryHeaderSize = 4
+const PNameHeaderSize = 4
+
+// Texture definitions only need name lookup from their archive snapshot.
+// Keep that snapshot boxed once in TextureSet so copying a resolved texture
+// does not repeatedly clone the mounted source table.
+type textureArchiveLookup interface {
+    Find(name LumpName) LumpRef
+}
+
+type TextureSet struct {
+    Mounts Archives
+    lookup textureArchiveLookup
+    PNames LumpRef
+    First LumpRef
+    Second LumpRef
+    FirstCount int
+    SecondCount int
+    Valid bit
+    names nameIndexRef
+    indexed int
+}
+
+type TextureDef struct {
+    Mounts textureArchiveLookup
+    File bytes
+    PNames LumpRef
+    Offset int
+    Width int
+    Height int
+    PatchCount int
+    Valid bit
+}
+
+type TexturePixel struct {
+    Value bits<8>
+    Covered bit
+    Valid bit
+}
+
+func signed16(value int) int {
+    if value >= 32768 { return value - 65536 }
+    return value
+}
+
+func validTextureDirectory(lump LumpRef) int {
+    if !lump.Valid || lump.Size < TextureDirectoryHeaderSize { return -1 }
+    count := LE32(lump.File, lump.Offset)
+    if count < 0 || count > (lump.Size - TextureDirectoryHeaderSize) / 4 { return -1 }
+    return count
+}
+
+func LoadTextureSet(file bytes) TextureSet { return LoadMountedTextureSet(OpenArchive(file)) }
+
+func LoadMountedTextureSet(mounts Archives) TextureSet {
+    pnames := mounts.Find(LumpName{Low: 0x4d414e50, High: 0x5345}) // PNAMES
+    if !pnames.Valid || pnames.Size < PNameHeaderSize { return TextureSet{} }
+    patchCount := LE32(pnames.File, pnames.Offset)
+    if patchCount < 0 || patchCount > (pnames.Size - PNameHeaderSize) / 8 {
+        return TextureSet{}
+    }
+    first := mounts.Find(LumpName{Low: 0x54584554, High: 0x31455255}) // TEXTURE1
+    firstCount := validTextureDirectory(first)
+    if firstCount < 0 { return TextureSet{} }
+    second := mounts.Find(LumpName{Low: 0x54584554, High: 0x32455255}) // TEXTURE2
+    secondCount := 0
+    if second.Found {
+        secondCount = validTextureDirectory(second)
+        if secondCount < 0 { return TextureSet{} }
+    }
+    return TextureSet{Mounts: mounts, lookup: mounts, PNames: pnames, First: first, Second: second,
+        FirstCount: firstCount, SecondCount: secondCount, Valid: true}
+}
+
+func TextureCount(set TextureSet) int {
+    if !set.Valid { return 0 }
+    return set.FirstCount + set.SecondCount
+}
+
+func textureOffset(lump LumpRef, index int) int {
+    if !lump.Valid || index < 0 { return -1 }
+    count := LE32(lump.File, lump.Offset)
+    if index >= count { return -1 }
+    offset := LE32(lump.File, lump.Offset + TextureDirectoryHeaderSize + index * 4)
+    directoryEnd := TextureDirectoryHeaderSize + count * 4
+    if offset < directoryEnd || offset > lump.Size - TextureHeaderSize { return -1 }
+    return offset
+}
+
+func textureDef(set TextureSet, lump LumpRef, index int) TextureDef {
+    offset := textureOffset(lump, index)
+    if offset < 0 { return TextureDef{} }
+    start := lump.Offset + offset
+    width, height := signed16(U16(lump.File, start + 12)), signed16(U16(lump.File, start + 14))
+    patches := signed16(U16(lump.File, start + 20))
+    if width <= 0 || height <= 0 || patches < 0 || patches > (lump.Size - offset - TextureHeaderSize) / TexturePatchSize {
+        return TextureDef{}
+    }
+    return TextureDef{Mounts: set.lookup, File: lump.File, PNames: set.PNames, Offset: start, Width: width, Height: height,
+        PatchCount: patches, Valid: true}
+}
+
+func TextureAt(set TextureSet, index int) TextureDef {
+    if !set.Valid || index < 0 || index >= TextureCount(set) { return TextureDef{} }
+    if index < set.FirstCount { return textureDef(set, set.First, index) }
+    return textureDef(set, set.Second, index - set.FirstCount)
+}
+
+func findTextureIn(lump LumpRef, count int, name LumpName) int {
+    for index := range count {
+        offset := textureOffset(lump, index)
+        if offset >= 0 {
+            candidate := normalizeName(lumpNameAt(lump.File, lump.Offset + offset))
+            if candidate.Low == name.Low && candidate.High == name.High { return index }
+        }
+    }
+    return -1
+}
+
+// Texture names use the first match in TEXTURE1 followed by TEXTURE2.
+// Texture index zero is reserved for no texture in the wall renderer.
+func TextureIndex(set TextureSet, name LumpName) int {
+    if !set.Valid || name.Low == 0 || name.Low & 0xff == 45 { return -1 }
+    key := normalizeName(name)
+    if set.indexed > 0 && set.NameIndexReady() {
+        index := set.names.Lookup(key) - 1
+        if index > 0 { return index }
+        return -1
+    }
+    first := findTextureIn(set.First, set.FirstCount, key)
+    if first >= 0 {
+        if first == 0 { return -1 }
+        return first
+    }
+    second := findTextureIn(set.Second, set.SecondCount, key)
+    if second < 0 || second + set.FirstCount == 0 { return -1 }
+    return set.FirstCount + second
+}
+
+func FindWallTexture(set TextureSet, name LumpName) TextureDef {
+    return TextureAt(set, TextureIndex(set, name))
+}
+
+// Both a leading dash and the actual name of texture zero select the empty tier.
+func IsEmptyWallTexture(set TextureSet, name LumpName) bit {
+    if !set.Valid { return false }
+    if name.Low & 0xff == 45 { return true }
+    first := TextureAt(set, 0)
+    return first.Valid && SameLumpName(name, lumpNameAt(first.File, first.Offset))
+}
+
+func patchLump(mounts textureArchiveLookup, pnames LumpRef, patch int) LumpRef {
+    if patch < 0 || !pnames.Valid || pnames.Size < PNameHeaderSize { return LumpRef{} }
+    count := LE32(pnames.File, pnames.Offset)
+    if patch >= count || patch >= (pnames.Size - PNameHeaderSize) / 8 { return LumpRef{} }
+    name := pnames.Offset + PNameHeaderSize + patch * 8
+    return mounts.Find(lumpNameAt(pnames.File, name))
+}
+
+// Return the last opaque post pixel copied into a destination texture row.
+// The clipping follows R_DrawColumnInCache exactly, including its historical
+// negative-origin copy behavior. The C routine shortens a negative post at
+// the destination but keeps its source pointer at the first post pixel.
+func patchPixel(patch LumpRef, column int, row int, originY int, cacheHeight int) TexturePixel {
+    if !patch.Valid || patch.Size < PatchHeaderSize { return TexturePixel{} }
+    file := patch.File
+    width, height := signed16(U16(file, patch.Offset)), signed16(U16(file, patch.Offset + 2))
+    if width <= 0 || height <= 0 || PatchHeaderSize + width * 4 > patch.Size { return TexturePixel{} }
+    // A valid patch outside its translated bounds is transparent at this
+    // texture coordinate. The compositor only treats malformed patch bytes as
+    // an error.
+    if column < 0 || column >= width { return TexturePixel{Valid: true} }
+    relative := LE32(file, patch.Offset + PatchHeaderSize + column * 4)
+    directoryEnd := PatchHeaderSize + width * 4
+    if relative < directoryEnd || relative >= patch.Size { return TexturePixel{} }
+    cursor := patch.Offset + relative
+    end := patch.Offset + patch.Size
+    result := TexturePixel{Valid: true}
+    // Every nonterminal post consumes at least four bytes, so this is a
+    // finite upper bound even if corrupted data contains zero-length posts.
+    for range patch.Size / 4 + 1 {
+        if cursor >= end { return TexturePixel{} }
+        top := int(file[cursor])
+        if top == 255 { return result }
+        if cursor > end - 4 { return TexturePixel{} }
+        length := int(file[cursor + 1])
+        if length > end - cursor - 4 { return TexturePixel{} }
+        position := originY + top
+        count := length
+        if position < 0 {
+            count = count + position
+            position = 0
+        }
+        if position + count > cacheHeight { count = cacheHeight - position }
+        if count > 0 && row >= position && row < position + count {
+            result.Value, result.Covered = file[cursor + 3 + row - position], true
+        }
+        cursor = cursor + length + 4
+    }
+    return TexturePixel{}
+}
+
+// Sample the composite cache algorithm. Later patches overwrite earlier
+// opaque pixels. Masked walls use the original post streams.
+func TexturePixelAt(texture TextureDef, column int, row int) TexturePixel {
+    if !texture.Valid || column < 0 || column >= texture.Width || row < 0 || row >= texture.Height { return TexturePixel{} }
+    result := TexturePixel{Valid: true}
+    for index := range texture.PatchCount {
+        entry := texture.Offset + TextureHeaderSize + index * TexturePatchSize
+        originX, originY := signed16(U16(texture.File, entry)), signed16(U16(texture.File, entry + 2))
+        patch := signed16(U16(texture.File, entry + 4))
+        source := patchPixel(patchLump(texture.Mounts, texture.PNames, patch), column - originX, row, originY, texture.Height)
+        if !source.Valid { return TexturePixel{} }
+        if source.Covered { result.Value, result.Covered = source.Value, true }
+    }
+    return result
+}

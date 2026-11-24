@@ -1,0 +1,180 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// A compact, asset-independent campaign picker for the playable preview.
+// Its 3x5 bitmap alphabet deliberately avoids relying on WAD HUD patches.
+
+package main
+
+import "engine"
+import "play"
+
+const campaignGlyphWidth = 3
+const campaignGlyphHeight = 5
+const campaignGlyphAdvance = 4
+const gammaLabels = [engine.DoomGammaCount]string{"J GAMMA 0", "J GAMMA 1", "J GAMMA 2", "J GAMMA 3", "J GAMMA 4"}
+
+func campaignGlyph(character string) bits<16> {
+    switch character {
+    case "A": return 23530
+    case "B": return 15083
+    case "C": return 29263
+    case "D": return 15211
+    case "E": return 29391
+    case "F": return 4815
+    case "G": return 31567
+    case "H": return 23533
+    case "I": return 29847
+    case "J": return 31527
+    case "K": return 23277
+    case "L": return 29257
+    case "M": return 23549
+    case "N": return 24573
+    case "O": return 31599
+    case "P": return 5103
+    case "Q": return 20335
+    case "R": return 23275
+    case "S": return 31183
+    case "T": return 9367
+    case "U": return 31597
+    case "V": return 11117
+    case "W": return 24557
+    case "Y": return 9389
+    case "0": return 31599
+    case "1": return 29850
+    case "2": return 29347
+    case "3": return 14499
+    case "4": return 18925
+    case "5": return 14543
+    }
+    return 0
+}
+
+func drawCampaignGlyph(character string, originX int, originY int, shade color) {
+    glyph := campaignGlyph(character)
+    for row := range campaignGlyphHeight {
+        for column := range campaignGlyphWidth {
+            if glyph & (bits<16>(1) << (row * campaignGlyphWidth + column)) != 0 {
+                pixel(originX + column, originY + row, true, shade)
+            }
+        }
+    }
+}
+
+func campaignTextWidth(text string) int {
+    width := 0
+    for _, character := range text {
+        if character == " " { width = width + 2 } else { width = width + campaignGlyphAdvance }
+    }
+    return width
+}
+
+func drawCampaignText(text string, x int, y int, shade color) {
+    for _, character := range text {
+        if character == " " { x = x + 2
+        } else {
+            drawCampaignGlyph(character, x, y, shade)
+            x = x + campaignGlyphAdvance
+        }
+    }
+}
+
+func campaignEpisodeLabel(episode int) string {
+    switch episode {
+    case 1: return "EPISODE 1"
+    case 2: return "EPISODE 2"
+    case 3: return "EPISODE 3"
+    case 4: return "EPISODE 4"
+    }
+    return "EPISODE"
+}
+
+func campaignSkillLabel(index int) string {
+    switch index {
+    case 0: return "VERY EASY"
+    case 1: return "EASY"
+    case 2: return "MEDIUM"
+    case 3: return "HARD"
+    case 4: return "NIGHTMARE"
+    }
+    return ""
+}
+
+func campaignMenuRows(menu play.CampaignMenu) int {
+    switch menu.Stage {
+    case play.CampaignMenuEpisode: return menu.Count
+    case play.CampaignMenuSkill: return 5
+    case play.CampaignMenuNightmare: return 2
+    }
+    return 0
+}
+
+func campaignMenuTitle(menu play.CampaignMenu) string {
+    switch menu.Stage {
+    case play.CampaignMenuEpisode: return "SELECT EPISODE"
+    case play.CampaignMenuSkill: return "SELECT SKILL"
+    case play.CampaignMenuNightmare: return "NIGHTMARE"
+    }
+    return "CAMPAIGN"
+}
+
+func campaignMenuLabel(menu play.CampaignMenu, index int) string {
+    switch menu.Stage {
+    case play.CampaignMenuEpisode:
+        if index >= 0 && index < menu.Count { return campaignEpisodeLabel(menu.Episodes[index]) }
+    case play.CampaignMenuSkill: return campaignSkillLabel(index)
+    case play.CampaignMenuNightmare:
+        if index == 0 { return "CANCEL" }
+        if index == 1 { return "START" }
+    }
+    return ""
+}
+
+func drawCampaignSlider(label string, left int, y int, slots int, selected int) {
+    drawCampaignText(label, left + 8, y, color.Orange)
+    for slot := range slots {
+        swatch := color.Blue
+        if slot <= selected { swatch = color.Yellow }
+        x := left + 50 + slot * 3
+        for row := range 5 {
+            pixel(x, y + row, true, swatch)
+            pixel(x + 1, y + row, true, swatch)
+        }
+    }
+}
+
+// The modal keeps a fixed footprint so changing stages clears every old row.
+func drawCampaignMenu(menu play.CampaignMenu, blocks int, sensitivity int, lowDetail bit, gamma int) {
+    if menu.Stage == play.CampaignMenuClosed { return }
+    rows := campaignMenuRows(menu)
+    panelWidth := Width * 3 / 4
+    if panelWidth > 160 { panelWidth = 160 }
+    if panelWidth < 88 { panelWidth = 88 }
+    panelHeight := 85
+    left, top := (Width - panelWidth) / 2, (Height - panelHeight) / 2
+    for y := range panelHeight {
+        for x := range panelWidth {
+            shade := color.Black
+            if x == 0 || y == 0 || x == panelWidth - 1 || y == panelHeight - 1 { shade = color.Purple }
+            pixel(left + x, top + y, true, shade)
+        }
+    }
+    title := campaignMenuTitle(menu)
+    drawCampaignText(title, left + (panelWidth - campaignTextWidth(title)) / 2, top + 6, color.White)
+    for index := range rows {
+        y := top + 17 + index * 9
+        shade := color.White
+        if index == menu.Cursor {
+            shade = color.Yellow
+            for marker := range 5 { pixel(left + 8, y + marker, true, shade) }
+        }
+        label := campaignMenuLabel(menu, index)
+        drawCampaignText(label, left + 16, y, shade)
+    }
+    drawCampaignText("W S MOVE", left + 8, top + panelHeight - 12, color.Orange)
+    detail := "G HIGH DETAIL"
+    if lowDetail { detail = "G LOW DETAIL" }
+    drawCampaignText(detail, left + 39, top + panelHeight - 12, color.Orange)
+    drawCampaignText("F OK T BACK", left + 8, top + panelHeight - 7, color.Orange)
+    drawCampaignText(gammaLabels[gamma], left + 51, top + panelHeight - 7, color.Orange)
+    drawCampaignSlider("A D SCREEN", left, top + panelHeight - 24, 9, blocks - 3)
+    drawCampaignSlider("Q E MOUSE", left, top + panelHeight - 18, play.MaxMouseSensitivity + 1, sensitivity)
+}

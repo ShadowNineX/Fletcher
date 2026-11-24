@@ -1,0 +1,222 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// A_Brain*, A_SpawnSound and A_SpawnFly from linuxdoom-1.10/p_enemy.c.
+
+package enemy
+
+import "actorinfo"
+import "engine"
+import "play"
+import "wad"
+
+const brainArrivalFlying = 0
+const brainArrivalWake = 1
+const brainArrivalStomp = 2
+
+type BrainState = play.BrainState
+
+func AwakenBrain(world play.CombatWorld, old BrainState) BrainState {
+    state := BrainState{EasyTurn: old.EasyTurn}
+    for index := range world.Actors.Count {
+        actor := world.Actors.ActorAt(index)
+        if actor.Valid && actor.Kind == actorinfo.ActorBossTarget {
+            if state.Count == play.BrainTargetLimit { return state }
+            state.Targets[state.Count] = index + 1
+            state.Count = state.Count + 1
+        }
+    }
+    return state
+}
+
+type BrainSpitStep struct {
+    Brain BrainState
+    Combat play.CombatStep
+    Handle int
+    Done bit
+    source int
+    destination int
+    missile play.MissileLaunch
+}
+
+func BeginBrainSpit(level wad.BspLevel, world play.CombatWorld, brain BrainState, handle int,
+    rules play.CombatRules) BrainSpitStep {
+    brain.EasyTurn = !brain.EasyTurn
+    result := BrainSpitStep{Brain: brain, Combat: play.CombatStep{World: world}, source: handle}
+    if (rules.Skill <= 1 && !brain.EasyTurn) || brain.Count == 0 { result.Done = true; return result }
+    result.destination = brain.Targets[brain.Cursor]
+    result.Brain.Cursor = (brain.Cursor + 1) % brain.Count
+    result.missile = play.BeginMonsterMissile(level, world, handle, result.destination, actorinfo.ActorSpawnCube, rules)
+    result.Combat, result.Handle = result.missile.Combat, result.missile.Handle
+    return result
+}
+
+func ResumeBrainSpit(level wad.BspLevel, blocks wad.BlockMapInfo, result BrainSpitStep, rules play.CombatRules) BrainSpitStep {
+    if result.Done || result.Combat.Failed { return result }
+    if !result.missile.Done {
+        result.missile.Combat = result.Combat
+        result.missile = play.ResumeMissileLaunch(level, blocks, result.missile, rules)
+        result.Combat = result.missile.Combat
+        if !result.missile.Done || result.Combat.Failed { return result }
+    }
+    world := result.Combat.World
+    missile := world.Actors.ActorAt(result.Handle - 1)
+    if missile.Valid && missile.Physics.MomentumY != 0 {
+        start := world.Actors.ActorAt(result.source - 1).Physics.Body.Y
+        end := world.Actors.ActorAt(result.destination - 1).Physics.Body.Y
+        missile.Target = result.destination
+        // P_CheckMissileSpawn jitters the live tic count. The travel formula
+        // uses the unmodified count from the state's definition.
+        missile.ReactionTime = ((end - start) / missile.Physics.MomentumY) / actorinfo.StateAt(missile.State).Tics
+        world.Actors = world.Actors.WithActor(result.Handle, missile)
+    }
+    result.Combat = play.CombatStep{World: world, ActorHandle: result.Handle,
+        Feedback: play.CombatFeedback{Sound: actorinfo.SoundBossSpit}}
+    result.Done = true
+    return result
+}
+
+const brainThresholds = [10]int{50, 90, 120, 130, 160, 162, 172, 192, 222, 246}
+const brainKinds = [10]int{actorinfo.ActorImp, actorinfo.ActorDemon, actorinfo.ActorSpectre, actorinfo.ActorPainElemental,
+    actorinfo.ActorCacodemon, actorinfo.ActorVile, actorinfo.ActorRevenant, actorinfo.ActorArachnotron,
+    actorinfo.ActorMancubus, actorinfo.ActorKnight}
+
+func BrainSpawnKind(roll int) int {
+    for index := range 10 {
+        if roll < brainThresholds[index] { return brainKinds[index] }
+    }
+    return actorinfo.ActorBruiser
+}
+
+func spawnBrainActor(level wad.BspLevel, world play.CombatWorld, kind int, x int, y int, z int,
+    rules play.CombatRules) play.CombatStep {
+    handle := world.Actors.NextTransientHandle()
+    if handle == 0 { return play.CombatStep{World: world, Failed: true} }
+    spawn := play.SpawnMobjWithFast(level, kind, x, y, z, rules.Skill, rules.Fast, world.Random)
+    linked := world.Links.SetActorPosition(level, handle, spawn.Actor)
+    if !linked.Valid { return play.CombatStep{World: world, Failed: true} }
+    world.Actors = world.Actors.AppendTransient(linked.Actor)
+    world.Links, world.Random = linked.Links, spawn.Random
+    return play.CombatStep{World: world, ActorHandle: handle}
+}
+
+type BrainArrival struct {
+    Combat play.CombatStep
+    Wake bit
+    Done bit
+    Spawned int
+    Hit play.DamageRequest
+    cube int
+    phase int
+    teleport play.TeleportMoveStep
+}
+
+func BeginBrainArrival(world play.CombatWorld, handle int, action int) BrainArrival {
+    result := BrainArrival{Combat: play.CombatStep{World: world}, cube: handle}
+    if action == actorinfo.ActionSpawnSound {
+        result.Combat.Feedback = play.CombatFeedback{Sound: actorinfo.SoundBossCube, SoundOrigin: handle}
+    }
+    return result
+}
+
+func removeSpawnCube(result BrainArrival) BrainArrival {
+    world := result.Combat.World
+    cube := world.Actors.ActorAt(result.cube - 1)
+    cube.Valid = false
+    world.Actors = world.Actors.WithActor(result.cube, cube)
+    world.Links = world.Links.UnlinkActor(result.cube)
+    result.Combat, result.Done = play.CombatStep{World: world, ActorHandle: result.cube}, true
+    return result
+}
+
+func spawnCubeMonster(level wad.BspLevel, result BrainArrival, rules play.CombatRules) BrainArrival {
+    world := result.Combat.World
+    cube := world.Actors.ActorAt(result.cube - 1)
+    cube.ReactionTime = cube.ReactionTime - 1
+    world.Actors = world.Actors.WithActor(result.cube, cube)
+    result.Combat = play.CombatStep{World: world}
+    if cube.ReactionTime != 0 { result.Done = true; return result }
+    spot := world.Actors.ActorAt(cube.Target - 1)
+    if !spot.Valid { return removeSpawnCube(result) }
+
+    body := spot.Physics.Body
+    fog := spawnBrainActor(level, world, actorinfo.ActorSpawnFire, body.X, body.Y, body.Z, rules)
+    if fog.Failed { result.Combat = fog; return result }
+    pick := play.PRandom(fog.World.Random)
+    world = fog.World
+    world.Random = pick.State
+    kind := BrainSpawnKind(int(pick.Value))
+    result.Combat = spawnBrainActor(level, world, kind, body.X, body.Y, body.Z, rules)
+    if result.Combat.Failed { return result }
+    result.Spawned, result.phase = result.Combat.ActorHandle, brainArrivalWake
+    result.Combat.Feedback = play.CombatFeedback{Sound: actorinfo.SoundTeleport, SoundOrigin: fog.ActorHandle}
+    world = result.Combat.World
+    look := LookForPlayers(level, world, world.Actors.ActorAt(result.Spawned - 1), true)
+    actor := look.Actor
+    if look.Found {
+        result.Combat.State = play.SetMobjStateWithFast(actor, actorinfo.KindAt(kind).SeeState, rules.Fast)
+        result.Combat.Failed = result.Combat.State.Failed
+        result.Wake = result.Combat.State.Action != 0
+        actor = result.Combat.State.Actor
+    }
+    result.Combat.World.Actors = world.Actors.WithActor(result.Spawned, actor)
+    return result
+}
+
+func ResumeBrainArrival(level wad.BspLevel, blocks wad.BlockMapInfo, result BrainArrival, mapNumber int,
+    rules play.CombatRules) BrainArrival {
+    if result.Done || result.Combat.Failed { return result }
+    result.Hit = play.DamageRequest{}
+    switch result.phase {
+    case brainArrivalFlying:
+        return spawnCubeMonster(level, result, rules)
+    case brainArrivalWake:
+        result.Wake = false
+        body := result.Combat.World.Actors.ActorAt(result.Spawned - 1).Physics.Body
+        result.teleport = play.BeginTeleportMove(level, blocks, result.Combat.World, result.Spawned, body.X, body.Y, mapNumber, rules)
+        result.phase = brainArrivalStomp
+    case brainArrivalStomp:
+        if result.teleport.Done { return removeSpawnCube(result) }
+        result.teleport.Combat.World = result.Combat.World
+        result.teleport = play.ResumeTeleportMove(level, result.teleport, rules)
+    }
+    result.Combat, result.Hit = result.teleport.Combat, result.teleport.Hit
+    return result
+}
+
+func spawnBrainExplosion(level wad.BspLevel, world play.CombatWorld, x int, y int, rules play.CombatRules) play.CombatStep {
+    rise := play.PRandom(world.Random)
+    world.Random = rise.State
+    result := spawnBrainActor(level, world, actorinfo.ActorRocket, x, y, 128 + int(rise.Value) * 2 * engine.FracUnit, rules)
+    if result.Failed { return result }
+    actor := result.World.Actors.ActorAt(result.ActorHandle - 1)
+    momentum := play.PRandom(result.World.Random)
+    actor.Physics.MomentumZ = int(momentum.Value) * 512
+    actor = play.SetMobjState(actor, actorinfo.StateBrainExplode1).Actor
+    jitter := play.PRandom(momentum.State)
+    actor.Tics = actor.Tics - int(jitter.Value & 7)
+    if actor.Tics < 1 { actor.Tics = 1 }
+    result.World.Actors = result.World.Actors.WithActor(result.ActorHandle, actor)
+    result.World.Random = jitter.State
+    return result
+}
+
+func BrainFireworks(level wad.BspLevel, world play.CombatWorld, handle int, action int,
+    rules play.CombatRules) play.CombatStep {
+    body := world.Actors.ActorAt(handle - 1).Physics.Body
+    if action == actorinfo.ActionBrainExplode {
+        first := play.PRandom(world.Random)
+        second := play.PRandom(first.State)
+        world.Random = second.State
+        x := body.X + (int(first.Value) - int(second.Value)) * 2048
+        return spawnBrainExplosion(level, world, x, body.Y, rules)
+    }
+    // ceil((196 + 320) / 8) rockets in the original west-to-east sweep.
+    y := body.Y - 320 * engine.FracUnit
+    for index := range 65 {
+        x := body.X + (index * 8 - 196) * engine.FracUnit
+        rocket := spawnBrainExplosion(level, world, x, y, rules)
+        if rocket.Failed { return rocket }
+        world = rocket.World
+    }
+    return play.CombatStep{World: world, Feedback: play.CombatFeedback{Sound: actorinfo.SoundBossDeath}}
+}

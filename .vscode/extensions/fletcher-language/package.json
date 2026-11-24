@@ -1,0 +1,35 @@
+{
+  "name": "fletcher-language",
+  "displayName": "Fletcher Language",
+  "description": "Workspace-local syntax highlighting for Fletcher .flt files.",
+  "version": "0.0.0",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.89.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "fletcher",
+        "aliases": [
+          "Fletcher",
+          "fletcher"
+        ],
+        "extensions": [
+          ".flt"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "fletcher",
+        "scopeName": "source.fletcher",
+        "path": "./syntaxes/fletcher.tmLanguage.json"
+      }
+    ]
+  }
+}

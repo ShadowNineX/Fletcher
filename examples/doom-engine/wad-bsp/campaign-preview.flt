@@ -1,0 +1,56 @@
+package main
+
+import "play"
+import "wad"
+import "walls"
+
+func campaignMarker(mounts wad.Archives, route play.CampaignRoute) int {
+    lump := mounts.Find(route.NextName)
+    if !lump.Valid || lump.Entry < 0 || lump.Size != 0 { return -1 }
+    return lump.Entry
+}
+
+func campaignScore(level wad.BspLevel, actors play.MapActors, inventory play.PlayerInventory,
+    levelTime int, parTime int) play.IntermissionScore {
+    secrets := 0
+    for sector := range level.Sectors.Count {
+        if level.SectorSpecial(sector) == 9 { secrets = secrets + 1 }
+    }
+    return play.IntermissionScore{Kills: inventory.KillCount, MaxKills: actors.TotalKills,
+        Items: inventory.ItemCount, MaxItems: actors.TotalItems, Secrets: inventory.SecretCount, MaxSecrets: secrets,
+        TimeTics: levelTime, ParTics: parTime}
+}
+
+// F_StartFinale selects the flat used underneath the story text.
+func finaleFlatName(route play.CampaignRoute) wad.LumpName {
+    if route.Commercial {
+        switch route.LastMap + 1 {
+        case 6: return wad.LumpName{Low: 0x4d494c53, High: 0x363145}
+        case 11: return wad.LumpName{Low: 0x434f5252, High: 0x34314b}
+        case 15: return wad.LumpName{Low: 0x434f5252, High: 0x33314b}
+        case 20: return wad.LumpName{Low: 0x434f5252, High: 0x37304b}
+        case 30: return wad.LumpName{Low: 0x434f5252, High: 0x37314b}
+        case 31: return wad.LumpName{Low: 0x434f5252, High: 0x39314b}
+        }
+    }
+    switch route.Episode {
+    case 0: return wad.LumpName{Low: 0x4f4f4c46, High: 0x385f3452}
+    case 1: return wad.LumpName{Low: 0x524c4653, High: 0x315f36}
+    case 2: return wad.LumpName{Low: 0x524c464d, High: 0x345f38}
+    case 3: return wad.LumpName{Low: 0x524c464d, High: 0x335f38}
+    }
+    return wad.LumpName{}
+}
+
+func drawFinaleBackdrop(materials walls.Materials, route play.CampaignRoute) {
+    if !materials.Shade.Valid { return }
+    flat := wad.FindFlat(materials.Flats, finaleFlatName(route))
+    if !flat.Valid || flat.Size != wad.FlatBytes { return }
+    for y := range Height {
+        row := flat.Offset + ((y * intermissionHeight / Height) & 63) * 64
+        for x := range Width {
+            column := (x * intermissionWidth / Width) & 63
+            pixel(x, y, true, materials.Shade.ColorAt(int(flat.File[row + column]), x, y))
+        }
+    }
+}

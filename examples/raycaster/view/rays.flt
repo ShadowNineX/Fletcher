@@ -1,0 +1,59 @@
+package view
+
+import "maze"
+
+const scale = maze.Scale
+const infinity = 1 << 30
+
+type rayHit struct {
+    depth int
+    side int
+    material int
+    strip int
+}
+
+// DDA steps directly to the next grid edge on the cheaper axis.
+func cast(x int, y int, rayX int, rayY int) rayHit {
+    col, row := x / scale, y / scale
+    stepX, stepY := 1, 1
+    if rayX < 0 { stepX = -1 }
+    if rayY < 0 { stepY = -1 }
+
+    deltaX, deltaY := infinity, infinity
+    distanceX, distanceY := infinity, infinity
+    if rayX != 0 {
+        deltaX = scale * scale / (rayX * stepX)
+        gap := (col + 1) * scale - x
+        if stepX < 0 { gap = x - col * scale }
+        distanceX = gap * deltaX / scale
+    }
+    if rayY != 0 {
+        deltaY = scale * scale / (rayY * stepY)
+        gap := (row + 1) * scale - y
+        if stepY < 0 { gap = y - row * scale }
+        distanceY = gap * deltaY / scale
+    }
+
+    // A ray exits the enclosed 10×10 grid within 16 crossings.
+    for range 16 {
+        var depth int
+        var side int
+        if distanceX < distanceY {
+            depth = distanceX
+            distanceX = distanceX + deltaX
+            col = col + stepX
+        } else {
+            depth = distanceY
+            distanceY = distanceY + deltaY
+            row = row + stepY
+            side = 1
+        }
+        material := maze.Cell(col, row)
+        if material != 0 {
+            across := y + depth * rayY / scale
+            if side == 1 { across = x + depth * rayX / scale }
+            return rayHit{ depth: depth, side: side, material: material, strip: (across & (scale - 1)) / 128 }
+        }
+    }
+    return rayHit{depth: scale * maze.Size, material: 1}
+}

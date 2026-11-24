@@ -1,0 +1,67 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// P_DeathThink from linuxdoom-1.10/p_user.c.
+
+package play
+
+import "engine"
+
+const CheatNoMomentum = 4
+const deathViewHeight = 6 * engine.FracUnit
+const deathTurn = quarterTurn / 18
+const halfTurn bits<32> = 0x80000000
+
+type PlayerDeathStep struct {
+    World CombatWorld
+    View PlayerView
+    Reborn bit
+    OnGround bit
+}
+
+// The player thinker has already advanced the weapon sprites.
+func TickPlayerDeath(world CombatWorld, handle int, levelTime int, use bit) PlayerDeathStep {
+    actor := world.Actors.ActorAt(handle - 1)
+    slot := combatPlayer(actor)
+    if slot < 0 || !world.Players[slot].Dead { return PlayerDeathStep{World: world} }
+    inventory := world.Players[slot]
+    body := actor.Physics
+    if body.ViewHeight > deathViewHeight { body.ViewHeight = body.ViewHeight - engine.FracUnit }
+    if body.ViewHeight < deathViewHeight { body.ViewHeight = deathViewHeight }
+    body.ViewHeightDelta = 0
+    onGround := body.Body.Z <= body.Body.Floor
+    view := CalculatePlayerViewOnGround(body, levelTime, false, inventory.Cheats & CheatNoMomentum != 0, onGround)
+
+    attacker := world.Actors.ActorAt(inventory.Attacker - 1)
+    fadeDamage := true
+    if attacker.Valid && inventory.Attacker != handle {
+        target := attacker.Physics.Body
+        angle := engine.PointToAngle(body.Body.X, body.Body.Y, target.X, target.Y)
+        delta := angle - body.Angle
+        if delta < deathTurn || delta > -deathTurn {
+            body.Angle = angle
+        } else {
+            fadeDamage = false
+            if delta < halfTurn {
+                body.Angle = body.Angle + deathTurn
+            } else { body.Angle = body.Angle - deathTurn }
+        }
+    }
+    if fadeDamage && inventory.DamageCount != 0 { inventory.DamageCount = inventory.DamageCount - 1 }
+    actor.Physics = body
+    world.Actors = world.Actors.WithActor(handle, actor)
+    world.Players[slot] = inventory
+    return PlayerDeathStep{World: world, View: view, Reborn: use, OnGround: onGround}
+}
+
+// The player body still runs its P_MobjThinker state timer after movement.
+// The player mobj runs its state timer after physical movement, even when
+// P_PlayerThink already processed weapon sprites or the death camera.
+func TickPlayerBodyState(world CombatWorld, handle int, levelTime int) CombatStep {
+    actor := world.Actors.ActorAt(handle - 1)
+    slot := combatPlayer(actor)
+    result := CombatStep{World: world}
+    if slot < 0 || actor.Tics == -1 { return result }
+    advanced := TickMobjState(actor, levelTime, false, world.Random)
+    result.World.Random = advanced.Random
+    return publishCombatState(result, handle, advanced.Step, 0)
+}

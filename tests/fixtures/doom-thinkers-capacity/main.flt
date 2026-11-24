@@ -1,0 +1,28 @@
+package main
+
+import "play"
+
+type CapacitySink struct {}
+
+func (sink CapacitySink) Think(handle int, payload int) play.ThinkerAction {
+    if payload == 63 { return play.ThinkerAction{Append: true, AppendPayload: 99} }
+    return play.ThinkerAction{}
+}
+
+map "Doom thinker capacity" {
+    tick {
+        state := play.InitThinkers()
+        for i := range play.MaxThinkers {
+            added := play.AddThinker(state, i)
+            state = added.State
+        }
+        if currentTick() == 0 {
+            overflow := play.AddThinker(state, 99)
+            log(state.Count, state.Head, state.Tail, state.Failed, overflow.Handle, overflow.State.Failed, overflow.State.Count)
+        } else {
+            for index := range play.MaxThinkers - 1 { state = play.RemoveThinker(state, index) }
+            state = play.RunThinkers(state, CapacitySink{})
+            log(state.Count, state.Head, state.Tail, state.RunCount, state.RunOrder[0], state.RunOrder[1], state.Failed)
+        }
+    }
+}

@@ -1,0 +1,76 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted on 2026-11-21 from the geometry loaders in linuxdoom-1.10/p_setup.c and doomdata.h.
+
+package engine
+
+type Vertex struct {
+    X int
+    Y int
+}
+
+type Subsector struct {
+    SegmentCount int
+    FirstSegment int
+}
+
+type SectorHeights struct {
+    Floor int
+    Ceiling int
+}
+
+func little16(low bits<8>, high bits<8>) int {
+    return int(low) | (int(high) << 8)
+}
+
+// Shifting the unsigned 16-bit value into the upper half both sign-extends
+// the original map coordinate and scales it to 16.16 fixed point.
+func coordinate(low bits<8>, high bits<8>) int {
+    return little16(low, high) << 16
+}
+
+func DecodeVertex(record [4]bits<8>) Vertex {
+    return Vertex{X: coordinate(record[0], record[1]), Y: coordinate(record[2], record[3])}
+}
+
+func DecodeSubsector(record [4]bits<8>) Subsector {
+    return DecodeSubsectorWord(little16(record[0], record[1]) | coordinate(record[2], record[3]))
+}
+
+func DecodeSubsectorWord(record int) Subsector {
+    return Subsector{SegmentCount: (record << 16) >> 16, FirstSegment: record >> 16}
+}
+
+func DecodeNode(record [28]bits<8>) Node {
+    return DecodeNodeWords(nodeWord(record, 0), nodeWord(record, 4), nodeWord(record, 8), nodeWord(record, 12),
+        nodeWord(record, 16), nodeWord(record, 20), nodeWord(record, 24))
+}
+
+func nodeWord(record [28]bits<8>, offset int) int {
+    return int(record[offset]) | (int(record[offset + 1]) << 8) |
+        (int(record[offset + 2]) << 16) | (int(record[offset + 3]) << 24)
+}
+
+// Each geometry word contains two signed 16-bit values. A shift or mask
+// places either value in the high half for Doom's 16.16 coordinates.
+func DecodeBspPartition(position int, delta int, children int) BspPartition {
+    return BspPartition{
+        X: position << 16, Y: position & -65536,
+        DeltaX: delta << 16, DeltaY: delta & -65536,
+        Front: children & 0xffff, Back: int(bits<32>(children) >> 16),
+    }
+}
+
+func DecodeBoxWords(vertical int, horizontal int) Box {
+    return Box{Top: vertical << 16, Bottom: vertical & -65536,
+        Left: horizontal << 16, Right: horizontal & -65536}
+}
+
+func DecodeNodeWords(position int, delta int, frontY int, frontX int, backY int, backX int, children int) Node {
+    partition := DecodeBspPartition(position, delta, children)
+    return Node{
+        X: partition.X, Y: partition.Y, DeltaX: partition.DeltaX, DeltaY: partition.DeltaY,
+        Front: partition.Front, Back: partition.Back,
+        FrontBounds: DecodeBoxWords(frontY, frontX), BackBounds: DecodeBoxWords(backY, backX),
+    }
+}

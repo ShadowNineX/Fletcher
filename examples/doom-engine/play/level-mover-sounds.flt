@@ -1,0 +1,63 @@
+package play
+
+import "actorinfo"
+import "wad"
+
+const GlobalMoverSoundSector = -1
+
+type MoverSound struct {
+    Id int
+    Sector int
+}
+
+// A tic's sound cues are stored in thinker order.
+type MoverSounds struct {
+    Count int
+    slots PagedSlots<int>
+}
+
+func (sounds MoverSounds) At(index int) MoverSound {
+    if index < 0 || index >= sounds.Count { return MoverSound{} }
+    value := sounds.slots.At(index)
+    return MoverSound{Id: value & 127, Sector: (value >> 7) - 1}
+}
+
+func (sounds MoverSounds) add(id int, sector int) MoverSounds {
+    if id == 0 { return sounds }
+    value := ((sector + 1) << 7) | id
+    return MoverSounds{Count: sounds.Count + 1, slots: sounds.slots.With(sounds.Count, value)}
+}
+
+func (sounds MoverSounds) addTick(sector int, events MoverTickSounds) MoverSounds {
+    if events.First == 0 && events.Second == 0 { return sounds }
+    return sounds.add(events.First, sector).add(events.Second, sector)
+}
+
+func taggedDoorStartSound(door DoorState) int {
+    if door.Direction == -1 {
+        if door.Mode == DoorBlazeClose { return actorinfo.SoundBlazeClose }
+        return actorinfo.SoundDoorClose
+    }
+    if door.Ceiling == door.Top { return 0 }
+    if door.Mode == DoorBlazeRaise || door.Mode == DoorBlazeOpen { return actorinfo.SoundBlazeOpen }
+    return actorinfo.SoundDoorOpen
+}
+
+func platformStartSound(mode int) int {
+    if mode == PlatformRaiseAndChange || mode == PlatformRaiseNearestAndChange { return actorinfo.SoundStoneMove }
+    return actorinfo.SoundPlatformStart
+}
+
+// P_UpdateSpecials restores buttons after the actor and sector thinkers.
+func (doors LevelDoors) TickButtonTimers(level wad.BspLevel) LevelDoors {
+    if doors.Switches.ButtonCount == 0 || doors.Switches.ButtonOverflow { return doors }
+    for i := range MaxButtons {
+        button := doors.Switches.Buttons[i]
+        if button.Tics == 1 {
+            sector := level.LineAt(button.Line).FrontSector
+            doors.Sounds = doors.Sounds.add(actorinfo.SoundSwitch, sector)
+        }
+    }
+    doors.Switches = doors.Switches.TickButtons()
+    return doors
+}

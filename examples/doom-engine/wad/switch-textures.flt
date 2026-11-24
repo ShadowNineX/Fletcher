@@ -1,0 +1,82 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted on 2026-11-21 from alphSwitchList and P_ChangeSwitchTexture in
+// linuxdoom-1.10/p_switch.c.
+
+package wad
+
+const SwitchTop = 0
+const SwitchMiddle = 1
+const SwitchBottom = 2
+const SwitchPairCount = 40
+
+type SwitchTextureMatch struct {
+    Valid bit
+    Tier int
+    Original LumpName
+    Replacement LumpName
+}
+
+// Each row is { SW1 low word, high word, minimum episode }. SW2 differs
+// solely in byte two of Low. Rows retain alphSwitchList's exact order.
+const SwitchPairs = [SwitchPairCount][3]int{
+    [3]int{0x42315753, 0x4d4f4352, 1}, [3]int{0x42315753, 0x00314e52, 1}, [3]int{0x42315753, 0x00324e52, 1}, [3]int{0x42315753, 0x4e474e52, 1}, [3]int{0x42315753, 0x4e574f52, 1}, // BRCOM BRN1 BRN2 BRNGN BROWN
+    [3]int{0x43315753, 0x004d4d4f, 1}, [3]int{0x43315753, 0x00504d4f, 1}, [3]int{0x44315753, 0x00545249, 1}, [3]int{0x45315753, 0x00544958, 1}, [3]int{0x47315753, 0x00594152, 1}, // COMM COMP DIRT EXIT GRAY
+    [3]int{0x47315753, 0x31594152, 1}, [3]int{0x4d315753, 0x4c415445, 1}, [3]int{0x50315753, 0x00455049, 1}, [3]int{0x53315753, 0x0044414c, 1}, [3]int{0x53315753, 0x47524154, 1}, // GRAY1 METAL PIPE SLAD STARG
+    [3]int{0x53315753, 0x314e4f54, 1}, [3]int{0x53315753, 0x324e4f54, 1}, [3]int{0x53315753, 0x454e4f54, 1}, [3]int{0x53315753, 0x4e545254, 1}, // STON1 STON2 STONE STRTN
+    [3]int{0x42315753, 0x0045554c, 2}, [3]int{0x43315753, 0x0000544d, 2}, [3]int{0x47315753, 0x00475241, 2}, [3]int{0x47315753, 0x4e4f5453, 2}, [3]int{0x48315753, 0x0000544f, 2}, // BLUE CMT GARG GSTON HOT
+    [3]int{0x4c315753, 0x004e4f49, 2}, [3]int{0x53315753, 0x52595441, 2}, [3]int{0x53315753, 0x004e494b, 2}, [3]int{0x56315753, 0x00454e49, 2}, [3]int{0x57315753, 0x00444f4f, 2}, // LION SATYR SKIN VINE WOOD
+    [3]int{0x50315753, 0x4c454e41, 3}, [3]int{0x52315753, 0x004b434f, 3}, [3]int{0x4d315753, 0x00325445, 3}, [3]int{0x57315753, 0x54454d44, 3}, [3]int{0x42315753, 0x004b4952, 3}, // PANEL ROCK MET2 WDMET BRIK
+    [3]int{0x4d315753, 0x0031444f, 3}, [3]int{0x5a315753, 0x00004d49, 3}, [3]int{0x53315753, 0x364e4f54, 3}, [3]int{0x54315753, 0x00004b45, 3}, [3]int{0x4d315753, 0x00425241, 3}, [3]int{0x53315753, 0x4c4c554b, 3}, // MOD1 ZIM STON6 TEK MARB SKULL
+}
+
+func switchName(low int, high int) LumpName { return LumpName{Low: low, High: high} }
+func otherSwitchName(name LumpName) LumpName { return LumpName{Low: name.Low + 0x10000, High: name.High} }
+
+func switchSideName(side SideMaterial, tier int) LumpName {
+    if tier == SwitchTop { return normalizeName(side.Upper) }
+    if tier == SwitchMiddle { return normalizeName(side.Middle) }
+    return normalizeName(side.Lower)
+}
+
+func switchNamesEqual(left LumpName, right LumpName) bit { return left.Low == right.Low && left.High == right.High }
+
+// The preview receives an archive without Doom's IWAD filename selection.
+// Infer its edition from the selected map family and episode markers.
+func SwitchEpisode(mounts Archives, mapName LumpName) int {
+    name := normalizeName(mapName)
+    if name.Low & 0xffffff == 0x50414d { return 3 } // MAPnn
+    episode := (name.Low >> 8) & 0xff
+    if episode == 52 || mounts.Find(LumpName{Low: 0x314d3445}).Found { return 1 } // Retail (E4M1)
+    if episode == 50 || episode == 51 || mounts.Find(LumpName{Low: 0x314d3245}).Found ||
+        mounts.Find(LumpName{Low: 0x314d3345}).Found { return 2 } // E2M1 or E3M1
+    return 1
+}
+
+// MatchSwitchTexture follows P_ChangeSwitchTexture's exact dispatch order:
+// each individual SW1/SW2 entry is tested against top, middle, then bottom
+// before continuing to the next table entry.
+func MatchSwitchTexture(side SideMaterial, textures TextureSet, episode int) SwitchTextureMatch {
+    if !textures.Valid { return SwitchTextureMatch{} }
+    names := [3]LumpName{switchSideName(side, SwitchTop), switchSideName(side, SwitchMiddle), switchSideName(side, SwitchBottom)}
+    for pairIndex := range SwitchPairCount {
+        pair := SwitchPairs[pairIndex]
+        if pair[2] <= episode {
+            first := switchName(pair[0], pair[1])
+            second := otherSwitchName(first)
+            for direction := range 2 {
+                original, replacement := first, second
+                if direction == 1 { original, replacement = second, first }
+                for tier := range 3 {
+                    if switchNamesEqual(names[tier], original) {
+                        // A partial archive may supply only one endpoint.
+                        if TextureIndex(textures, original) >= 0 && TextureIndex(textures, replacement) >= 0 {
+                            return SwitchTextureMatch{Valid: true, Tier: tier, Original: original, Replacement: replacement}
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return SwitchTextureMatch{}
+}

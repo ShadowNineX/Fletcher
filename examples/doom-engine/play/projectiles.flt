@@ -1,0 +1,164 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted from P_SpawnMissile, P_SpawnPlayerMissile and P_CheckMissileSpawn.
+
+package play
+
+import "actorinfo"
+import "engine"
+import "numeric"
+import "wad"
+
+const ActorShadow = 0x40000
+const playerAimDistance = 16 * 64 * engine.FracUnit
+const playerAimOffset = 1 << 26
+const missileLaunchHeight = 32 * engine.FracUnit
+
+const missileInitialize = 1
+const missileExplodeOnSpawn = 2
+const missileFinishExplosion = 3
+
+func missileSpeed(kind int, fast bit) int {
+    if fast && (kind == actorinfo.ActorBruiserShot || kind == actorinfo.ActorHeadShot || kind == actorinfo.ActorTroopShot) { return 20 * engine.FracUnit }
+    return actorinfo.KindAt(kind).Speed
+}
+
+type PlayerAttackAim struct {
+    Valid bit
+    Heading bits<32>
+    Slope int
+    Target int
+}
+
+func AimPlayerAttack(level wad.BspLevel, blocks wad.BlockMapInfo, world CombatWorld, shooter int) PlayerAttackAim {
+    source := world.Actors.ActorAt(shooter - 1)
+    if !source.Valid { return PlayerAttackAim{} }
+    original := source.Physics.Angle
+    heading := original
+    for probe := range 3 {
+        aim := AimLineAttack(level, blocks, world, shooter, heading, playerAimDistance)
+        if !aim.Valid { return PlayerAttackAim{} }
+        if aim.Target != 0 { return PlayerAttackAim{Valid: true, Heading: heading, Slope: aim.Slope, Target: aim.Target} }
+        if probe == 0 { heading = original + playerAimOffset }
+        if probe == 1 { heading = original - playerAimOffset }
+    }
+    return PlayerAttackAim{Valid: true, Heading: original}
+}
+
+// The initial result publishes the launch sound from the original position.
+// Resumption initializes momentum, attempts the first half-step, and delivers
+// any contact or explosion state actions before finishing the launch.
+type MissileLaunch struct {
+    Combat CombatStep
+    Handle int
+    Aim PlayerAttackAim
+    Done bit
+    source int
+    destination int
+    phase int
+}
+
+func allocateMissile(level wad.BspLevel, world CombatWorld, sourceHandle int, kind int,
+    rules CombatRules) MissileLaunch {
+    result := MissileLaunch{Combat: CombatStep{World: world}}
+    source := world.Actors.ActorAt(sourceHandle - 1)
+    info := actorinfo.KindAt(kind)
+    if !source.Valid || !info.Valid || info.Speed <= 0 || info.Flags & MoveMissile == 0 ||
+        world.Actors.NextTransientHandle() == 0 {
+        result.Combat.Failed = true
+        return result
+    }
+    body := source.Physics.Body
+    spawn := SpawnMobjWithFast(level, kind, body.X, body.Y, body.Z + missileLaunchHeight, rules.Skill, rules.Fast, world.Random)
+    handle := world.Actors.NextTransientHandle()
+    linked := world.Links.SetActorPosition(level, handle, spawn.Actor)
+    if !linked.Valid { result.Combat.Failed = true; return result }
+    world.Actors = world.Actors.AppendTransient(linked.Actor)
+    world.Links, world.Random = linked.Links, spawn.Random
+    result.Combat.World, result.Handle, result.source, result.phase = world, handle, sourceHandle, missileInitialize
+    if info.SeeSound != 0 { result.Combat.Feedback.Sound, result.Combat.Feedback.SoundOrigin = info.SeeSound, handle }
+    return result
+}
+
+func BeginMonsterMissile(level wad.BspLevel, world CombatWorld, source int, destination int, kind int,
+    rules CombatRules) MissileLaunch {
+    if !world.Actors.ActorAt(destination - 1).Valid { return MissileLaunch{Combat: CombatStep{World: world, Failed: true}} }
+    result := allocateMissile(level, world, source, kind, rules)
+    result.destination = destination
+    return result
+}
+
+func BeginPlayerMissile(level wad.BspLevel, blocks wad.BlockMapInfo, world CombatWorld, source int, kind int,
+    rules CombatRules) MissileLaunch {
+    aim := AimPlayerAttack(level, blocks, world, source)
+    if !aim.Valid { return MissileLaunch{Combat: CombatStep{World: world, Failed: true}} }
+    world.AttackRange = playerAimDistance
+    result := allocateMissile(level, world, source, kind, rules)
+    result.Aim = aim
+    return result
+}
+
+func checkMissileLaunch(level wad.BspLevel, blocks wad.BlockMapInfo, result MissileLaunch,
+    rules CombatRules) MissileLaunch {
+    world := result.Combat.World
+    missile := world.Actors.ActorAt(result.Handle - 1)
+    info := actorinfo.KindAt(missile.Kind)
+    heading := result.Aim.Heading
+    speed := missileSpeed(missile.Kind, rules.Fast)
+    vertical := cport.C_FixedMul(speed, result.Aim.Slope)
+    if result.destination != 0 {
+        source := world.Actors.ActorAt(result.source - 1).Physics.Body
+        target := world.Actors.ActorAt(result.destination - 1).Physics.Body
+        heading = engine.PointToAngle(source.X, source.Y, target.X, target.Y)
+        if target.Flags & ActorShadow != 0 {
+            first := PRandom(world.Random)
+            second := PRandom(first.State)
+            world.Random = second.State
+            heading = heading + bits<32>((int(first.Value) - int(second.Value)) << 20)
+        }
+        travel := wad.ApproxDistance(target.X - source.X, target.Y - source.Y) / speed
+        if travel < 1 { travel = 1 }
+        vertical = (target.Z - source.Z) / travel
+    }
+    missile.Target, missile.Physics.Angle = result.source, heading
+    missile.Physics.MomentumX = cport.C_FixedMul(speed, engine.AngleCosine(heading))
+    missile.Physics.MomentumY = cport.C_FixedMul(speed, engine.AngleSine(heading))
+    missile.Physics.MomentumZ = vertical
+    roll := PRandom(world.Random)
+    world.Random = roll.State
+    missile.Tics = missile.Tics - int(roll.Value & 3)
+    if missile.Tics < 1 { missile.Tics = 1 }
+
+    // The startup check writes XYZ before trying to move. On failure the
+    // explosion starts there, but sector and BLOCKMAP links stay at spawn.
+    missile.Physics.Body.X = missile.Physics.Body.X + (missile.Physics.MomentumX >> 1)
+    missile.Physics.Body.Y = missile.Physics.Body.Y + (missile.Physics.MomentumY >> 1)
+    missile.Physics.Body.Z = missile.Physics.Body.Z + (missile.Physics.MomentumZ >> 1)
+    world.Actors = world.Actors.WithActor(result.Handle, missile)
+    move := TryMovingMobj(level, blocks, world, result.Handle, missile.Physics.Body.X, missile.Physics.Body.Y, rules)
+    result.Combat, result.Done = move.Combat, move.Allowed
+    result.phase = missileExplodeOnSpawn
+    return result
+}
+
+func ResumeMissileLaunch(level wad.BspLevel, blocks wad.BlockMapInfo, result MissileLaunch,
+    rules CombatRules) MissileLaunch {
+    if result.Done || result.Combat.Failed { return result }
+    if result.Combat.State.Action != 0 {
+        result.Combat = ResumeMobjCombat(level, result.Combat, rules)
+        return result
+    }
+    result.Combat.Feedback = CombatFeedback{}
+    switch result.phase {
+    case missileInitialize:
+        return checkMissileLaunch(level, blocks, result, rules)
+    case missileExplodeOnSpawn:
+        // P_CheckMissileSpawn explodes even on a sky boundary. The special
+        // sky removal rule applies to a later P_XYMovement instead.
+        result.Combat = ExplodeMissile(level, result.Combat.World, result.Handle, rules)
+        result.phase = missileFinishExplosion
+    default:
+        result.Done = true
+    }
+    return result
+}

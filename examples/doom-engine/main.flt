@@ -1,0 +1,33 @@
+package main
+
+import "engine"
+
+type Bands struct {
+    Rows bit
+}
+
+func (pattern Bands) Texel(index int) color {
+    if pattern.Rows {
+        if (index / 64 + index % 64) & 4 != 0 { return color.Purple }
+        return color.Blue
+    }
+    if index & 4 != 0 { return color.Orange }
+    return color.Yellow
+}
+
+map "Doom Engine Raster Sample" {
+    screen at (-12, -6) size (24, 12) with { style = "solid", hold = true }
+    register drew bit = false
+    tick {
+        if !drew {
+            for column := range 24 {
+                top := 1 + column / 8
+                engine.DrawColumn(Bands{}, column, top, 5, 5, engine.FracUnit, engine.FracUnit)
+            }
+            for row := range 6 {
+                engine.DrawSpan(Bands{Rows: true}, row + 6, 0, 23, 0, row * engine.FracUnit, engine.FracUnit, 0)
+            }
+            next drew = true
+        }
+    }
+}

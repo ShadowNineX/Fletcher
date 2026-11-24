@@ -1,0 +1,13 @@
+func identity<T>(value T) T {
+    return value
+}
+
+map "Fletcher Half Adder" {
+    input a bit
+    input b bit
+
+    output sum bit = identity(a ^ b)
+    circuit {
+        output carry bit = a & b
+    }
+}

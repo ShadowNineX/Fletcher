@@ -1,0 +1,449 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted from Linux Doom 1.10 p_inter.c at commit
+// a77dfb96cb91780ca334d0d4cfd86957558007e0. This is gameplay metadata only;
+// message and sound numbers are events, not text or audio assets.
+
+package play
+
+import "actorinfo"
+
+const AmmoClip = 0
+const AmmoShell = 1
+const AmmoCell = 2
+const AmmoMissile = 3
+const AmmoCount = 4
+const AmmoNone = 4
+
+const WeaponFist = 0
+const WeaponPistol = 1
+const WeaponShotgun = 2
+const WeaponChaingun = 3
+const WeaponMissile = 4
+const WeaponPlasma = 5
+const WeaponBfg = 6
+const WeaponChainsaw = 7
+const WeaponSuperShotgun = 8
+const WeaponCount = 9
+const WeaponNoChange = WeaponCount + 1
+
+const PowerInvulnerability = 0
+const PowerStrength = 1
+const PowerInvisibility = 2
+const PowerIronFeet = 3
+const PowerAllMap = 4
+const PowerInfrared = 5
+const PowerCount = 6
+
+const CardBlue = 0
+const CardYellow = 1
+const CardRed = 2
+const CardBlueSkull = 3
+const CardYellowSkull = 4
+const CardRedSkull = 5
+const CardCount = 6
+
+const PickupSoundNone = 0
+const PickupSoundItem = 32
+const PickupSoundWeapon = 33
+const PickupSoundPower = 93
+
+const PickupMessageNone = 0
+const PickupMessageArmor = 1
+const PickupMessageMega = 2
+const PickupMessageHealthBonus = 3
+const PickupMessageArmorBonus = 4
+const PickupMessageSoul = 5
+const PickupMessageMegaSphere = 6
+const PickupMessageBlueCard = 7
+const PickupMessageYellowCard = 8
+const PickupMessageRedCard = 9
+const PickupMessageBlueSkull = 10
+const PickupMessageYellowSkull = 11
+const PickupMessageRedSkull = 12
+const PickupMessageStim = 13
+const PickupMessageMedikit = 14
+const PickupMessageMedikitNeeded = 15
+const PickupMessageInvulnerability = 16
+const PickupMessageBerserk = 17
+const PickupMessageInvisibility = 18
+const PickupMessageSuit = 19
+const PickupMessageMap = 20
+const PickupMessageVisor = 21
+const PickupMessageClip = 22
+const PickupMessageClipBox = 23
+const PickupMessageRocket = 24
+const PickupMessageRocketBox = 25
+const PickupMessageCell = 26
+const PickupMessageCellBox = 27
+const PickupMessageShells = 28
+const PickupMessageShellBox = 29
+const PickupMessageBackpack = 30
+const PickupMessageBfg = 31
+const PickupMessageChaingun = 32
+const PickupMessageChainsaw = 33
+const PickupMessageLauncher = 34
+const PickupMessagePlasma = 35
+const PickupMessageShotgun = 36
+const PickupMessageSuperShotgun = 37
+
+const PickupDropped = 0x20000
+const PickupShadow = 0x40000
+const PickupBonus = 6
+const PickupMaxHealth = 100
+const PickupOverHealth = 200
+
+// Pinned info.h spritenum_t ordinals for P_TouchSpecialThing's cases.
+const SpriteArm1 = 55
+const SpriteArm2 = 56
+const SpriteBon1 = 60
+const SpriteBon2 = 61
+const SpriteSoul = 70
+const SpriteMega = 74
+const SpriteBKey = 62
+const SpriteYKey = 64
+const SpriteRKey = 63
+const SpriteBSku = 65
+const SpriteYSku = 67
+const SpriteRSku = 66
+const SpriteStim = 68
+const SpriteMedi = 69
+const SpritePinv = 71
+const SpritePstr = 72
+const SpritePins = 73
+const SpriteSuit = 75
+const SpritePmap = 76
+const SpritePvis = 77
+const SpriteClip = 78
+const SpriteAmmo = 79
+const SpriteRock = 80
+const SpriteBrok = 81
+const SpriteCell = 82
+const SpriteCelp = 83
+const SpriteShel = 84
+const SpriteSbox = 85
+const SpriteBpak = 86
+const SpriteBfug = 87
+const SpriteMgun = 88
+const SpriteCsaw = 89
+const SpriteLaun = 90
+const SpritePlas = 91
+const SpriteShot = 92
+const SpriteSgn2 = 93
+
+type PlayerInventory struct {
+    Health int
+    Cheats bits<32>
+    Attacker int
+    DamageCount int
+    KillCount int
+    SecretCount int
+    FixedColormap int
+    Frags [4]int
+    Dead bit
+    ItemCount int
+    BonusCount int
+    Armor int
+    ArmorType int
+    Ammo [AmmoCount]int
+    MaxAmmo [AmmoCount]int
+    Weapons [WeaponCount]bit
+    ReadyWeapon int
+    PendingWeapon int
+    Powers [PowerCount]int
+    Cards [CardCount]bit
+    Backpack bit
+}
+
+type PickupRules struct {
+    Skill int
+    Commercial bit
+}
+
+type InventoryGrant struct {
+    Inventory PlayerInventory
+    Given bit
+}
+
+type PickupResult struct {
+    Inventory PlayerInventory
+    Actor LevelActor
+    Removed bit
+    Sound int
+    Message int
+}
+
+func NewPlayerInventory(health int) PlayerInventory {
+    return PlayerInventory{Health: health, Ammo: [AmmoCount]int{50, 0, 0, 0}, MaxAmmo: [AmmoCount]int{200, 50, 300, 50},
+        Weapons: [WeaponCount]bit{true, true}, ReadyWeapon: WeaponPistol, PendingWeapon: WeaponPistol}
+}
+
+func weaponAmmo(weapon int) int {
+    info := actorinfo.WeaponAt(weapon)
+    if !info.Valid { return AmmoNone }
+    return info.Ammo
+}
+
+func GiveAmmo(inventory PlayerInventory, ammo int, clips int, skill int) InventoryGrant {
+    if ammo < 0 || ammo >= AmmoCount || inventory.Ammo[ammo] == inventory.MaxAmmo[ammo] { return InventoryGrant{Inventory: inventory} }
+    amount := clips * [AmmoCount]int{10, 4, 20, 1}[ammo]
+    if clips == 0 { amount = [AmmoCount]int{5, 2, 10, 0}[ammo] }
+    if skill == 0 || skill == 4 { amount = amount * 2 }
+    previous := inventory.Ammo[ammo]
+    inventory.Ammo[ammo] = inventory.Ammo[ammo] + amount
+    if inventory.Ammo[ammo] > inventory.MaxAmmo[ammo] { inventory.Ammo[ammo] = inventory.MaxAmmo[ammo] }
+    if previous == 0 {
+        switch ammo {
+        case AmmoClip:
+            if inventory.ReadyWeapon == WeaponFist { if inventory.Weapons[WeaponChaingun] { inventory.PendingWeapon = WeaponChaingun } else { inventory.PendingWeapon = WeaponPistol } }
+        case AmmoShell:
+            if (inventory.ReadyWeapon == WeaponFist || inventory.ReadyWeapon == WeaponPistol) && inventory.Weapons[WeaponShotgun] { inventory.PendingWeapon = WeaponShotgun }
+        case AmmoCell:
+            if (inventory.ReadyWeapon == WeaponFist || inventory.ReadyWeapon == WeaponPistol) && inventory.Weapons[WeaponPlasma] { inventory.PendingWeapon = WeaponPlasma }
+        case AmmoMissile:
+            if inventory.ReadyWeapon == WeaponFist && inventory.Weapons[WeaponMissile] { inventory.PendingWeapon = WeaponMissile }
+        }
+    }
+    return InventoryGrant{Inventory: inventory, Given: true}
+}
+
+func GiveWeapon(inventory PlayerInventory, weapon int, dropped bit, rules PickupRules) InventoryGrant {
+    if weapon < 0 || weapon >= WeaponCount { return InventoryGrant{Inventory: inventory} }
+    ammo := weaponAmmo(weapon)
+    granted := InventoryGrant{Inventory: inventory}
+    if ammo != AmmoNone {
+        clips := 2
+        if dropped { clips = 1 }
+        granted = GiveAmmo(inventory, ammo, clips, rules.Skill)
+        inventory = granted.Inventory
+    }
+    if !inventory.Weapons[weapon] {
+        inventory.Weapons[weapon], inventory.PendingWeapon = true, weapon
+        granted.Given = true
+    }
+    granted.Inventory = inventory
+    return granted
+}
+
+func GiveBody(inventory PlayerInventory, amount int) InventoryGrant {
+    if inventory.Health >= PickupMaxHealth { return InventoryGrant{Inventory: inventory} }
+    inventory.Health = inventory.Health + amount
+    if inventory.Health > PickupMaxHealth { inventory.Health = PickupMaxHealth }
+    return InventoryGrant{Inventory: inventory, Given: true}
+}
+
+func GiveArmor(inventory PlayerInventory, armorType int) InventoryGrant {
+    hits := armorType * 100
+    if inventory.Armor >= hits { return InventoryGrant{Inventory: inventory} }
+    inventory.ArmorType, inventory.Armor = armorType, hits
+    return InventoryGrant{Inventory: inventory, Given: true}
+}
+
+func GivePower(inventory PlayerInventory, power int) InventoryGrant {
+    if power < 0 || power >= PowerCount { return InventoryGrant{Inventory: inventory} }
+    switch power {
+    case PowerInvulnerability: inventory.Powers[power] = 30 * 35
+    case PowerInvisibility: inventory.Powers[power] = 60 * 35
+    case PowerInfrared: inventory.Powers[power] = 120 * 35
+    case PowerIronFeet: inventory.Powers[power] = 60 * 35
+    case PowerStrength:
+        inventory = GiveBody(inventory, 100).Inventory
+        inventory.Powers[power] = 1
+    default:
+        if inventory.Powers[power] != 0 { return InventoryGrant{Inventory: inventory} }
+        inventory.Powers[power] = 1
+    }
+    return InventoryGrant{Inventory: inventory, Given: true}
+}
+
+func giveCard(inventory PlayerInventory, card int) PlayerInventory {
+    if card >= 0 && card < CardCount && !inventory.Cards[card] {
+        inventory.BonusCount = PickupBonus
+        inventory.Cards[card] = true
+    }
+    return inventory
+}
+
+func touchResult(inventory PlayerInventory, toucher LevelActor, removed bit, sound int, message int, healthChanged bit) PickupResult {
+    if healthChanged { toucher.Health = inventory.Health }
+    return PickupResult{Inventory: inventory, Actor: toucher, Removed: removed, Sound: sound, Message: message}
+}
+
+// TouchPickup applies P_TouchSpecialThing to the campaign player's inventory.
+func TouchPickup(inventory PlayerInventory, special LevelActor, toucher LevelActor, rules PickupRules) PickupResult {
+    if !special.Valid || !toucher.Valid || !toucher.Physics.Body.Player || toucher.Health <= 0 {
+        return touchResult(inventory, toucher, false, PickupSoundNone, PickupMessageNone, false)
+    }
+    delta := special.Physics.Body.Z - toucher.Physics.Body.Z
+    if delta > toucher.Physics.Body.Height || delta < -8 * 65536 {
+        return touchResult(inventory, toucher, false, PickupSoundNone, PickupMessageNone, false)
+    }
+    sprite := special.Sprite
+    sound, message := PickupSoundItem, PickupMessageNone
+    var healthChanged bit
+    var granted InventoryGrant
+    var clips int
+    var dropped bit
+    switch sprite {
+    case SpriteArm1:
+        granted = GiveArmor(inventory, 1)
+        if !granted.Given { return touchResult(inventory, toucher, false, PickupSoundNone, PickupMessageNone, false) }
+        inventory, message = granted.Inventory, PickupMessageArmor
+    case SpriteArm2:
+        granted = GiveArmor(inventory, 2)
+        if !granted.Given { return touchResult(inventory, toucher, false, PickupSoundNone, PickupMessageNone, false) }
+        inventory, message = granted.Inventory, PickupMessageMega
+    case SpriteBon1:
+        previous := inventory.Health
+        inventory.Health = inventory.Health + 1
+        if inventory.Health > PickupOverHealth { inventory.Health = PickupOverHealth }
+        healthChanged, message = inventory.Health != previous, PickupMessageHealthBonus
+    case SpriteBon2:
+        inventory.Armor = inventory.Armor + 1
+        if inventory.Armor > PickupOverHealth { inventory.Armor = PickupOverHealth }
+        if inventory.ArmorType == 0 { inventory.ArmorType = 1 }
+        message = PickupMessageArmorBonus
+    case SpriteSoul:
+        previous := inventory.Health
+        inventory.Health = inventory.Health + 100
+        if inventory.Health > PickupOverHealth { inventory.Health = PickupOverHealth }
+        healthChanged, sound, message = inventory.Health != previous, PickupSoundPower, PickupMessageSoul
+    case SpriteMega:
+        if !rules.Commercial { return touchResult(inventory, toucher, false, PickupSoundNone, PickupMessageNone, false) }
+        healthChanged = inventory.Health != PickupOverHealth
+        inventory.Health = PickupOverHealth
+        inventory = GiveArmor(inventory, 2).Inventory
+        sound, message = PickupSoundPower, PickupMessageMegaSphere
+    case SpriteBKey:
+        if !inventory.Cards[CardBlue] { message = PickupMessageBlueCard }
+        inventory = giveCard(inventory, CardBlue)
+    case SpriteYKey:
+        if !inventory.Cards[CardYellow] { message = PickupMessageYellowCard }
+        inventory = giveCard(inventory, CardYellow)
+    case SpriteRKey:
+        if !inventory.Cards[CardRed] { message = PickupMessageRedCard }
+        inventory = giveCard(inventory, CardRed)
+    case SpriteBSku:
+        if !inventory.Cards[CardBlueSkull] { message = PickupMessageBlueSkull }
+        inventory = giveCard(inventory, CardBlueSkull)
+    case SpriteYSku:
+        if !inventory.Cards[CardYellowSkull] { message = PickupMessageYellowSkull }
+        inventory = giveCard(inventory, CardYellowSkull)
+    case SpriteRSku:
+        if !inventory.Cards[CardRedSkull] { message = PickupMessageRedSkull }
+        inventory = giveCard(inventory, CardRedSkull)
+    case SpriteStim:
+        granted = GiveBody(inventory, 10)
+        if !granted.Given { return touchResult(inventory, toucher, false, PickupSoundNone, PickupMessageNone, false) }
+        healthChanged, inventory, message = true, granted.Inventory, PickupMessageStim
+    case SpriteMedi:
+        granted = GiveBody(inventory, 25)
+        if !granted.Given { return touchResult(inventory, toucher, false, PickupSoundNone, PickupMessageNone, false) }
+        healthChanged, inventory = true, granted.Inventory
+        if inventory.Health < 25 { message = PickupMessageMedikitNeeded } else { message = PickupMessageMedikit }
+    case SpritePinv:
+        granted = GivePower(inventory, PowerInvulnerability)
+        inventory, sound, message = granted.Inventory, PickupSoundPower, PickupMessageInvulnerability
+    case SpritePstr:
+        previous := inventory.Health
+        inventory = GivePower(inventory, PowerStrength).Inventory
+        healthChanged = inventory.Health != previous
+        if inventory.ReadyWeapon != WeaponFist { inventory.PendingWeapon = WeaponFist }
+        sound, message = PickupSoundPower, PickupMessageBerserk
+    case SpritePins:
+        granted = GivePower(inventory, PowerInvisibility)
+        if !granted.Given { return touchResult(inventory, toucher, false, PickupSoundNone, PickupMessageNone, false) }
+        inventory = granted.Inventory
+        toucher.Physics.Body.Flags = toucher.Physics.Body.Flags | PickupShadow
+        sound, message = PickupSoundPower, PickupMessageInvisibility
+    case SpriteSuit:
+        granted = GivePower(inventory, PowerIronFeet)
+        if !granted.Given { return touchResult(inventory, toucher, false, PickupSoundNone, PickupMessageNone, false) }
+        inventory, sound, message = granted.Inventory, PickupSoundPower, PickupMessageSuit
+    case SpritePmap:
+        granted = GivePower(inventory, PowerAllMap)
+        if !granted.Given { return touchResult(inventory, toucher, false, PickupSoundNone, PickupMessageNone, false) }
+        inventory, sound, message = granted.Inventory, PickupSoundPower, PickupMessageMap
+    case SpritePvis:
+        granted = GivePower(inventory, PowerInfrared)
+        if !granted.Given { return touchResult(inventory, toucher, false, PickupSoundNone, PickupMessageNone, false) }
+        inventory, sound, message = granted.Inventory, PickupSoundPower, PickupMessageVisor
+    case SpriteClip:
+        clips = 1
+        if special.Physics.Body.Flags & PickupDropped != 0 { clips = 0 }
+        granted = GiveAmmo(inventory, AmmoClip, clips, rules.Skill)
+        if !granted.Given { return touchResult(inventory, toucher, false, PickupSoundNone, PickupMessageNone, false) }
+        inventory, message = granted.Inventory, PickupMessageClip
+    case SpriteAmmo:
+        granted = GiveAmmo(inventory, AmmoClip, 5, rules.Skill)
+        if !granted.Given { return touchResult(inventory, toucher, false, PickupSoundNone, PickupMessageNone, false) }
+        inventory, message = granted.Inventory, PickupMessageClipBox
+    case SpriteRock:
+        granted = GiveAmmo(inventory, AmmoMissile, 1, rules.Skill)
+        if !granted.Given { return touchResult(inventory, toucher, false, PickupSoundNone, PickupMessageNone, false) }
+        inventory, message = granted.Inventory, PickupMessageRocket
+    case SpriteBrok:
+        granted = GiveAmmo(inventory, AmmoMissile, 5, rules.Skill)
+        if !granted.Given { return touchResult(inventory, toucher, false, PickupSoundNone, PickupMessageNone, false) }
+        inventory, message = granted.Inventory, PickupMessageRocketBox
+    case SpriteCell:
+        granted = GiveAmmo(inventory, AmmoCell, 1, rules.Skill)
+        if !granted.Given { return touchResult(inventory, toucher, false, PickupSoundNone, PickupMessageNone, false) }
+        inventory, message = granted.Inventory, PickupMessageCell
+    case SpriteCelp:
+        granted = GiveAmmo(inventory, AmmoCell, 5, rules.Skill)
+        if !granted.Given { return touchResult(inventory, toucher, false, PickupSoundNone, PickupMessageNone, false) }
+        inventory, message = granted.Inventory, PickupMessageCellBox
+    case SpriteShel:
+        granted = GiveAmmo(inventory, AmmoShell, 1, rules.Skill)
+        if !granted.Given { return touchResult(inventory, toucher, false, PickupSoundNone, PickupMessageNone, false) }
+        inventory, message = granted.Inventory, PickupMessageShells
+    case SpriteSbox:
+        granted = GiveAmmo(inventory, AmmoShell, 5, rules.Skill)
+        if !granted.Given { return touchResult(inventory, toucher, false, PickupSoundNone, PickupMessageNone, false) }
+        inventory, message = granted.Inventory, PickupMessageShellBox
+    case SpriteBpak:
+        if !inventory.Backpack {
+            for i := range AmmoCount { inventory.MaxAmmo[i] = inventory.MaxAmmo[i] * 2 }
+            inventory.Backpack = true
+        }
+        for i := range AmmoCount { inventory = GiveAmmo(inventory, i, 1, rules.Skill).Inventory }
+        message = PickupMessageBackpack
+    case SpriteBfug:
+        granted = GiveWeapon(inventory, WeaponBfg, false, rules)
+        if !granted.Given { return touchResult(inventory, toucher, false, PickupSoundNone, PickupMessageNone, false) }
+        inventory, sound, message = granted.Inventory, PickupSoundWeapon, PickupMessageBfg
+    case SpriteMgun:
+        dropped = special.Physics.Body.Flags & PickupDropped != 0
+        granted = GiveWeapon(inventory, WeaponChaingun, dropped, rules)
+        if !granted.Given { return touchResult(inventory, toucher, false, PickupSoundNone, PickupMessageNone, false) }
+        inventory, sound, message = granted.Inventory, PickupSoundWeapon, PickupMessageChaingun
+    case SpriteCsaw:
+        granted = GiveWeapon(inventory, WeaponChainsaw, false, rules)
+        if !granted.Given { return touchResult(inventory, toucher, false, PickupSoundNone, PickupMessageNone, false) }
+        inventory, sound, message = granted.Inventory, PickupSoundWeapon, PickupMessageChainsaw
+    case SpriteLaun:
+        granted = GiveWeapon(inventory, WeaponMissile, false, rules)
+        if !granted.Given { return touchResult(inventory, toucher, false, PickupSoundNone, PickupMessageNone, false) }
+        inventory, sound, message = granted.Inventory, PickupSoundWeapon, PickupMessageLauncher
+    case SpritePlas:
+        granted = GiveWeapon(inventory, WeaponPlasma, false, rules)
+        if !granted.Given { return touchResult(inventory, toucher, false, PickupSoundNone, PickupMessageNone, false) }
+        inventory, sound, message = granted.Inventory, PickupSoundWeapon, PickupMessagePlasma
+    case SpriteShot:
+        dropped = special.Physics.Body.Flags & PickupDropped != 0
+        granted = GiveWeapon(inventory, WeaponShotgun, dropped, rules)
+        if !granted.Given { return touchResult(inventory, toucher, false, PickupSoundNone, PickupMessageNone, false) }
+        inventory, sound, message = granted.Inventory, PickupSoundWeapon, PickupMessageShotgun
+    case SpriteSgn2:
+        dropped = special.Physics.Body.Flags & PickupDropped != 0
+        granted = GiveWeapon(inventory, WeaponSuperShotgun, dropped, rules)
+        if !granted.Given { return touchResult(inventory, toucher, false, PickupSoundNone, PickupMessageNone, false) }
+        inventory, sound, message = granted.Inventory, PickupSoundWeapon, PickupMessageSuperShotgun
+    default:
+        return touchResult(inventory, toucher, false, PickupSoundNone, PickupMessageNone, false)
+    }
+    if special.Physics.Body.Flags & ActorCountItem != 0 { inventory.ItemCount = inventory.ItemCount + 1 }
+    inventory.BonusCount = inventory.BonusCount + PickupBonus
+    return touchResult(inventory, toucher, true, sound, message, healthChanged)
+}

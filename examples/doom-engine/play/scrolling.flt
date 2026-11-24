@@ -1,0 +1,61 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Vanilla linuxdoom-1.10 special 48: P_UpdateSpecials scrolls the first
+// sidedef texture offset by one FRACUNIT each tic.
+
+package play
+
+import "engine"
+import "wad"
+
+const ScrollSpecialFirstColumn = 48
+
+type LineScrolls struct {
+    Count int
+    Distance int
+    sideBase int
+    firstOffset int
+    lastOffset int
+    increments engine.PagedSlots<int>
+}
+
+// WithSide adds one scrolling linedef for an absolute SIDEDEFS byte offset.
+func (scrolls LineScrolls) WithSide(offset int) LineScrolls {
+    if offset < scrolls.sideBase { return scrolls }
+    relative := offset - scrolls.sideBase
+    if relative % wad.SideSize != 0 { return scrolls }
+    side := relative / wad.SideSize
+    scrolls.increments = scrolls.increments.With(side, scrolls.increments.At(side) + 1)
+    if scrolls.Count == 0 || offset < scrolls.firstOffset { scrolls.firstOffset = offset }
+    if scrolls.Count == 0 || offset > scrolls.lastOffset { scrolls.lastOffset = offset }
+    scrolls.Count = scrolls.Count + 1
+    return scrolls
+}
+
+// P_SpawnSpecials queues one entry per special linedef. Lines which share a
+// first sidedef each contribute one unit to that side on every game tic. The
+// increments are grouped by sidedef so drawing a wall needs only one lookup.
+func LoadLineScrolls(level wad.BspLevel) LineScrolls {
+    if !level.Valid { return LineScrolls{} }
+    scrolls := LineScrolls{sideBase: level.Sides.Offset}
+    for index := range level.Lines.Count {
+        line := level.Lines.Offset + index * wad.LineSize
+        if wad.U16(level.File, line + 6) == ScrollSpecialFirstColumn {
+            offset := level.LineFrontSide(index)
+            if offset >= 0 { scrolls = scrolls.WithSide(offset) }
+        }
+    }
+    return scrolls
+}
+
+func (scrolls LineScrolls) Advance() LineScrolls {
+    if scrolls.Count > 0 { scrolls.Distance = scrolls.Distance + engine.FracUnit }
+    return scrolls
+}
+
+func (scrolls LineScrolls) OffsetForSide(sideOffset int) int {
+    if scrolls.Distance == 0 || sideOffset < scrolls.firstOffset || sideOffset > scrolls.lastOffset { return 0 }
+    relative := sideOffset - scrolls.sideBase
+    if relative % wad.SideSize != 0 { return 0 }
+    return scrolls.increments.At(relative / wad.SideSize) * scrolls.Distance
+}

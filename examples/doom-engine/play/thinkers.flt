@@ -1,0 +1,162 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted on 2026-11-21 from P_InitThinkers, P_AddThinker, P_RemoveThinker,
+// and P_RunThinkers in linuxdoom-1.10/p_tick.c.
+
+package play
+
+const MaxThinkers = 64
+const NoThinker = -1
+
+type ThinkerSlot struct {
+    Active bit
+    Removed bit
+    Next int
+    Previous int
+    Payload int
+}
+
+// Handles are slot indices. They stay stable while active and a removed slot
+// returns to the bounded allocator after its lazy-unlink turn.
+type ThinkerState struct {
+    Slots [MaxThinkers]ThinkerSlot
+    Head int
+    Tail int
+    Count int
+    Failed bit
+    // A bounded deterministic run trace supports demo and scheduler checks.
+    RunOrder [MaxThinkers]int
+    RunCount int
+}
+
+type ThinkerAdd struct {
+    State ThinkerState
+    Handle int
+}
+
+// A callback may update its own payload, lazily remove any live handle, and
+// append one tail thinker. More additions can use AddThinker outside a run.
+type ThinkerAction struct {
+    Update bit
+    Payload int
+    Remove bit
+    RemoveHandle int
+    Append bit
+    AppendPayload int
+}
+
+type ThinkerSink interface {
+    Think(handle int, payload int) ThinkerAction
+}
+
+func InitThinkers() ThinkerState {
+    return ThinkerState{Head: NoThinker, Tail: NoThinker}
+}
+
+func validHandle(state ThinkerState, handle int) bit {
+    return handle >= 0 && handle < MaxThinkers && state.Slots[handle].Active
+}
+
+func firstFreeThinker(state ThinkerState) int {
+    for index := range MaxThinkers {
+        if !state.Slots[index].Active { return index }
+    }
+    return NoThinker
+}
+
+func AddThinker(state ThinkerState, payload int) ThinkerAdd {
+    if state.Failed { return ThinkerAdd{State: state, Handle: NoThinker} }
+    handle := firstFreeThinker(state)
+    if handle == NoThinker {
+        state.Failed = true
+        return ThinkerAdd{State: state, Handle: NoThinker}
+    }
+    state.Slots[handle] = ThinkerSlot{Active: true, Next: NoThinker, Previous: state.Tail, Payload: payload}
+    if state.Tail == NoThinker {
+        state.Head = handle
+    } else {
+        state.Slots[state.Tail].Next = handle
+    }
+    state.Tail = handle
+    state.Count = state.Count + 1
+    return ThinkerAdd{State: state, Handle: handle}
+}
+
+// P_RemoveThinker marks its function sentinel. Unlinking happens only when
+// RunThinkers reaches that handle on a later turn.
+func RemoveThinker(state ThinkerState, handle int) ThinkerState {
+    if !validHandle(state, handle) {
+        state.Failed = true
+        return state
+    }
+    state.Slots[handle].Removed = true
+    return state
+}
+
+func unlinkThinker(state ThinkerState, handle int) ThinkerState {
+    slot := state.Slots[handle]
+    if slot.Previous == NoThinker {
+        state.Head = slot.Next
+    } else {
+        state.Slots[slot.Previous].Next = slot.Next
+    }
+    if slot.Next == NoThinker {
+        state.Tail = slot.Previous
+    } else {
+        state.Slots[slot.Next].Previous = slot.Previous
+    }
+    state.Slots[handle] = ThinkerSlot{}
+    state.Count = state.Count - 1
+    return state
+}
+
+func applyThinkerAction(state ThinkerState, handle int, action ThinkerAction) ThinkerState {
+    if action.Update && validHandle(state, handle) {
+        state.Slots[handle].Payload = action.Payload
+    }
+    if action.Remove {
+        state = RemoveThinker(state, action.RemoveHandle)
+    }
+    if action.Append {
+        added := AddThinker(state, action.AppendPayload)
+        state = added.State
+    }
+    return state
+}
+
+// Tail additions remain reachable from the current tail, exactly as the
+// original linked-list walk observes an appended thinker in the same run.
+func RunThinkers<T extends ThinkerSink>(state ThinkerState, sink T) ThinkerState {
+    if state.Failed { return state }
+    state.RunCount = 0
+    current := state.Head
+    // A run visits at most the initial slots and one addition per callback.
+    // Invoked thinkers remain linked until the next run, so at most
+    // MaxThinkers callbacks can execute even when slots are freed here.
+    for range MaxThinkers * 2 {
+        if current == NoThinker { return state }
+        if !validHandle(state, current) {
+            state.Failed = true
+            return state
+        }
+        if state.Slots[current].Removed {
+            successor := state.Slots[current].Next
+            state = unlinkThinker(state, current)
+            current = successor
+        } else {
+            state.RunOrder[state.RunCount] = current
+            state.RunCount = state.RunCount + 1
+            action := sink.Think(current, state.Slots[current].Payload)
+            state = applyThinkerAction(state, current, action)
+            if state.Failed { return state }
+            if !validHandle(state, current) {
+                state.Failed = true
+                return state
+            }
+            // Read Next after the callback so a tail append is visited now.
+            current = state.Slots[current].Next
+        }
+    }
+    if current != NoThinker { state.Failed = true }
+    return state
+}

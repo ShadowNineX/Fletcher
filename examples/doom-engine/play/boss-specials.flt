@@ -1,0 +1,87 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Level actions from A_BossDeath, A_KeenDie and A_BrainDie in p_enemy.c.
+
+package play
+
+import "actorinfo"
+import "wad"
+
+const BrainTargetLimit = 32
+
+// Kept in play so line and plane actions can carry the live campaign brain.
+type BrainState struct {
+    Targets [BrainTargetLimit]int
+    Count int
+    Cursor int
+    EasyTurn bit
+}
+
+type BossSpecialStep struct {
+    State LevelSpecials
+    World CombatWorld
+}
+
+func commercialBossMap(name wad.LumpName) bit { return name.Low & 0xffffff == 0x50414d }
+
+func BossMapNumber(name wad.LumpName) int {
+    digit := int((name.Low >> 24) & 255) - 48
+    if commercialBossMap(name) { return digit * 10 + int(name.High & 255) - 48 }
+    return digit
+}
+
+func sameLiveKind(actors MapActors, handle int, kind int) bit {
+    for index := range actors.Count {
+        actor := actors.ActorAt(index)
+        if index + 1 != handle && actor.Valid && actor.Kind == kind && actor.Health > 0 { return true }
+    }
+    return false
+}
+
+func bossPlayerAlive(world CombatWorld) bit {
+    for slot := range wad.VanillaPlayers {
+        if world.Actors.PlayerActors[slot] != 0 && world.Players[slot].Health > 0 { return true }
+    }
+    return false
+}
+
+func bossGate(commercial bit, episode int, number int, kind int) bit {
+    if commercial { return number == 7 && (kind == actorinfo.ActorMancubus || kind == actorinfo.ActorArachnotron) }
+    switch episode {
+    case 1: return number == 8 && kind == actorinfo.ActorBruiser
+    case 2: return number == 8 && kind == actorinfo.ActorCyborg
+    case 3: return number == 8 && kind == actorinfo.ActorSpider
+    case 4: return (number == 6 && kind == actorinfo.ActorCyborg) || (number == 8 && kind == actorinfo.ActorSpider)
+    default: return number == 8
+    }
+}
+
+func ApplyBossSpecial(level wad.BspLevel, state LevelSpecials, world CombatWorld, handle int, action int) BossSpecialStep {
+    actor := world.Actors.ActorAt(handle - 1)
+    if !actor.Valid { return BossSpecialStep{State: state, World: world} }
+    state = state.WithActorOrder(world.Actors)
+    switch action {
+    case actorinfo.ActionKeenDie:
+        actor.Physics.Body.Flags = actor.Physics.Body.Flags & ~bits<32>(ActorSolid)
+        world.Actors = world.Actors.WithActor(handle, actor)
+        if !sameLiveKind(world.Actors, handle, actor.Kind) {
+            state.Doors = startTaggedDoors(level, state.Doors, state.Floors, state.Ceilings, 666, DoorOpen).Doors
+        }
+    case actorinfo.ActionBrainDie:
+        state.ExitRequested, state.SecretExit = true, false
+    case actorinfo.ActionBossDeath:
+        commercial, number := commercialBossMap(level.MapName), BossMapNumber(level.MapName)
+        episode := int((level.MapName.Low >> 8) & 255) - 48
+        if bossGate(commercial, episode, number, actor.Kind) && bossPlayerAlive(world) && !sameLiveKind(world.Actors, handle, actor.Kind) {
+            if commercial && actor.Kind == actorinfo.ActorArachnotron {
+                state = startTaggedFloors(level, state, wad.CollisionLine{Tag: 667}, FloorRaiseTexture).State
+            } else if commercial || episode == 1 || (episode == 4 && number == 8) {
+                state = startTaggedFloors(level, state, wad.CollisionLine{Tag: 666}, FloorLowerLowest).State
+            } else if episode == 4 && number == 6 {
+                state.Doors = startTaggedDoors(level, state.Doors, state.Floors, state.Ceilings, 666, DoorBlazeOpen).Doors
+            } else { state.ExitRequested, state.SecretExit = true, false }
+        }
+    }
+    world.Actors = world.Actors.WithSectorOrder(state)
+    return BossSpecialStep{State: state, World: world}
+}

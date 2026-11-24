@@ -1,0 +1,31 @@
+type Stepper interface {
+    Apply(value bits<4>) bits<4>
+}
+
+type Increment struct {
+    amount bits<4>
+}
+
+func (step Increment) Apply(value bits<4>) bits<4> {
+    return value + step.amount
+}
+
+func apply<T extends Stepper>(step T, value bits<4>) bits<4> {
+    return step.Apply(value)
+}
+
+map "Fletcher Counter" {
+    input run bit
+    register count bits<4> = 0
+
+    tick {
+        if run {
+            var step Stepper = Increment{amount: 1}
+            next count = apply(step, count)
+        }
+    }
+
+    script {
+        output lamps bits<4> = count
+    }
+}

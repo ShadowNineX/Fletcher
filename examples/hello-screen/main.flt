@@ -1,0 +1,30 @@
+package main
+
+import "bitmap"
+
+map "Fletcher Hello Screen" {
+    screen at (-22, -3) size (45, 7) with { style = "solid", color = "green" }
+    input animate bit at (-25, 0)
+
+    tick {
+        if animate {
+            phase := currentTick() % 84
+            x := phase
+            if x > 42 {
+                x = 84 - x
+            }
+            ink := color.Blue
+            if (phase / 4) % 2 == 1 {
+                ink = color.Yellow
+            }
+            pixel(x + 1, 2, true, ink)
+            for dx := range 3 {
+                pixel(x + dx, 3, true, ink)
+            }
+            pixel(x + 1, 3, true, color.White)
+            pixel(x + 1, 4, true, ink)
+        } else {
+            bitmap.DrawText(1, 1, "HELLO WORLD")
+        }
+    }
+}

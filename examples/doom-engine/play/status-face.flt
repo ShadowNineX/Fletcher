@@ -1,0 +1,158 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted from Linux Doom 1.10 st_stuff.c at commit
+// a77dfb96cb91780ca334d0d4cfd86957558007e0. Face indices select WAD patches.
+
+package play
+
+const StatusPainFaces = 5
+const StatusStraightFaces = 3
+const StatusTurnFaces = 2
+const StatusFaceStride = StatusStraightFaces + StatusTurnFaces + 3
+const StatusTurnOffset = StatusStraightFaces
+const StatusOuchOffset = StatusTurnOffset + StatusTurnFaces
+const StatusEvilGrinOffset = StatusOuchOffset + 1
+const StatusRampageOffset = StatusEvilGrinOffset + 1
+const StatusGodFace = StatusPainFaces * StatusFaceStride
+const StatusDeadFace = StatusGodFace + 1
+const StatusEvilGrinCount = 70
+const StatusStraightFaceCount = 17
+const StatusTurnCount = 35
+const StatusRampageDelay = 70
+const StatusMuchPain = 20
+const StatusAngle45 bits<32> = 0x20000000
+const StatusAngle180 bits<32> = 0x80000000
+
+// StatusFace holds the original status-bar globals and function-local state.
+// StartStatusFace deliberately keeps the fields which st_stuff.c keeps static
+// across ST_Start: face count, pain cache, firing delay, and priority.
+type StatusFace struct {
+    Index int
+    Count int
+    Priority int
+    OldHealth int
+    PainHealth int
+    PainOffset int
+    LastAttackDown int
+    Weapons [WeaponCount]bit
+    Started bit
+}
+
+func StartStatusFace(previous StatusFace, inventory PlayerInventory) StatusFace {
+    face := previous
+    if !face.Started { face.LastAttackDown = -1 }
+    face.Index = 0
+    face.OldHealth = -1
+    face.Weapons = inventory.Weapons
+    face.Started = true
+    return face
+}
+
+func statusPainOffset(face StatusFace, health int) StatusFace {
+    current := health
+    if current > 100 { current = 100 }
+    if current != face.PainHealth {
+        face.PainHealth = current
+        face.PainOffset = StatusFaceStride * ((100 - current) * StatusPainFaces / 101)
+    }
+    return face
+}
+
+// TickStatusFace is ST_updateFaceWidget plus ST_Ticker's st_oldhealth update.
+// attackerAngle is the already-resolved R_PointToAngle2 result.  bits<32>
+// arithmetic intentionally preserves Doom's unsigned-turn wrap behavior.
+func TickStatusFace(face StatusFace, inventory PlayerInventory, angle bits<32>, attackerAngle bits<32>, otherAttacker bit, attackHeld bit, randomValue int) StatusFace {
+    face = statusPainOffset(face, inventory.Health)
+    pain := face.PainOffset
+
+    if face.Priority < 10 {
+        if inventory.Health == 0 {
+            face.Priority = 9
+            face.Index = StatusDeadFace
+            face.Count = 1
+        }
+    }
+
+    if face.Priority < 9 {
+        if inventory.BonusCount != 0 {
+            grin := false
+            for index := range WeaponCount {
+                if face.Weapons[index] != inventory.Weapons[index] { grin = true }
+            }
+            if grin {
+                face.Weapons = inventory.Weapons
+                face.Priority = 8
+                face.Count = StatusEvilGrinCount
+                face.Index = pain + StatusEvilGrinOffset
+            }
+        }
+    }
+
+    if face.Priority < 8 {
+        if inventory.DamageCount != 0 && otherAttacker {
+            face.Priority = 7
+            if inventory.Health - face.OldHealth > StatusMuchPain {
+                face.Count = StatusTurnCount
+                face.Index = pain + StatusOuchOffset
+            } else {
+                diff := bits<32>(0)
+                turnRight := false
+                if attackerAngle > angle {
+                    diff = attackerAngle - angle
+                    turnRight = diff > StatusAngle180
+                } else {
+                    diff = angle - attackerAngle
+                    turnRight = diff <= StatusAngle180
+                }
+                face.Count = StatusTurnCount
+                face.Index = pain
+                if diff < StatusAngle45 { face.Index = face.Index + StatusRampageOffset } else if turnRight { face.Index = face.Index + StatusTurnOffset } else { face.Index = face.Index + StatusTurnOffset + 1 }
+            }
+        }
+    }
+
+    if face.Priority < 7 {
+        if inventory.DamageCount != 0 {
+            if inventory.Health - face.OldHealth > StatusMuchPain {
+                face.Priority = 7
+                face.Count = StatusTurnCount
+                face.Index = pain + StatusOuchOffset
+            } else {
+                face.Priority = 6
+                face.Count = StatusTurnCount
+                face.Index = pain + StatusRampageOffset
+            }
+        }
+    }
+
+    if face.Priority < 6 {
+        if attackHeld {
+            if face.LastAttackDown == -1 { face.LastAttackDown = StatusRampageDelay } else {
+                face.LastAttackDown = face.LastAttackDown - 1
+                if face.LastAttackDown == 0 {
+                    face.Priority = 5
+                    face.Index = pain + StatusRampageOffset
+                    face.Count = 1
+                    face.LastAttackDown = 1
+                }
+            }
+        } else { face.LastAttackDown = -1 }
+    }
+
+    if face.Priority < 5 {
+        if inventory.Cheats & CheatGodMode != 0 || inventory.Powers[PowerInvulnerability] != 0 {
+            face.Priority = 4
+            face.Index = StatusGodFace
+            face.Count = 1
+        }
+    }
+
+    if face.Count == 0 {
+        face.Index = pain + randomValue % 3
+        face.Count = StatusStraightFaceCount
+        face.Priority = 0
+    }
+    face.Count = face.Count - 1
+    face.OldHealth = inventory.Health
+    return face
+}

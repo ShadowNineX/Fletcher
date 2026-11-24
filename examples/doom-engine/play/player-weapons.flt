@@ -1,0 +1,109 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Connect the Doom weapon overlay to the live actor and combat world.
+
+package play
+
+import "wad"
+
+// Number-key requests are resolved by P_PlayerThink in linuxdoom-1.10/p_user.c.
+func SelectPlayerWeapon(inventory PlayerInventory, requested int, commercial bit, shareware bit) PlayerInventory {
+    if requested < 0 || requested >= WeaponCount - 1 { return inventory }
+    if requested == WeaponFist && inventory.Weapons[WeaponChainsaw] &&
+        !(inventory.ReadyWeapon == WeaponChainsaw && inventory.Powers[PowerStrength] != 0) {
+        requested = WeaponChainsaw
+    }
+    if commercial && requested == WeaponShotgun && inventory.Weapons[WeaponSuperShotgun] &&
+        inventory.ReadyWeapon != WeaponSuperShotgun {
+        requested = WeaponSuperShotgun
+    }
+    if inventory.Weapons[requested] && requested != inventory.ReadyWeapon &&
+        (!shareware || (requested != WeaponPlasma && requested != WeaponBfg)) {
+        inventory.PendingWeapon = requested
+    }
+    return inventory
+}
+
+// Apply a shot special to the level and resolve combat callbacks before
+// resuming. A weapon drop from combat can update View while the shot runs.
+// Noise marks the point at which Doom alerts the sector.
+type PlayerWeaponTick struct {
+    Combat CombatStep
+    View WeaponView
+    SpecialLine int
+    Noise bit
+    Done bit
+    source int
+    slot int
+    signal int
+    attacking bit
+    weapon WeaponStep
+    attack WeaponAttackStep
+}
+
+func beginWeaponSignals(step PlayerWeaponTick, weapon WeaponStep) PlayerWeaponTick {
+    step.weapon, step.signal, step.View = weapon, 0, weapon.View
+    step.Combat.World.Players[step.slot], step.Combat.World.Random = weapon.Inventory, weapon.Random
+    step.Combat.Failed = weapon.Failed
+    return step
+}
+
+func publishPlayerWeaponAttack(step PlayerWeaponTick, attack WeaponAttackStep) PlayerWeaponTick {
+    step.attack, step.Combat, step.SpecialLine = attack, attack.Combat, attack.SpecialLine
+    return step
+}
+
+func BeginPlayerWeaponTick(level wad.BspLevel, blocks wad.BlockMapInfo, world CombatWorld, source int,
+    view WeaponView, command WeaponInput, rules CombatRules) PlayerWeaponTick {
+    actor := world.Actors.ActorAt(source - 1)
+    slot := combatPlayer(actor)
+    step := PlayerWeaponTick{Combat: CombatStep{World: world, Failed: slot < 0}, source: source,
+        slot: slot, View: view, SpecialLine: -1}
+    if step.Combat.Failed { return step }
+    weapon := BeginWeaponTick(world.Players[slot], view, actor.State, world.Random, command)
+    return ResumePlayerWeaponTick(level, blocks, beginWeaponSignals(step, weapon), rules)
+}
+
+func ResumePlayerWeaponTick(level wad.BspLevel, blocks wad.BlockMapInfo, step PlayerWeaponTick,
+    rules CombatRules) PlayerWeaponTick {
+    if step.Done || step.Combat.Failed { return step }
+    step.Combat.Feedback, step.SpecialLine, step.Noise = CombatFeedback{}, -1, false
+    if step.attacking {
+        if !step.attack.Done {
+            step.attack.Combat = step.Combat
+            return publishPlayerWeaponAttack(step, ResumeWeaponAttack(level, blocks, step.attack, rules))
+        }
+        world := step.Combat.World
+        weapon := step.weapon
+        weapon.View = step.View
+        weapon.ActorState = world.Actors.ActorAt(step.source - 1).State
+        weapon.Inventory, weapon.Random = world.Players[step.slot], world.Random
+        step = beginWeaponSignals(step, ResumeWeaponAction(weapon))
+        step.attacking = false
+        if step.Combat.Failed { return step }
+    }
+    for range step.weapon.SignalCount - step.signal {
+        signal := step.weapon.Signals[step.signal]
+        step.signal = step.signal + 1
+        switch signal.Kind {
+        case WeaponSignalSound:
+            step.Combat.Feedback.Sound, step.Combat.Feedback.SoundOrigin = signal.Value, step.source
+            return step
+        case WeaponSignalActorState:
+            actor := step.Combat.World.Actors.ActorAt(step.source - 1)
+            changed := SetMobjState(actor, signal.Value)
+            if changed.Failed || changed.Removed || changed.Action != 0 { step.Combat.Failed = true; return step }
+            step.Combat.World.Actors = step.Combat.World.Actors.WithActor(step.source, changed.Actor)
+        case WeaponSignalNoise:
+            step.Noise = true
+            return step
+        }
+    }
+    if step.weapon.Action != 0 {
+        step.attacking = true
+        attack := BeginWeaponAttack(level, blocks, step.Combat.World, step.source, step.weapon.Action, step.View.Refire, rules)
+        return publishPlayerWeaponAttack(step, attack)
+    }
+    step.Done = true
+    return step
+}

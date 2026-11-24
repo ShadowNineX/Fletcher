@@ -1,0 +1,177 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Terrain handling from linuxdoom-1.10/p_map.c and p_maputl.c.
+
+package play
+
+import "engine"
+import "wad"
+
+const MoveDropoff = 0x400
+const MoveNoClip = 0x1000
+const MoveFloat = 0x4000
+const MoveTeleport = 0x8000
+const MoveMissile = 0x10000
+const lineBlocking = 1
+const lineBlockMonsters = 2
+const stepHeight = 24 * engine.FracUnit
+
+type MapActor struct {
+    X int
+    Y int
+    Z int
+    Floor int
+    Ceiling int
+    Radius int
+    Height int
+    Flags bits<32>
+    Player bit
+}
+
+type MapPositionCheck struct {
+    Valid bit
+    Clear bit
+    Floor int
+    Ceiling int
+    Dropoff int
+    CeilingLine int
+    SpecialCount int
+    Specials PagedSlots<int>
+    specialSeen PagedSlots<bits<32>>
+}
+
+type SpecialCrossing struct {
+    Line int
+    OldSide int
+}
+
+type MapMove struct {
+    Allowed bit
+    FloatOK bit
+    Actor MapActor
+    Position MapPositionCheck
+    CrossingCount int
+    Crossings PagedSlots<SpecialCrossing>
+}
+
+func checkMapLine(level wad.BspLevel, check MapPositionCheck, bounds engine.Box, flags bits<32>, player bit, index int) MapPositionCheck {
+    line := level.LineAt(index)
+    if !line.Valid {
+        check.Valid, check.Clear = false, false
+        return check
+    }
+    if bounds.Right <= line.Bounds.Left || bounds.Left >= line.Bounds.Right ||
+        bounds.Top <= line.Bounds.Bottom || bounds.Bottom >= line.Bounds.Top ||
+        wad.BoxOnCollisionLineSide(line, bounds) != -1 { return check }
+
+    if line.BackSector < 0 || (flags & MoveMissile == 0 &&
+        (line.Flags & lineBlocking != 0 || (!player && line.Flags & lineBlockMonsters != 0))) {
+        check.Clear = false
+        return check
+    }
+
+    opening := wad.LineOpening(level, line)
+    if opening.OpenTop < check.Ceiling { check.Ceiling, check.CeilingLine = opening.OpenTop, index }
+    if opening.OpenBottom > check.Floor { check.Floor = opening.OpenBottom }
+    if opening.LowFloor < check.Dropoff { check.Dropoff = opening.LowFloor }
+
+    if line.Action != 0 {
+        // Repeated entries cannot change the accumulated heights. Keep only
+        // the first visit to each special, in BLOCKMAP encounter order.
+        word, mask := index >> 5, bits<32>(1) << (index & 31)
+        seen := check.specialSeen.At(word)
+        if seen & mask != 0 { return check }
+        check.specialSeen = check.specialSeen.With(word, seen | mask)
+        check.Specials = check.Specials.With(check.SpecialCount, index)
+        check.SpecialCount = check.SpecialCount + 1
+    }
+    return check
+}
+
+func checkMapCell(level wad.BspLevel, blockMap wad.BlockMapInfo, check MapPositionCheck, bounds engine.Box, actor MapActor, cell wad.BlockCell) MapPositionCheck {
+    start := wad.BlockLineListStart(level, blockMap, cell)
+    if start >= 0 {
+        for entry := range (level.BlockMap.Count - start) / 2 {
+            line := wad.BlockLineAt(level, blockMap, start, entry)
+            if line < 0 { return check }
+            check = checkMapLine(level, check, bounds, actor.Flags, actor.Player, line)
+            if !check.Clear { return check }
+        }
+    }
+    // The list must start inside the lump and end with its own terminator.
+    check.Valid, check.Clear = false, false
+    return check
+}
+
+func BeginMapPositionCheck(level wad.BspLevel, blockMap wad.BlockMapInfo, actor MapActor, x int, y int) MapPositionCheck {
+    var check MapPositionCheck
+    check.CeilingLine = -1
+    if actor.Radius < 0 || actor.Height < 0 { return check }
+    sector := level.SectorAtPoint(x, y)
+    if !sector.Valid { return check }
+    check.Floor, check.Dropoff, check.Ceiling = sector.Heights.Floor, sector.Heights.Floor, sector.Heights.Ceiling
+    check.Valid = blockMap.Valid || actor.Flags & MoveNoClip != 0
+    check.Clear = check.Valid
+    return check
+}
+
+func FinishMapPositionCheck(level wad.BspLevel, blockMap wad.BlockMapInfo, actor MapActor, x int, y int,
+    check MapPositionCheck) MapPositionCheck {
+    if !check.Clear || actor.Flags & MoveNoClip != 0 { return check }
+    bounds := engine.Box{Left: x - actor.Radius, Right: x + actor.Radius, Bottom: y - actor.Radius, Top: y + actor.Radius}
+    left, right := (bounds.Left - blockMap.OriginX) >> wad.MapBlockShift, (bounds.Right - blockMap.OriginX) >> wad.MapBlockShift
+    bottom, top := (bounds.Bottom - blockMap.OriginY) >> wad.MapBlockShift, (bounds.Top - blockMap.OriginY) >> wad.MapBlockShift
+    if left < 0 { left = 0 }
+    if bottom < 0 { bottom = 0 }
+    if right >= blockMap.Width { right = blockMap.Width - 1 }
+    if top >= blockMap.Height { top = blockMap.Height - 1 }
+
+    if left > right || bottom > top { return check }
+    for column := range right - left + 1 {
+        for row := range top - bottom + 1 {
+            cell := wad.BlockCell{Valid: true, X: left + column, Y: bottom + row}
+            check = checkMapCell(level, blockMap, check, bounds, actor, cell)
+            if !check.Clear { return check }
+        }
+    }
+    return check
+}
+
+// Terrain-only entry point for callers with no actor roster.
+func CheckMapPosition(level wad.BspLevel, blockMap wad.BlockMapInfo, actor MapActor, x int, y int) MapPositionCheck {
+    return FinishMapPositionCheck(level, blockMap, actor, x, y, BeginMapPositionCheck(level, blockMap, actor, x, y))
+}
+
+// TryMapMove returns the accepted position and crossings in dispatch order.
+// Linking actors and applying line actions belong to the gameplay tick.
+func TryMapMove(level wad.BspLevel, blockMap wad.BlockMapInfo, actor MapActor, x int, y int) MapMove {
+    return finishTryMapMove(level, actor, x, y, CheckMapPosition(level, blockMap, actor, x, y))
+}
+
+func finishTryMapMove(level wad.BspLevel, actor MapActor, x int, y int, position MapPositionCheck) MapMove {
+    move := MapMove{Actor: actor, Position: position}
+    if !position.Clear { return move }
+    if actor.Flags & MoveNoClip == 0 {
+        if position.Ceiling - position.Floor < actor.Height { return move }
+        move.FloatOK = true
+        if actor.Flags & MoveTeleport == 0 &&
+            (position.Ceiling - actor.Z < actor.Height || position.Floor - actor.Z > stepHeight) { return move }
+        if actor.Flags & (MoveDropoff | MoveFloat) == 0 && position.Floor - position.Dropoff > stepHeight { return move }
+    }
+
+    move.Allowed = true
+    move.Actor.X, move.Actor.Y = x, y
+    move.Actor.Floor, move.Actor.Ceiling = position.Floor, position.Ceiling
+    if actor.Flags & (MoveTeleport | MoveNoClip) != 0 { return move }
+
+    for i := range position.SpecialCount {
+        index := position.Specials.At(position.SpecialCount - i - 1)
+        line := level.LineAt(index)
+        old := wad.PointOnCollisionLineSide(line, actor.X, actor.Y)
+        if old != wad.PointOnCollisionLineSide(line, x, y) {
+            move.Crossings = move.Crossings.With(move.CrossingCount, SpecialCrossing{Line: index, OldSide: old})
+            move.CrossingCount = move.CrossingCount + 1
+        }
+    }
+    return move
+}

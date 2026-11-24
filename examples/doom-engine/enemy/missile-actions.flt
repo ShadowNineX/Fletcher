@@ -1,0 +1,144 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// A_SkelMissile, A_Tracer and A_FatAttack1/2/3 from linuxdoom-1.10/p_enemy.c.
+
+package enemy
+
+import "actorinfo"
+import "engine"
+import "numeric"
+import "play"
+import "wad"
+
+const revenantLaunchLift = 16 * engine.FracUnit
+const mancubusSpread bits<32> = 0x08000000
+const tracerTurn bits<32> = 0x0c000000
+const tracerHalfTurn bits<32> = 0x80000000
+
+func setMissileHeading(actor play.LevelActor, angle bits<32>) play.LevelActor {
+    speed := actorinfo.KindAt(actor.Kind).Speed
+    actor.Physics.Angle = angle
+    actor.Physics.MomentumX = cport.C_FixedMul(speed, engine.AngleCosine(angle))
+    actor.Physics.MomentumY = cport.C_FixedMul(speed, engine.AngleSine(angle))
+    return actor
+}
+
+func beginSpecialMonsterLaunch(level wad.BspLevel, step MonsterAttack, action int, rules play.CombatRules) MonsterAttack {
+    world := FaceTarget(step.Combat.World, step.handle)
+    actor := world.Actors.ActorAt(step.handle - 1)
+    kind := actorinfo.ActorFatShot
+    switch action {
+    case actorinfo.ActionSkelMissile:
+        kind = actorinfo.ActorTracer
+        actor.Physics.Body.Z = actor.Physics.Body.Z + revenantLaunchLift
+    case actorinfo.ActionFatAttack1:
+        actor.Physics.Angle = actor.Physics.Angle + mancubusSpread
+    case actorinfo.ActionFatAttack2:
+        actor.Physics.Angle = actor.Physics.Angle - mancubusSpread
+    }
+    world.Actors = world.Actors.WithActor(step.handle, actor)
+    step.launchAction, step.phase = action, monsterAttackLaunch
+    step.missile = play.BeginMonsterMissile(level, world, step.handle, step.target, kind, rules)
+    step.Combat = step.missile.Combat
+    if step.Combat.Failed { return finishMonsterLaunch(level, step, rules) }
+    return step
+}
+
+func volleyOffset(action int, shotIndex int) bits<32> {
+    if action == actorinfo.ActionFatAttack3 {
+        if shotIndex == 0 { return -(mancubusSpread >> 1) }
+        return mancubusSpread >> 1
+    }
+    if shotIndex == 1 {
+        if action == actorinfo.ActionFatAttack1 { return mancubusSpread }
+        if action == actorinfo.ActionFatAttack2 { return -(mancubusSpread * 2) }
+    }
+    return 0
+}
+
+func finishMonsterLaunch(level wad.BspLevel, step MonsterAttack, rules play.CombatRules) MonsterAttack {
+    world := step.Combat.World
+    if step.launchAction == actorinfo.ActionSkelMissile {
+        source := world.Actors.ActorAt(step.handle - 1)
+        source.Physics.Body.Z = source.Physics.Body.Z - revenantLaunchLift
+        world.Actors = world.Actors.WithActor(step.handle, source)
+        if !step.Combat.Failed {
+            missile := world.Actors.ActorAt(step.missile.Handle - 1)
+            // The extra advance writes the raw origin after the half-step
+            // and leaves the links from P_TryMove in place.
+            missile.Physics.Body.X = missile.Physics.Body.X + missile.Physics.MomentumX
+            missile.Physics.Body.Y = missile.Physics.Body.Y + missile.Physics.MomentumY
+            missile.Tracer = source.Target
+            world.Actors = world.Actors.WithActor(step.missile.Handle, missile)
+        }
+    } else if step.launchAction != 0 && !step.Combat.Failed {
+        offset := volleyOffset(step.launchAction, step.shotIndex)
+        if offset != 0 {
+            missile := world.Actors.ActorAt(step.missile.Handle - 1)
+            missile = setMissileHeading(missile, missile.Physics.Angle + offset)
+            world.Actors = world.Actors.WithActor(step.missile.Handle, missile)
+        }
+        if step.shotIndex == 0 {
+            step.shotIndex = 1
+            source := world.Actors.ActorAt(step.handle - 1)
+            step.missile = play.BeginMonsterMissile(level, world, step.handle, source.Target, actorinfo.ActorFatShot, rules)
+            step.Combat = step.missile.Combat
+            return step
+        }
+    }
+    step.Combat.World, step.Done = world, true
+    return step
+}
+
+func spawnTracerSmoke(level wad.BspLevel, world play.CombatWorld, missile play.LevelActor, rules play.CombatRules) play.CombatStep {
+    handle := world.Actors.NextTransientHandle()
+    if handle == 0 { return play.CombatStep{World: world, Failed: true} }
+    body := missile.Physics.Body
+    spawn := play.SpawnMobj(level, actorinfo.ActorSmoke, body.X - missile.Physics.MomentumX,
+        body.Y - missile.Physics.MomentumY, body.Z, rules.Skill, world.Random)
+    linked := world.Links.SetActorPosition(level, handle, spawn.Actor)
+    if !linked.Valid { return play.CombatStep{World: world, Failed: true} }
+    roll := play.PRandom(spawn.Random)
+    smoke := linked.Actor
+    smoke.Physics.MomentumZ = engine.FracUnit
+    smoke.Tics = smoke.Tics - int(roll.Value & 3)
+    if smoke.Tics < 1 { smoke.Tics = 1 }
+    world.Actors = world.Actors.AppendTransient(smoke)
+    world.Links, world.Random = linked.Links, roll.State
+    return play.CombatStep{World: world}
+}
+
+func RunTracer(level wad.BspLevel, world play.CombatWorld, handle int, gameTic int, rules play.CombatRules) play.CombatStep {
+    if gameTic & 3 != 0 { return play.CombatStep{World: world} }
+    missile := world.Actors.ActorAt(handle - 1)
+    if !missile.Valid { return play.CombatStep{World: world, Failed: true} }
+    body := missile.Physics.Body
+    puff := play.SpawnShotEffect(level, world, body.X, body.Y, body.Z, false, 0, world.AttackRange, rules)
+    if !puff.Valid { return play.CombatStep{World: world, Failed: true} }
+    step := spawnTracerSmoke(level, puff.World, missile, rules)
+    if step.Failed { return step }
+    target := step.World.Actors.ActorAt(missile.Tracer - 1)
+    if !target.Valid || target.Health <= 0 { return step }
+
+    nextBody := target.Physics.Body
+    exact := engine.PointToAngle(body.X, body.Y, nextBody.X, nextBody.Y)
+    angle := missile.Physics.Angle
+    if exact != angle {
+        if exact - angle > tracerHalfTurn {
+            angle = angle - tracerTurn
+            if exact - angle < tracerHalfTurn { angle = exact }
+        } else {
+            angle = angle + tracerTurn
+            if exact - angle > tracerHalfTurn { angle = exact }
+        }
+    }
+    missile = setMissileHeading(missile, angle)
+    travel := wad.ApproxDistance(nextBody.X - body.X, nextBody.Y - body.Y) / actorinfo.KindAt(missile.Kind).Speed
+    if travel < 1 { travel = 1 }
+    slope := (nextBody.Z + 40 * engine.FracUnit - body.Z) / travel
+    change := engine.FracUnit / 8
+    if slope < missile.Physics.MomentumZ { change = -change }
+    missile.Physics.MomentumZ = missile.Physics.MomentumZ + change
+    step.World.Actors = step.World.Actors.WithActor(handle, missile)
+    return step
+}

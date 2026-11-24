@@ -1,0 +1,142 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Thing contacts from PIT_CheckThing and P_CheckPosition in linuxdoom-1.10.
+
+package play
+
+import "actorinfo"
+import "engine"
+import "wad"
+
+const ActorSpecial = 0x1
+const ActorSolid = 0x2
+const ActorShootable = 0x4
+const ActorPickup = 0x800
+const thingSearchRadius = 32 * engine.FracUnit
+
+const ContactTouch = 1
+const ContactDamage = 2
+const ContactSkull = 3
+
+type ThingContact struct {
+    Action int
+    Target int
+    Source int
+    Damage int
+    ResetState int
+    Blocked bit
+}
+
+func relatedMissileSpecies(source int, target int) bit {
+    return source == target || (source == actorinfo.ActorKnight && target == actorinfo.ActorBruiser) ||
+        (source == actorinfo.ActorBruiser && target == actorinfo.ActorKnight)
+}
+
+func checkThingContact(actors MapActors, moving LevelActor, movingHandle int, handle int, x int, y int, canPickup bit) ThingContact {
+    other := actors.ActorAt(handle - 1)
+    body := other.Physics.Body
+    flags := body.Flags
+    if !other.Valid || handle == movingHandle || flags & (ActorSolid | ActorSpecial | ActorShootable) == 0 {
+        return ThingContact{}
+    }
+    mover := moving.Physics.Body
+    radius := mover.Radius + body.Radius
+    dx, dy := body.X - x, body.Y - y
+    if dx >= radius || dx <= -radius || dy >= radius || dy <= -radius { return ThingContact{} }
+    solid := flags & ActorSolid != 0
+    if mover.Flags & MoveSkullFly != 0 {
+        info := actorinfo.KindAt(moving.Kind)
+        return ThingContact{Action: ContactSkull, Target: handle, Source: movingHandle,
+            Damage: info.Damage, ResetState: info.SpawnState, Blocked: true}
+    }
+    if mover.Flags & MoveMissile != 0 {
+        if mover.Z > body.Z + body.Height || mover.Z + mover.Height < body.Z { return ThingContact{} }
+        source := actors.ActorAt(moving.Target - 1)
+        if source.Valid && relatedMissileSpecies(source.Kind, other.Kind) {
+            if handle == moving.Target { return ThingContact{} }
+            if other.Kind != actorinfo.ActorPlayer { return ThingContact{Blocked: true} }
+        }
+        if flags & ActorShootable == 0 { return ThingContact{Blocked: solid} }
+        return ThingContact{Action: ContactDamage, Target: handle, Source: moving.Target,
+            Damage: actorinfo.KindAt(moving.Kind).Damage, Blocked: true}
+    }
+    if flags & ActorSpecial != 0 && canPickup {
+        return ThingContact{Action: ContactTouch, Target: handle, Blocked: solid}
+    }
+    return ThingContact{Blocked: solid}
+}
+
+type ThingScan struct {
+    X int
+    Y int
+    Left int
+    Right int
+    Bottom int
+    Top int
+    Column int
+    Row int
+    Candidate int
+    ReadCell bit
+    CanPickup bit
+    Done bit
+    Blocked bit
+}
+
+type ThingContactStep struct {
+    Scan ThingScan
+    Contact ThingContact
+    Random RandomState
+}
+
+func BeginThingScan(blocks wad.BlockMapInfo, actor MapActor, x int, y int) ThingScan {
+    if !blocks.Valid || actor.Flags & MoveNoClip != 0 { return ThingScan{Done: true} }
+    reach := actor.Radius + thingSearchRadius
+    left, right := (x - reach - blocks.OriginX) >> wad.MapBlockShift, (x + reach - blocks.OriginX) >> wad.MapBlockShift
+    bottom, top := (y - reach - blocks.OriginY) >> wad.MapBlockShift, (y + reach - blocks.OriginY) >> wad.MapBlockShift
+    if left < 0 { left = 0 }
+    if bottom < 0 { bottom = 0 }
+    if right >= blocks.Width { right = blocks.Width - 1 }
+    if top >= blocks.Height { top = blocks.Height - 1 }
+    return ThingScan{X: x, Y: y, Left: left, Right: right, Bottom: bottom, Top: top,
+        Column: left, Row: bottom, CanPickup: actor.Flags & ActorPickup != 0, Done: left > right || bottom > top}
+}
+
+// Pauses at native side effects before visiting further candidates or lines.
+// The successor is captured before pickup handling can unlink the current one.
+func ScanThingContacts(scan ThingScan, actors MapActors, links ActorLinks, moving LevelActor, handle int,
+    random RandomState) ThingContactStep {
+    if scan.Done { return ThingContactStep{Scan: scan, Random: random} }
+    for range ThinkerIterationLimit {
+        if scan.Column > scan.Right {
+            scan.Done = true
+            return ThingContactStep{Scan: scan, Random: random}
+        }
+        if !scan.ReadCell {
+            scan.Candidate = links.BlockFirst(scan.Column, scan.Row)
+            scan.ReadCell = true
+        }
+        if scan.Candidate == 0 {
+            scan.Row = scan.Row + 1
+            if scan.Row > scan.Top {
+                scan.Row = scan.Bottom
+                scan.Column = scan.Column + 1
+            }
+            scan.ReadCell = false
+        } else {
+            candidate := scan.Candidate
+            scan.Candidate = links.BlockNext(candidate)
+            contact := checkThingContact(actors, moving, handle, candidate, scan.X, scan.Y, scan.CanPickup)
+            if contact.Blocked { scan.Done, scan.Blocked = true, true }
+            if contact.Action != 0 || scan.Done {
+                if contact.Action == ContactDamage || contact.Action == ContactSkull {
+                    roll := PRandom(random)
+                    contact.Damage = (int(roll.Value) % 8 + 1) * contact.Damage
+                    random = roll.State
+                }
+                return ThingContactStep{Scan: scan, Contact: contact, Random: random}
+            }
+        }
+    }
+    scan.Done = true
+    return ThingContactStep{Scan: scan, Random: random}
+}

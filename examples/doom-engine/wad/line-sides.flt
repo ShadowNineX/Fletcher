@@ -1,0 +1,62 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted on 2026-11-21 from linuxdoom-1.10/p_maputl.c.
+
+package wad
+
+import "engine"
+import "numeric"
+
+// PointOnCollisionLineSide is P_PointOnLineSide: front is zero and back is
+// one. Axis-aligned equality deliberately follows the original <= branches.
+func PointOnCollisionLineSide(line CollisionLine, x int, y int) int {
+    if !line.Valid { return -1 }
+    if line.DeltaX == 0 {
+        if x <= line.First.X {
+            if line.DeltaY > 0 { return 1 }
+            return 0
+        }
+        if line.DeltaY < 0 { return 1 }
+        return 0
+    }
+    if line.DeltaY == 0 {
+        if y <= line.First.Y {
+            if line.DeltaX < 0 { return 1 }
+            return 0
+        }
+        if line.DeltaX > 0 { return 1 }
+        return 0
+    }
+    dx, dy := x - line.First.X, y - line.First.Y
+    left := cport.C_FixedMul(line.DeltaY >> 16, dx)
+    right := cport.C_FixedMul(dy, line.DeltaX >> 16)
+    if right < left { return 0 }
+    return 1
+}
+
+// BoxOnCollisionLineSide returns -1 for an invalid line or a box that
+// straddles the infinite linedef plane.
+func BoxOnCollisionLineSide(line CollisionLine, bounds engine.Box) int {
+    if !line.Valid { return -1 }
+    p1, p2 := 0, 0
+    switch line.Slope {
+    case LineSlopeHorizontal:
+        if bounds.Top > line.First.Y { p1 = 1 }
+        if bounds.Bottom > line.First.Y { p2 = 1 }
+        if line.DeltaX < 0 { p1, p2 = p1 ^ 1, p2 ^ 1 }
+    case LineSlopeVertical:
+        if bounds.Right < line.First.X { p1 = 1 }
+        if bounds.Left < line.First.X { p2 = 1 }
+        if line.DeltaY < 0 { p1, p2 = p1 ^ 1, p2 ^ 1 }
+    case LineSlopePositive:
+        p1 = PointOnCollisionLineSide(line, bounds.Left, bounds.Top)
+        p2 = PointOnCollisionLineSide(line, bounds.Right, bounds.Bottom)
+    case LineSlopeNegative:
+        p1 = PointOnCollisionLineSide(line, bounds.Right, bounds.Top)
+        p2 = PointOnCollisionLineSide(line, bounds.Left, bounds.Bottom)
+    default:
+        return -1
+    }
+    if p1 == p2 { return p1 }
+    return -1
+}

@@ -1,0 +1,110 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Adapted from P_SlideMove, PTR_SlideTraverse and P_HitSlideLine in linuxdoom-1.10/p_map.c.
+
+package play
+
+import "engine"
+import "numeric"
+import "wad"
+
+const slideWallGap = 0x800
+const slideHalfTurn bits<32> = 0x80000000
+const lineTwoSided = 4
+
+type SlideContact struct {
+    Valid bit
+    Line int
+    Fraction int
+}
+
+func slideContactAt(level wad.BspLevel, blockMap wad.BlockMapInfo, actor ActorPhysics, best SlideContact, x int, y int) SlideContact {
+    path := wad.TraceMapLines(level, blockMap, x, y, x + actor.MomentumX, y + actor.MomentumY)
+    if !path.Valid { return SlideContact{} }
+    for i := range path.Count {
+        hit := path.Hits.At(i)
+        if hit.Fraction >= best.Fraction { return best }
+        line := level.LineAt(hit.Index)
+        if line.Flags & lineTwoSided == 0 {
+            if wad.PointOnCollisionLineSide(line, actor.Body.X, actor.Body.Y) == 0 {
+                return SlideContact{Valid: true, Line: hit.Index, Fraction: hit.Fraction}
+            }
+        } else {
+            opening := wad.LineOpening(level, line)
+            if opening.Range < actor.Body.Height || opening.OpenTop - actor.Body.Z < actor.Body.Height ||
+                opening.OpenBottom - actor.Body.Z > stepHeight {
+                return SlideContact{Valid: true, Line: hit.Index, Fraction: hit.Fraction}
+            }
+        }
+    }
+    return best
+}
+
+func slideContact(level wad.BspLevel, blockMap wad.BlockMapInfo, actor ActorPhysics) SlideContact {
+    x, y, radius := actor.Body.X, actor.Body.Y, actor.Body.Radius
+    leadX, trailX := x - radius, x + radius
+    leadY, trailY := y - radius, y + radius
+    if actor.MomentumX > 0 { leadX, trailX = trailX, leadX }
+    if actor.MomentumY > 0 { leadY, trailY = trailY, leadY }
+
+    best := SlideContact{Valid: true, Line: -1, Fraction: engine.FracUnit + 1}
+    best = slideContactAt(level, blockMap, actor, best, leadX, leadY)
+    if !best.Valid { return best }
+    best = slideContactAt(level, blockMap, actor, best, trailX, leadY)
+    if !best.Valid { return best }
+    return slideContactAt(level, blockMap, actor, best, leadX, trailY)
+}
+
+func clipSlideMomentum(actor ActorPhysics, line wad.CollisionLine, remaining int) ActorPhysics {
+    x := cport.C_FixedMul(actor.MomentumX, remaining)
+    y := cport.C_FixedMul(actor.MomentumY, remaining)
+    switch line.Slope {
+    case wad.LineSlopeHorizontal:
+        actor.MomentumX, actor.MomentumY = x, 0
+    case wad.LineSlopeVertical:
+        actor.MomentumX, actor.MomentumY = 0, y
+    default:
+        lineAngle := engine.PointToAngle(0, 0, line.DeltaX, line.DeltaY)
+        if wad.PointOnCollisionLineSide(line, actor.Body.X, actor.Body.Y) == 1 { lineAngle = lineAngle + slideHalfTurn }
+        delta := engine.PointToAngle(0, 0, x, y) - lineAngle
+        if delta > slideHalfTurn { delta = delta + slideHalfTurn }
+        length := cport.C_FixedMul(wad.ApproxDistance(x, y), engine.AngleCosine(delta))
+        actor.MomentumX = cport.C_FixedMul(length, engine.AngleCosine(lineAngle))
+        actor.MomentumY = cport.C_FixedMul(length, engine.AngleSine(lineAngle))
+    }
+    return actor
+}
+
+func stairStepMove(blockMap wad.BlockMapInfo, result HorizontalMove) HorizontalMove {
+    actor := result.Actor
+    result = tryHorizontalMove(blockMap, result, actor.Body.X, actor.Body.Y + actor.MomentumY)
+    if result.Valid && !result.LastAllowed {
+        return tryHorizontalMove(blockMap, result, actor.Body.X + actor.MomentumX, actor.Body.Y)
+    }
+    return result
+}
+
+func slideMove(blockMap wad.BlockMapInfo, result HorizontalMove) HorizontalMove {
+    for range maxSlideAttempts {
+        actor := result.Actor
+        contact := slideContact(result.Level, blockMap, actor)
+        if !contact.Valid { result.Valid = false; return result }
+        if contact.Line < 0 { return stairStepMove(blockMap, result) }
+        approach := contact.Fraction - slideWallGap
+        if approach > 0 {
+            x := actor.Body.X + cport.C_FixedMul(actor.MomentumX, approach)
+            y := actor.Body.Y + cport.C_FixedMul(actor.MomentumY, approach)
+            result = tryHorizontalMove(blockMap, result, x, y)
+            if !result.Valid { return result }
+            if !result.LastAllowed { return stairStepMove(blockMap, result) }
+        }
+
+        remainder := engine.FracUnit - contact.Fraction
+        if remainder <= 0 { return result }
+        actor = clipSlideMomentum(result.Actor, result.Level.LineAt(contact.Line), remainder)
+        result.Actor = actor
+        result = tryHorizontalMove(blockMap, result, actor.Body.X + actor.MomentumX, actor.Body.Y + actor.MomentumY)
+        if !result.Valid || result.LastAllowed { return result }
+    }
+    return stairStepMove(blockMap, result)
+}

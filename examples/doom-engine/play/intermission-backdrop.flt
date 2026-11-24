@@ -1,0 +1,88 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Episode backdrop animation metadata and ticker from linuxdoom-1.10/wi_stuff.c.
+
+package play
+
+const MaxIntermissionAnimations = 10
+const intermissionFirstLocations = [20]int{224, 104, 184, 160, 112, 136, 72, 112, 88, 96,
+    64, 48, 192, 40, 136, 16, 80, 16, 64, 24}
+const intermissionThirdLocations = [12]int{104, 168, 40, 136, 160, 96, 104, 80, 120, 32, 40, 0}
+
+type IntermissionAnimation struct {
+    X int
+    Y int
+    Period int
+    Frames int
+    Target int
+}
+
+type IntermissionBackdrop struct {
+    Count int
+    Frame [MaxIntermissionAnimations]int
+    NextTic [MaxIntermissionAnimations]int
+    Random RandomState
+    Changed bit
+}
+
+func IntermissionAnimationAt(episode int, index int) IntermissionAnimation {
+    data := IntermissionAnimation{Period: 35 / 3, Frames: 3, Target: -1}
+    switch episode {
+    case 0:
+        data.X, data.Y = intermissionFirstLocations[index * 2], intermissionFirstLocations[index * 2 + 1]
+    case 1:
+        data.X, data.Y, data.Frames, data.Target = 128, 136, 1, index + 1
+        if index == 7 { data.X, data.Y, data.Frames = 192, 144, 3 }
+        if index == 8 { data.Target = 8 }
+    case 2:
+        data.X, data.Y = intermissionThirdLocations[index * 2], intermissionThirdLocations[index * 2 + 1]
+        if index == 5 { data.Period = 35 / 4 }
+    }
+    return data
+}
+
+func StartIntermissionBackdrop(summary IntermissionState, random RandomState) IntermissionBackdrop {
+    backdrop := IntermissionBackdrop{Random: random}
+    if summary.Route.Commercial { return backdrop }
+    switch summary.Route.Episode {
+    case 0: backdrop.Count = 10
+    case 1: backdrop.Count = 9
+    case 2: backdrop.Count = 6
+    }
+    for index := range backdrop.Count {
+        data := IntermissionAnimationAt(summary.Route.Episode, index)
+        first := summary.BackgroundTics + 1
+        if data.Target < 0 {
+            roll := MRandom(backdrop.Random)
+            first, backdrop.Random = first + int(roll.Value) % data.Period, roll.State
+        }
+        backdrop.Frame[index], backdrop.NextTic[index] = -1, first
+    }
+    return backdrop
+}
+
+func TickIntermissionBackdrop(backdrop IntermissionBackdrop, previous IntermissionState,
+    current IntermissionState) IntermissionBackdrop {
+    if current.Stage == IntermissionNext && previous.Stage != IntermissionNext {
+        return StartIntermissionBackdrop(current, backdrop.Random)
+    }
+    backdrop.Changed = false
+    for index := range backdrop.Count {
+        if backdrop.NextTic[index] == current.BackgroundTics {
+            data := IntermissionAnimationAt(current.Route.Episode, index)
+            frame := backdrop.Frame[index]
+            active := data.Target < 0 ||
+                (data.Target == current.Route.NextMap && !(previous.Stage == IntermissionStats && index == 7))
+            if active {
+                advanced := frame + 1
+                if advanced >= data.Frames {
+                    advanced = 0
+                    if data.Target >= 0 { advanced = data.Frames - 1 }
+                }
+                backdrop.Frame[index], backdrop.NextTic[index] = advanced, current.BackgroundTics + data.Period
+                backdrop.Changed = backdrop.Changed || advanced != frame
+            }
+        }
+    }
+    return backdrop
+}

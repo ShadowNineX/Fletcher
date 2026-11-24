@@ -1,0 +1,275 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Actor initialization from linuxdoom-1.10 P_SpawnMobj, P_SpawnPlayer,
+// and P_SpawnMapThing. Action routines are not called during allocation.
+
+package play
+
+import "actorinfo"
+import "wad"
+
+const ActorSpawnCeiling = 0x100
+const ActorAmbush = 0x20
+const ActorNoSector = 0x8
+const ActorCountKill = 0x400000
+const ActorCountItem = 0x800000
+const ActorTranslationShift = 26
+const ActorOnFloor = -2147483647 - 1
+const ActorOnCeiling = 2147483647
+// Keep one positive sentinel after the last possible one-based handle.
+const maxActorHandle = 2147483646
+
+type LevelActor struct {
+    Valid bit
+    Kind int
+    Physics ActorPhysics
+    Sector int
+    Subsector int
+    Health int
+    ReactionTime int
+    LastLook int
+    MoveDirection int
+    MoveCount int
+    Target int
+    Tracer int
+    Threshold int
+    State int
+    Tics int
+    Sprite int
+    Frame int
+    SpawnPoint wad.MapThing
+    PlayerSlot int
+    Transient bit
+    Damaged bit
+}
+
+type MobSpawn struct {
+    Actor LevelActor
+    Random RandomState
+}
+
+// SpawnMobj initializes a living actor using raw 16.16 coordinates and the
+// sector containing its origin. ActorOnFloor and ActorOnCeiling select the
+// original z sentinels. No state action runs until the actor is linked.
+func SpawnMobjWithFast(level wad.BspLevel, kind int, x int, y int, z int, skill int, fast bit, random RandomState) MobSpawn {
+    info := actorinfo.KindAt(kind)
+    if !info.Valid { return MobSpawn{Random: random} }
+    sector := level.SectorAtPoint(x, y)
+    if !sector.Valid { return MobSpawn{Random: random} }
+    state := actorinfo.StateAt(info.SpawnState)
+    if !state.Valid { return MobSpawn{Random: random} }
+    heights := sector.Heights
+    if z == ActorOnFloor {
+        z = heights.Floor
+    } else if z == ActorOnCeiling {
+        z = heights.Ceiling - info.Height
+    }
+    body := MapActor{X: x, Y: y, Z: z, Floor: heights.Floor, Ceiling: heights.Ceiling,
+        Radius: info.Radius, Height: info.Height, Flags: info.Flags}
+    reaction := info.ReactionTime
+    if skill == 4 { reaction = 0 }
+    look := PRandom(random)
+    return MobSpawn{Random: look.State, Actor: LevelActor{Valid: true, Kind: kind,
+        Physics: ActorPhysics{Body: body}, Sector: sector.Index, Subsector: sector.Subsector, Health: info.SpawnHealth,
+        ReactionTime: reaction, LastLook: int(look.Value) % wad.VanillaPlayers, State: info.SpawnState,
+        Tics: StateTics(info.SpawnState, state.Tics, fast), Sprite: state.Sprite, Frame: state.Frame, PlayerSlot: -1}}
+}
+
+func SpawnMobj(level wad.BspLevel, kind int, x int, y int, z int, skill int, random RandomState) MobSpawn {
+    return SpawnMobjWithFast(level, kind, x, y, z, skill, false, random)
+}
+
+// Actor references retain value semantics and keep unused slots small.
+type LevelActorRef interface {
+    ReadActor() LevelActor
+}
+
+func (actor LevelActor) ReadActor() LevelActor { return actor }
+
+type actorSlot struct {
+    Present bit
+    Value LevelActorRef
+}
+
+type transientLink struct {
+    Next int
+    Order int
+}
+
+type MapActors struct {
+    entries PagedSlots<actorSlot>
+    Count int
+    TotalKills int
+    TotalItems int
+    Random RandomState
+    PlayerActors [wad.VanillaPlayers]int
+    Failed bit
+    RejectedThing int
+    Overflow bit
+    NextThinkerOrder int
+    transientLinks PagedSlots<transientLink>
+    transientHead int
+    transientTail int
+    transientFree int
+}
+
+func (actors MapActors) ActorAt(index int) LevelActor {
+    if index < 0 || index >= actors.Count { return LevelActor{} }
+    slot := actors.entries.At(index)
+    if !slot.Present { return LevelActor{} }
+    return slot.Value.ReadActor()
+}
+
+func (actors MapActors) WithActor(handle int, actor LevelActor) MapActors {
+    if handle > 0 && handle <= actors.Count {
+        actors.entries = actors.entries.With(handle - 1, actorSlot{Present: true, Value: actor})
+    }
+    return actors
+}
+
+func (actors MapActors) AppendActor(actor LevelActor) MapActors {
+    if actors.Count >= maxActorHandle {
+        actors.Failed, actors.Overflow = true, true
+        return actors
+    }
+    actors.entries = actors.entries.With(actors.Count, actorSlot{Present: true, Value: actor})
+    actors.Count = actors.Count + 1
+    return actors
+}
+
+// Actors spawned during play use
+// released high-water slots before growing the roster. Their separate linked
+// order preserves thinker order without changing ordinary map actor handles.
+func (actors MapActors) NextTransientHandle() int {
+    if actors.transientFree > 0 { return actors.transientFree }
+    if actors.Count >= maxActorHandle { return 0 }
+    return actors.Count + 1
+}
+
+func (actors MapActors) AppendTransient(actor LevelActor) MapActors {
+    handle := actors.NextTransientHandle()
+    if handle == 0 {
+        actors.Failed, actors.Overflow = true, true
+        return actors
+    }
+    index := handle - 1
+    if actors.transientFree == handle {
+        actors.transientFree = actors.transientLinks.At(index).Next
+    } else {
+        actors.Count = actors.Count + 1
+    }
+    actor.Transient = true
+    actors = actors.WithActor(handle, actor)
+    actors.transientLinks = actors.transientLinks.With(index, transientLink{Order: actors.NextThinkerOrder})
+    actors.NextThinkerOrder = actors.NextThinkerOrder + 1
+    if actors.transientTail == 0 {
+        actors.transientHead, actors.transientTail = handle, handle
+    } else {
+        tail := actors.transientLinks.At(actors.transientTail - 1)
+        tail.Next = handle
+        actors.transientLinks = actors.transientLinks.With(actors.transientTail - 1, tail)
+        actors.transientTail = handle
+    }
+    return actors
+}
+
+func (actors MapActors) TransientFirst() int { return actors.transientHead }
+
+func (actors MapActors) TransientOrder(handle int) int {
+    if handle <= 0 || handle > actors.Count { return -1 }
+    return actors.transientLinks.At(handle - 1).Order
+}
+
+// The two views of a level share their registration clock at the boundaries
+// between actor and sector actions.
+func (actors MapActors) WithSectorOrder(state LevelSpecials) MapActors {
+    if state.Doors.NextMover > actors.NextThinkerOrder { actors.NextThinkerOrder = state.Doors.NextMover }
+    return actors
+}
+
+func (actors MapActors) TransientNext(handle int) int {
+    if handle <= 0 || handle > actors.Count { return 0 }
+    return actors.transientLinks.At(handle - 1).Next
+}
+
+func (actors MapActors) ReleaseTransient(previous int, handle int) MapActors {
+    if handle <= 0 || handle > actors.Count { return actors }
+    actor := actors.ActorAt(handle - 1)
+    if actor.Valid || !actor.Transient { return actors }
+    link := actors.transientLinks.At(handle - 1)
+    if previous == 0 {
+        if actors.transientHead != handle { return actors }
+        actors.transientHead = link.Next
+    } else {
+        if previous < 0 || previous > actors.Count { return actors }
+        prior := actors.transientLinks.At(previous - 1)
+        if prior.Next != handle { return actors }
+        prior.Next = link.Next
+        actors.transientLinks = actors.transientLinks.With(previous - 1, prior)
+    }
+    if actors.transientTail == handle { actors.transientTail = previous }
+    actors.entries = actors.entries.With(handle - 1, actorSlot{})
+    link.Next = actors.transientFree
+    actors.transientLinks = actors.transientLinks.With(handle - 1, link)
+    actors.transientFree = handle
+    return actors
+}
+
+func mapThingHeading(thing wad.MapThing) bits<32> { return bits<32>(thing.Angle / 45) << 29 }
+
+// SpawnMapActors keeps THINGS order, including RNG consumed by players and
+// decorations before P_SpawnSpecials initializes the level's lights.
+// Every player-one start creates a body, and the last one owns slot zero.
+func SpawnMapActors(level wad.BspLevel, rules wad.ThingRules, health [wad.VanillaPlayers]int,
+    random RandomState) MapActors {
+    actors := MapActors{Random: random, RejectedThing: -1}
+    for index := range level.Things.Count {
+        thing := level.ThingAt(index)
+        kind := actorinfo.KindForThing(thing.Type)
+        info := actorinfo.KindAt(kind)
+        intent := wad.SpawnThing(thing, rules, wad.ThingActorClass{Known: info.Valid,
+            CountKill: info.Flags & ActorCountKill != 0, Skull: kind == actorinfo.ActorSkull})
+        if intent.StopLoad { return actors }
+        if !intent.Valid || intent.UnknownActor {
+            actors.Failed, actors.RejectedThing = true, index
+            return actors
+        }
+        if intent.SpawnPlayer || intent.SpawnActor {
+            if actors.Count == maxActorHandle {
+                actors.Failed, actors.Overflow, actors.RejectedThing = true, true, index
+                return actors
+            }
+            z := ActorOnFloor
+            if intent.SpawnPlayer {
+                kind = actorinfo.ActorPlayer
+            } else if info.Flags & ActorSpawnCeiling != 0 {
+                z = ActorOnCeiling
+            }
+            spawned := SpawnMobjWithFast(level, kind, thing.X << 16, thing.Y << 16, z, rules.Skill, rules.Fast, actors.Random)
+            actor := spawned.Actor
+            if !actor.Valid {
+                actors.Failed, actors.RejectedThing = true, index
+                return actors
+            }
+            actors.Random = spawned.Random
+            actor.Physics.Angle = mapThingHeading(thing)
+            if intent.SpawnPlayer {
+                actor.PlayerSlot, actor.Health = 0, health[0]
+                actor.Physics.Body.Player = true
+                actor.Physics.ViewHeight = NormalViewHeight
+                actors.PlayerActors[0] = actors.Count + 1
+            } else {
+                actor.SpawnPoint = thing
+                if actor.Tics > 0 {
+                    roll := PRandom(actors.Random)
+                    actors.Random, actor.Tics = roll.State, 1 + int(roll.Value) % actor.Tics
+                }
+                if actor.Physics.Body.Flags & ActorCountKill != 0 { actors.TotalKills = actors.TotalKills + 1 }
+                if actor.Physics.Body.Flags & ActorCountItem != 0 { actors.TotalItems = actors.TotalItems + 1 }
+                if thing.Options & 8 != 0 { actor.Physics.Body.Flags = actor.Physics.Body.Flags | ActorAmbush }
+            }
+            actors = actors.AppendActor(actor)
+        }
+    }
+    return actors
+}

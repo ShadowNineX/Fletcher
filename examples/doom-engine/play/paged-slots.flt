@@ -1,0 +1,5 @@
+package play
+
+import "engine"
+
+type PagedSlots<T> = engine.PagedSlots<T>
