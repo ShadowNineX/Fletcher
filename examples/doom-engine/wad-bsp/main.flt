@@ -1102,6 +1102,9 @@ map "Original WAD BSP View" {
             log("Doom checkpoint saved", checkpointIndex + 1, name)
         } else if checkpointHold {
             saved := checkpoint.Value.Recall()
+            // G_DoLoadGame restores the world while the active video and
+            // message preferences remain in effect.
+            preserveOptions := ClassicMenu && menuStep.LoadCheckpoint
             next marker = saved.Marker
             next campaignSkill = saved.Skill
             next campaignSecret = saved.DidSecret
@@ -1140,21 +1143,28 @@ map "Original WAD BSP View" {
             next ceilings = saved.Ceilings
             next scrolls = saved.Scrolls
             next soundBounds = saved.SoundBounds
-            if !renderGeometry.Valid || renderGeometry.Marker != saved.Marker {
-                next renderGeometry = loadRenderGeometry(wad.LoadBspLevel(Archive, saved.Marker), saved.Marker)
+            geometry := renderGeometry
+            if !geometry.Valid || geometry.Marker != saved.Marker {
+                geometry = loadRenderGeometry(wad.LoadBspLevel(Archive, saved.Marker), saved.Marker)
+                next renderGeometry = geometry
             }
 
-            next materialSource = saved.Materials
+            if preserveOptions && selectedGamma != saved.Gamma {
+                next materialSource = previewStageGamma(saved.Materials, archives, selectedGamma)
+            } else { next materialSource = saved.Materials }
             next animations = saved.Animations
             next actorSprites = saved.ActorSprites
             next screenShade = saved.Shade
             next screenFuzzPhase = saved.FuzzPhase
             next screenFuzzVisible = saved.FuzzVisible
             next statusAvailable = saved.StatusAvailable
-            next statusHidden = saved.StatusHidden
-            next viewBlocks = saved.ViewBlocks
-            next lowDetail = saved.LowDetail
-            next gammaLevel = saved.Gamma
+            if !preserveOptions {
+                next statusHidden = saved.StatusHidden
+                next viewBlocks = saved.ViewBlocks
+                next lowDetail = saved.LowDetail
+                next gammaLevel = saved.Gamma
+                next hudMessagesEnabled = saved.HudMessagesEnabled
+            }
             next screenStatusVisible = saved.StatusVisible
             next statusFace = saved.StatusFace
             next automapActive = saved.AutomapActive
@@ -1163,8 +1173,48 @@ map "Original WAD BSP View" {
             next mappedLines = saved.MappedLines
             next mapMarks = saved.MapMarks
             next hudMessages = saved.HudMessages
-            next hudMessagesEnabled = saved.HudMessagesEnabled
-            revealScreen(saved.Screen, saved.Screen, [1]int{0}, Width)
+            repainted := false
+            if preserveOptions {
+                showStatus := saved.StatusAvailable && (!hideStatus || saved.AutomapActive)
+                viewDiffers := !saved.AutomapActive &&
+                    (selectedBlocks != saved.ViewBlocks || selectedDetail != saved.LowDetail || showStatus != saved.StatusVisible)
+                if viewDiffers || selectedGamma != saved.Gamma {
+                    shade := saved.Shade.WithGamma(selectedGamma)
+                    level := play.LevelSpecials{Doors: saved.Doors, Floors: saved.Floors,
+                        Ceilings: saved.Ceilings, Lighting: saved.Light}.ApplyTo(wad.LoadBspLevel(Archive, saved.Marker))
+                    useDisplayPalette(shade)
+                    if saved.AutomapActive {
+                        drawAutomap(saved.MapView, level, saved.BlockMap, saved.MappedLines, saved.Player, saved.MapMarks,
+                            archives, shade, saved.Inventory.Powers[play.PowerAllMap] != 0, reveal.Mode, saved.Actors, saved.ActorLinks)
+                        if showStatus { DrawStatusBar(archives, shade, saved.Inventory, saved.StatusFace.Index) }
+                        repainted = true
+                    } else {
+                        display := CameraDisplay{Shade: shade, Border: viewBorder, Inventory: saved.Inventory, StatusVisible: showStatus,
+                            ViewBlocks: selectedBlocks, LowDetail: selectedDetail, Face: saved.StatusFace.Index,
+                            Invisible: weaponUsesFuzz(saved.Inventory.Powers[play.PowerInvisibility]), FuzzPhase: saved.FuzzPhase,
+                            Mapped: saved.MappedLines, Columns: textureColumns, Geometry: geometry}
+                        painted := drawCamera(level, archives, saved.Actors, saved.ActorLinks, saved.ActorSprites,
+                            saved.Player.Body.X, saved.Player.Body.Y, saved.EyeZ, saved.Player.Angle,
+                            previewMaterials(saved.Materials, saved.Animations, saved.LevelTime - 1),
+                            saved.Scrolls, saved.Light.Lights, saved.Weapon, display)
+                        repainted = painted.Valid
+                        if repainted {
+                            next screenFuzzVisible = painted.FuzzVisible
+                            if painted.Columns.Revision != textureColumns.Revision { next textureColumns = painted.Columns }
+                            if painted.Geometry.Revision != geometry.Revision { next renderGeometry = painted.Geometry }
+                            if painted.Border.Blocks != 0 { next viewBorder = painted.Border }
+                        }
+                    }
+                    if repainted {
+                        next screenShade = shade
+                        next screenStatusVisible = showStatus
+                        message := visibleMessage(saved.HudMessages)
+                        if message != "" { drawHudMessage(archives, shade, message) }
+                        if saved.Paused { drawPause(archives, shade) }
+                    }
+                }
+            }
+            if !repainted { revealScreen(saved.Screen, saved.Screen, [1]int{0}, Width) }
 
             // Keep the physical Music Arrow phase bits so loading is silent.
             next soundtrackId = saved.SoundtrackId

@@ -166,6 +166,11 @@ ${anchor}`);
                 assert.ok(source.includes(messageTick), "HUD settings trace anchor moved");
                 source = source.replace(messageTick, `${messageTick}
                 log("settings-hud", messagesEnabled, messages.Current)`);
+                const checkpointPaint = /(^ +if repainted \{\r?\n)( +next screenShade = shade)/m;
+                assert.match(source, checkpointPaint, "checkpoint settings trace anchor moved");
+                source = source.replace(checkpointPaint, `                    if repainted {
+                        log("checkpoint-view", showStatus, selectedBlocks, selectedDetail, selectedGamma)
+                        next screenShade = shade`);
             }
             const drawResult = "return CameraDraw{Valid: true, FuzzPhase: masked.Phase,";
             const drawCommit = "if painted.Valid {";
@@ -195,10 +200,12 @@ ${resize}`);
     return path.join(preview, "main.flt");
 }
 
-function build(entry, commercial = false, blinkBoard = "") {
+function build(entry, commercial = false, blinkBoard = "", classicMenu = false) {
     const map = level();
     if (commercial) map[0][0] = "MAP01";
-    writeFileSync(path.join(scratch, "LEVEL.WAD"), wad([...map, ...resources()]));
+    const lumps = [...map, ...resources()];
+    if (classicMenu) lumps.push(["M_DOOM", patch(8, 8, 46)]);
+    writeFileSync(path.join(scratch, "LEVEL.WAD"), wad(lumps));
     const output = path.join(scratch, "status.json");
     const result = spawnSync("dotnet", [cli, "build", entry, "--package-root", port, "--asset-root", scratch, "-o", output],
         { cwd: root, encoding: "utf8", timeout: 30000 });
@@ -427,7 +434,7 @@ try {
         assert.equal(pixel(screen(blink), 1, 90), cutWire ? 6 : 3,
             "the radiation tint changes a real status bar tile only when the wire is connected");
     }
-    const settings = build(previewSource(10, false, true));
+    const settings = build(previewSource(10, false, true), false, "", true);
     waitFor(settings, () => settings.logs.some(([tag]) => tag === "settings-hud"), "start the shortcut fixture");
     const detailEvents = () => settings.logs.filter(([tag]) => tag === "detail-selection").map(([, selected]) => selected);
     const gammaEvents = () => settings.logs.filter(([tag]) => tag === "gamma-selection").map(([, selected]) => selected);
@@ -458,6 +465,23 @@ try {
     assert.deepEqual(gammaEvents(), [1, 2, 3, 4, 0], "F11 is ignored while the menu is open");
     tap(settings, 20);
     assert.equal(lastMessage()[0], true, "F8 is ignored while the menu is open");
+
+    tap(settings, 38); // F2 opens the classic Save list.
+    tap(settings, 50); // Enter edits the first slot.
+    tap(settings, 3); // C.
+    waitFor(settings, () => settings.logs.some(([tag]) => tag === "Doom checkpoint saved"),
+        "save a named classic slot", [50]);
+    const savedSettingsFrame = screen(settings);
+    for (const key of [8, 41, 47, 44]) tap(settings, key); // Full screen, low detail, gamma 1, messages off.
+    assert.notDeepEqual(screen(settings), savedSettingsFrame, "video settings change the displayed frame");
+    tap(settings, 39);
+    waitFor(settings, () => settings.logs.some(([tag]) => tag === "Doom checkpoint loaded"),
+        "load the slot under the current options", [50]);
+    assert.deepEqual(settings.logs.findLast(([tag]) => tag === "checkpoint-view"),
+        ["checkpoint-view", false, 10, true, 1], "classic Load redraws with current display options");
+    assert.notDeepEqual(screen(settings), savedSettingsFrame, "Load presents the new view on the restore tic");
+    for (let i = 0; i < 4; i++) settings.step();
+    assert.equal(lastMessage()[0], false, "classic Load keeps the current message preference");
 
     console.log("WAD preview passed STBAR widgets, Doom and Doom II borders, runtime sizing and detail, and exact viewport checkpoint restoration. The native blink disconnection and physical F5/F8/F11 settings also passed.");
 } finally {

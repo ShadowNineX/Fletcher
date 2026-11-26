@@ -11,8 +11,10 @@ import { decode, simulator } from "./logic-arrows-simulator.mjs";
 const root = fileURLToPath(new URL("..", import.meta.url));
 const { values } = parseArgs({ options: {
     wad: { type: "string" }, cli: { type: "string" }, full: { type: "boolean" }, "native-traces": { type: "string" },
+    "native-actors": { type: "boolean" },
 } });
 assert.ok(values.wad, "Pass --wad PATH to a local Ultimate Doom IWAD");
+assert.ok(!values["native-actors"] || values["native-traces"], "--native-actors requires --native-traces");
 const wad = readFileSync(path.resolve(values.wad));
 assert.equal(wad.toString("ascii", 0, 4), "IWAD");
 const directory = wad.readUInt32LE(8);
@@ -89,6 +91,18 @@ try {
                 frame.Contacts.Inventory.Ammo[0], frame.Contacts.Inventory.Ammo[1],
                 frame.Contacts.Inventory.KillCount, frame.Contacts.Inventory.ItemCount, frame.Contacts.Inventory.SecretCount,
                 lighting.Random.GameplayIndex, frame.Contacts.Inventory.ReadyWeapon, frame.Contacts.Inventory.DamageCount)` : "";
+    const actorProbe = values["native-actors"] ? `
+            if (levelTime & 15) == 0 {
+                for i := range actorFrame.Actors.Count {
+                    actor := actorFrame.Actors.ActorAt(i)
+                    if actor.Valid {
+                        b := actor.Physics.Body
+                        log("Demo actor state", attract.Stage, levelTime, actor.Kind, b.X, b.Y, b.Z, int(actor.Physics.Angle),
+                            actor.Physics.MomentumX, actor.Physics.MomentumY, actor.Physics.MomentumZ, int(b.Flags), actor.Health,
+                            actor.State, actor.Tics, actor.Sprite, actor.Frame, b.Floor, b.Ceiling, b.Radius, b.Height)
+                    }
+                }
+            }` : "";
     assert.ok(source.includes(stageProbe) && source.includes(commitProbe) && source.includes(demoStart), "observe sequence and gameplay commits");
     source = source.replace("register startTick int = 0", `register testGameTick int = 0
     register startTick int = 0`)
@@ -97,7 +111,7 @@ try {
         ${stageProbe}`)
         .replace(commitProbe, `if playingDemo {
             ${cursorCommit}
-            log("Demo player", attract.Stage, moved.Body.X, moved.Body.Y, int(moved.Angle))${nativeProbe}
+            log("Demo player", attract.Stage, moved.Body.X, moved.Body.Y, int(moved.Angle))${nativeProbe}${actorProbe}
         }`)
         .replaceAll(cursorCommit, `${cursorCommit};
             log("Demo command committed", attract.Stage, recorded.Command.Forward, recorded.Command.Side,
@@ -142,10 +156,12 @@ try {
     assert.deepEqual(committed, expectedCommands, "every demo tic commits the recorded command");
     if (values["native-traces"]) {
         const samples = events("Demo player state");
+        const actorSamples = values["native-actors"] ? events("Demo actor state") : [];
         assert.equal(samples.length, committed.length, "one state sample for every committed command");
         for (const [index, stage] of demoStages.entries()) {
             const file = path.resolve(values["native-traces"], `native-demo-${index + 1}.log`);
-            const native = Array.from(readFileSync(file, "utf8").matchAll(/^DEMO-TIC (.+)$/gm),
+            const trace = readFileSync(file, "utf8");
+            const native = Array.from(trace.matchAll(/^DEMO-TIC (.+)$/gm),
                 match => match[1].trim().split(/\s+/).map(Number));
             const traced = samples.filter(row => row[0] === stage);
             assert.ok(native.length >= traced.length, `DEMO${index + 1} native trace covers every sampled tic`);
@@ -159,8 +175,22 @@ try {
                     assert.equal(observed[field], reference[field], `DEMO${index + 1} tic ${tic} ${name}`);
                 }
             }
+            if (values["native-actors"]) {
+                const expected = Array.from(trace.matchAll(/^DEMO-ACTOR (\d+) (.+)$/gm),
+                    ([, tic, fields]) => [Number(tic), fields.trim()]);
+                const seen = actorSamples.filter(row => row[0] === stage);
+                for (let tic = 0; tic < traced.length; tic += 16) {
+                    // Handles differ after actor removal. Compare the complete
+                    // multiset of live records, including repeated objects.
+                    const reference = expected.filter(row => row[0] === tic).map(row => row[1]).sort();
+                    const observed = seen.filter(row => row[1] === tic).map(row => row.slice(2).join(" ")).sort();
+                    assert.ok(reference.length, `DEMO${index + 1} has native actor records at tic ${tic}`);
+                    assert.deepEqual(observed, reference, `DEMO${index + 1} live actors at tic ${tic}`);
+                }
+            }
         }
         console.log(`Matched ${nativeFields.length} player and RNG fields against pinned Linux Doom on ${samples.length} tics.`);
+        if (values["native-actors"]) console.log(`Matched ${actorSamples.length} live actor records sampled every 16 tics.`);
     }
     const players = events("Demo player");
     for (const stage of demoStages) {

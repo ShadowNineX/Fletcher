@@ -98,6 +98,8 @@ node examples/doom-engine/build-campaign.mjs --wad 'C:\path\to\DOOM.WAD' --outpu
 
 Open **Doom Campaign** using the [Logic Arrows map instructions](../../docs/logic-arrows.md). This profile uses the WAD's title, demos, menus, and HUD with a 160×120 RGB display and full 3D detail. It starts at gamma 4 for the wall display. **F11** cycles gamma in play. Add `--muted` to start the campaign silently.
 
+Use `--resolution 320x200` to build **Doom Campaign 320x200** at Doom's original framebuffer resolution with the same RGB wall display. With `--output` omitted, it saves to `artifacts/doom-engine/doom-campaign-320x200.json`.
+
 ## Preview an original level
 
 The wireframe sample reads the first classic Doom-format level in an original `LEVEL.WAD` PWAD. It uses `LINEDEFS` and `VERTEXES` to draw a top-down view. White lines are one-sided and blue lines are two-sided. The archive stays at `--asset-root` and the generated Level file embeds it in the zlib-compressed map data. The preview has a 256-linedef limit and checks the raster work before drawing a frame.

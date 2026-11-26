@@ -108,6 +108,18 @@ int main(int argc, char **argv) {
             player->health, player->armorpoints, player->ammo[am_clip], player->ammo[am_shell],
             player->killcount, player->itemcount, player->secretcount, prndindex,
             player->readyweapon, player->damagecount);
+        if ((gametic & 15) == 0) {
+            thinker_t *thinker;
+            for (thinker = thinkercap.next; thinker != &thinkercap; thinker = thinker->next) {
+                const mobj_t *m;
+                if (thinker->function.acp1 != (actionf_p1)P_MobjThinker) continue;
+                m = (const mobj_t *)thinker;
+                printf("DEMO-ACTOR %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d\n",
+                    gametic, m->type, m->x, m->y, m->z, (int)m->angle, m->momx, m->momy, m->momz,
+                    (int)m->flags, m->health, (int)(m->state - states), m->tics, m->sprite, m->frame,
+                    m->floorz, m->ceilingz, m->radius, m->height);
+            }
+        }
         gametic++;
     }
     if (at >= size) return 2;
