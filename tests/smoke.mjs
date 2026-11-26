@@ -881,6 +881,34 @@ map "Sliced call entry" {
     calls.step();
     assert.deepEqual(calls.logs.slice(-2), [[3308], ["host", 1700]], "direct dispatch preserves evaluated arguments");
 
+    const scratchArrays = build("deferred-array-default", writeSource("deferred-array-default", `
+func replacement() [128]int {
+    var rows [128]int
+    rows[127] = 13
+    return rows
+}
+
+func sample() int { return 19 }
+
+map "Deferred array default" {
+    screen at (0, 0) size (1, 1) with { style = "solid", slice = true }
+    tick {
+        var rows [128]int
+        if currentTick() != 0 { rows = replacement() } else { for range 4096 {} }
+        rows[7] = sample()
+        log(rows[7], rows[127])
+    }
+}
+`));
+    const scratchController = scratchArrays.data.find(tile => tile.payload?.includes("function* __tick()"));
+    assert.match(scratchController?.payload.toString() ?? "", /v\d+ \?\?= new Array\(128\)\.fill\(0\)/);
+    const scratchScene = simulator(scratchArrays.data);
+    scratchScene.step();
+    assert.deepEqual(scratchScene.logs, [], "the write suspends after resolving its array destination");
+    scratchScene.step();
+    scratchScene.step();
+    assert.deepEqual(scratchScene.logs, [[19, 0], [19, 13]], "lazy defaults and whole-array replacements retain their values");
+
     const bufferedMap = build("buffered-sliced-work", writeSource("buffered-sliced-work",
         slicedProgram.replace('key = "F" }', 'key = "F", buffer = true }')));
     const buffered = simulator(bufferedMap.data);

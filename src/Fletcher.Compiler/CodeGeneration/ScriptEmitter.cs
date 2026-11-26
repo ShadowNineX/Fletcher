@@ -79,9 +79,14 @@ internal sealed partial class ScriptEmitter(IrProgram program, bool splitTables 
         if (sliced)
         {
             AnalyzeOwnedArguments(reachable);
+            AnalyzeDeferredArrays(program.Tick);
+            AnalyzeDeferredArrays(program.HostTick);
             foreach (var function in reachable)
+            {
+                AnalyzeDeferredArrays(function.Body);
                 if (!BoundTree.HasLoopOrCall(function.Body) && CachedFileReadValue(function) is null)
                     directSlicedFunctions.Add(function);
+            }
             AnalyzeDirectDispatch(dispatches);
         }
         UsesMouse = BoundTree.UsesMouse(program.Tick) || bindings.Any(binding => BoundTree.UsesMouse(binding.Value)) ||
@@ -326,7 +331,8 @@ internal sealed partial class ScriptEmitter(IrProgram program, bool splitTables 
                 Line("}");
                 break;
             case BoundLocals { ResultSource: null, Symbols: [{ } local] } single:
-                Line($"{(single.IsNew[0] ? "let " : "")}{Name(local)} = {Copy(single.Values[0])};");
+                var initial = single.IsNew[0] && deferredArrays.ContainsKey(local) ? "null" : Copy(single.Values[0]);
+                Line($"{(single.IsNew[0] ? "let " : "")}{Name(local)} = {initial};");
                 break;
             case BoundLocals locals:
             {
@@ -343,7 +349,7 @@ internal sealed partial class ScriptEmitter(IrProgram program, bool splitTables 
                 when target is BoundVariable or BoundMember or BoundIndex { Receiver.Type.Shape.Kind: TypeKind.Array }:
                 // JavaScript resolves the destination before evaluating the
                 // RHS and retains that reference if the RHS suspends.
-                Line($"{Expr(target)} = {Copy(single.Values[0])};");
+                Line($"{(target is BoundVariable variable ? Name(variable.Symbol) : Expr(target))} = {Copy(single.Values[0])};");
                 break;
             case BoundAssignment assignment:
             {
@@ -509,7 +515,7 @@ internal sealed partial class ScriptEmitter(IrProgram program, bool splitTables 
         BoundSharedBytes shared => SharedFileReference(shared.Key),
         BoundLiteral { Value: ConstantArray array } => TableReference(array),
         BoundLiteral literal => Literal(literal.Value),
-        BoundVariable variable => Name(variable.Symbol),
+        BoundVariable variable => ReadVariable(variable.Symbol),
         BoundCurrentTick => sliced ? "(__logicalTick | 0)" : "(world.getTick() | 0)",
         BoundHostTimeMillis => "(Date.now() | 0)",
         BoundMousePosition mouse => MousePosition(mouse.Horizontal),
