@@ -87,6 +87,8 @@ const notes = tick >= 0 && frame?.t === tick ? frame.p?.notes : undefined;
 
 The codec reads raw and zlib v5 payloads and preserves unknown payload bytes when round-tripping tiles. The format stores up to 65,535 occupied chunks of 16 by 16 cells. Tile coordinates run from −524,272 to 524,287 on either axis. A script or message payload can contain up to 65,535 UTF-8 bytes including any format prefix. The Steam Level loader allows 16 MiB for the body after the three-byte v5 header and checks the same limit after expansion. Fletcher checks the actual encoded layout and packed imports, with no separate tile count cap. A 76,803-tile probe loaded and powered a lamp in its final chunk in Logic Arrows 20261112.
 
+`node tests/logic-arrows-level-limit-probe.mjs` generates two Levels independently of Fletcher. Each has 261 tiles, and both compressed bodies are 18,949 bytes. In the installed game, the 16,777,216-byte expanded Level opened and ran its signal check at Unlimited speed. The 16,777,217-byte Level showed a question mark and stayed in the map list when clicked.
+
 The Steam preview reader allows 20 chunks and 1 MiB. Fletcher crops the preview and omits script bodies. If other tile payloads would exceed the preview limit, the map card keeps their tile icons and the full Level keeps their data.
 
 REA verified these limits in the 20261112 Windows executable. Its Level and preview loaders call the v5 decoder at `0x1408F6030` with `0x1000000` and `0x100000` bytes, respectively. The preview loader also checks the 16-bit chunk count against 20.
