@@ -106,12 +106,15 @@ function stepUntilLogged(sim, keys, message) {
 
 function mechanismEdges(sim) {
     const edges = [];
-    let previous = sim.value(mechanism) ?? 0;
+    const voices = [mechanism, { x: mechanism.x - 4, y: mechanism.y }];
+    const previous = voices.map(voice => sim.value(voice) > 0);
     for (let host = 0; host < 100; host++) {
         sim.step();
-        const current = sim.value(mechanism) ?? 0;
-        if (previous <= 0 && current > 0) edges.push(host);
-        previous = current;
+        for (const [index, voice] of voices.entries()) {
+            const current = sim.value(voice) > 0;
+            if (!previous[index] && current) edges.push(host);
+            previous[index] = current;
+        }
     }
     return edges;
 }
@@ -121,7 +124,7 @@ try {
     const sim = build(entry, "E1M1", 1130);
     const music = sim.tileAt(mechanism), source = sim.tileAt({ x: mechanism.x, y: mechanism.y - 1 });
     assert.equal(music?.type, 29, "mechanism cue lane ends in a native Music Arrow");
-    assert.equal(source?.type, 16, "the mechanism cue is driven by a native AND gate");
+    assert.equal(source?.type, 8, "a native splitter drives the mechanism cue in one hop");
 
     stepUntilLogged(sim, [], "Classic WAD BSP frame rendered");
     stepUntilLogged(sim, [25], "Doom checkpoint saved");

@@ -65,7 +65,8 @@ func drawBorderStrip(flat wad.LumpRef, shade walls.WadShading, row int, first in
                 swatch = shade.Patterns.Second[index]
             } else { swatch = shade.Patterns.First[index] }
         } else { swatch = shade.Palette[index] }
-        pixel(x, row, true, swatch)
+        if DisplayUsesRgb { pixel(x, row, true, swatch, index)
+        } else { pixel(x, row, true, swatch) }
     }
 }
 

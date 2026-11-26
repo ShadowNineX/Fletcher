@@ -3,9 +3,39 @@
 
 package wad
 
+// One flat block keeps common texture directories one lookup deep. Entries
+// beyond the block still use their original WAD headers.
+const CachedTextureHeaders = 512
+
+type textureHeaderIndex interface {
+    HeaderAt(index int) textureHeader
+    ExtendHeaders(firstLump LumpRef, secondLump LumpRef, firstCount int, first int, end int) textureHeaders
+}
+
+type textureHeaders struct {
+    Entries [CachedTextureHeaders]textureHeader
+}
+
+func (headers textureHeaders) HeaderAt(index int) textureHeader { return headers.Entries[index] }
+
+func (headers textureHeaders) ExtendHeaders(firstLump LumpRef, secondLump LumpRef, firstCount int, first int, end int) textureHeaders {
+    for offset := range end - first {
+        index := first + offset
+        lump, local := firstLump, index
+        if index >= firstCount { lump, local = secondLump, index - firstCount }
+        headers.Entries[index] = readTextureHeader(lump, local)
+    }
+    return headers
+}
+
 func (set TextureSet) IndexKey(index int) indexKey {
     lump, local := set.First, index
     if index >= set.FirstCount { lump, local = set.Second, index - set.FirstCount }
+    if index >= 0 && index < CachedTextureHeaders && index < set.indexed {
+        header := set.textureHeaders.HeaderAt(index)
+        if header.Offset == 0 { return indexKey{} }
+        return indexKey{Name: normalizeName(lumpNameAt(lump.File, header.Offset)), Found: true}
+    }
     offset := textureOffset(lump, local)
     if offset < 0 { return indexKey{} }
     return indexKey{Name: normalizeName(lumpNameAt(lump.File, lump.Offset + offset)), Found: true}
@@ -15,17 +45,25 @@ func (set TextureSet) CanIndexNames() bit { return set.Valid }
 
 func (set TextureSet) NameIndexReady() bit { return set.Valid && set.indexed == TextureCount(set) }
 
-// BuildNameIndex processes up to batch definitions in their original order.
-// TextureIndex uses its forward scan while this index is being built.
+// Read the headers as each name batch is built. Textures keep their original
+// numeric indices, including malformed headers and duplicates.
 func (set TextureSet) BuildNameIndex(batch int) TextureSet {
     if !set.CanIndexNames() || set.NameIndexReady() || batch <= 0 { return set }
     count := TextureCount(set) - set.indexed
     if batch < count { count = batch }
     var names nameIndexRef = set.names
     if set.indexed == 0 { names = newNameIndex() }
+    first := set.indexed
+    if first < CachedTextureHeaders {
+        end := first + count
+        if end > CachedTextureHeaders { end = CachedTextureHeaders }
+        headers := set.textureHeaders
+        if first == 0 { headers = textureHeaders{} }
+        set.textureHeaders = headers.ExtendHeaders(set.First, set.Second, set.FirstCount, first, end)
+    }
+    set.indexed = first + count
     // Keep the first matching definition, including texture zero and a
     // named header whose dimensions will fail validation.
-    set.names = names.Extend(set, set.indexed, count, false)
-    set.indexed = set.indexed + count
+    set.names = names.Extend(set, first, count, false)
     return set
 }

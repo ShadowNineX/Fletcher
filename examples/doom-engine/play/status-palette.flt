@@ -11,6 +11,11 @@ const statusBonusRows = 4
 const statusRadiationRow = 13
 
 func StatusPalette(player PlayerInventory) int {
+    var blink bytes
+    return StatusPaletteWithBlink(player, blink)
+}
+
+func StatusPaletteWithBlink(player PlayerInventory, blink bytes) int {
     damage := player.DamageCount
     strength := player.Powers[PowerStrength]
     if strength != 0 {
@@ -28,6 +33,6 @@ func StatusPalette(player PlayerInventory) int {
         return statusBonusStart + row
     }
     ironFeet := player.Powers[PowerIronFeet]
-    if ironFeet > powerBlinkTics || ironFeet & 8 != 0 { return statusRadiationRow }
+    if powerColormapOn(ironFeet, blink) { return statusRadiationRow }
     return 0
 }

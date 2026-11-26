@@ -97,7 +97,7 @@ func magnitude(value int) int {
     return value
 }
 
-func drawScreenLine(window Window, line ScreenLine, shade color) {
+func drawScreenLine(window Window, line ScreenLine, shade color, index int) {
     dx := line.X2 - line.X1
     ax := 2 * magnitude(dx)
     sx := 1
@@ -110,7 +110,7 @@ func drawScreenLine(window Window, line ScreenLine, shade color) {
     if ax > ay {
         d := ay - ax / 2
         for range window.Width {
-            pixel(x, y, true, shade)
+            pixel(x, y, true, shade, index)
             if x == line.X2 { return }
             if d >= 0 { y, d = y + sy, d - ax }
             x, d = x + sx, d + ay
@@ -118,7 +118,7 @@ func drawScreenLine(window Window, line ScreenLine, shade color) {
     } else {
         d := ax - ay / 2
         for range window.Height {
-            pixel(x, y, true, shade)
+            pixel(x, y, true, shade, index)
             if y == line.Y2 { return }
             if d >= 0 { x, d = x + sx, d - ay }
             y, d = y + sy, d + ax
@@ -128,6 +128,10 @@ func drawScreenLine(window Window, line ScreenLine, shade color) {
 
 // DrawLine clips map-space endpoints then draws the exact Doom framebuffer path.
 func DrawLine(window Window, x1 int, y1 int, x2 int, y2 int, shade color) {
+    DrawIndexedLine(window, x1, y1, x2, y2, shade, -1)
+}
+
+func DrawIndexedLine(window Window, x1 int, y1 int, x2 int, y2 int, shade color, index int) {
     line := ClipLine(window, x1, y1, x2, y2)
-    if line.Valid { drawScreenLine(window, line, shade) }
+    if line.Valid { drawScreenLine(window, line, shade, index) }
 }

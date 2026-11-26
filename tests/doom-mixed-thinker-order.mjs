@@ -315,12 +315,13 @@ map "Mixed actor action, ceiling and missile" {
                 Base: base, Level: base, Specials: specials, MapActors: 1, Rules: play.CombatRules{Skill: 2}}
             scene.World.Players[0] = play.NewPlayerInventory(100)
             next saved = scene
-            // A damaged map actor counting down must still be seen by the
-            // map-thinker cursor and renderer. Its scream belongs to the next tic.
+            // A damaged map actor still counts down in the map-thinker cursor.
+            // Its sprite stays clean and its scream belongs to the next tic.
             screamer.Tics, screamer.Damaged = 2, true
             scene.World.Actors = actors.WithActor(2, screamer)
-            scene.MapActors, scene.LastSound = 2, 9
-            scene = tickPreviewActor(scene, blocks, 2, 0)
+            scene.MapActors, scene.FirstActive, scene.LastSound = 2, 2, 9
+            var passive play.PassiveActors
+            scene = tickPreviewMapActors(PreviewMapActorStep{Combat: scene}, blocks, 0, passive, 2, 3).Combat
             after := scene.World.Actors.ActorAt(1)
             log("countdown", scene.Failed, scene.Changed, scene.FirstActive, after.State == screamer.State,
                 after.Tics, scene.LastSound, scene.World.Random.GameplayIndex, scene.World.Random.MenuIndex)
@@ -344,7 +345,7 @@ map "Mixed actor action, ceiling and missile" {
     const sim = simulator(decode(JSON.parse(readFileSync(output, "utf8")).data), true);
     for (let host = 0; host < 10 && sim.logs.length < 3; host++) sim.step();
     const rows = Array.from(sim.logs, row => Array.from(row));
-    assert.deepEqual(rows.shift(), ["countdown", false, true, 2, true, 1, 9, 1, 7]);
+    assert.deepEqual(rows.shift(), ["countdown", false, false, 2, true, 1, 9, 1, 7]);
     return rows;
 }
 

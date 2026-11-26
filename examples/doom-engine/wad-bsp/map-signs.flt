@@ -1,0 +1,38 @@
+package main
+
+// Stock wall glyphs remain legible when inspecting a paused or running map.
+macro DoomSignLetter(x int, y int, letter string) {
+    place wall at (x, y) with { color = "white", glyph = letter }
+}
+
+macro DoomSignFive(x int, y int, a string, b string, c string, d string, e string) {
+    expand DoomSignLetter(x, y, a)
+    expand DoomSignLetter(x + 1, y, b)
+    expand DoomSignLetter(x + 2, y, c)
+    expand DoomSignLetter(x + 3, y, d)
+    expand DoomSignLetter(x + 4, y, e)
+}
+
+macro DoomMapSigns() {
+    // The controller and WAD storage share the cluster at the top left.
+    expand DoomSignFive(DisplayLeft - 10, DisplayTop - 16, "C", "O", "N", "T", "R")
+    expand DoomSignFive(DisplayLeft - 5, DisplayTop - 16, "O", "L", "L", "E", "R")
+    expand DoomSignFive(DisplayLeft + 16, DisplayTop - 10, "S", "C", "R", "E", "E")
+    expand DoomSignLetter(DisplayLeft + 21, DisplayTop - 10, "N")
+
+    expand DoomSignFive(-83, ControlRow + 20, "I", "N", "P", "U", "T")
+    expand DoomSignFive(-83, ControlRow + 25, "S", "O", "U", "N", "D")
+    expand DoomSignLetter(-77, ControlRow + 25, "F")
+    expand DoomSignLetter(-76, ControlRow + 25, "X")
+    expand DoomSignFive(98, ControlRow + 16, "M", "U", "S", "I", "C")
+
+    expand DoomSignFive(-Width / 2, ControlRow + 48, "L", "I", "G", "H", "T")
+    expand DoomSignFive(-Width / 2 + 6, ControlRow + 48, "T", "A", "B", "L", "E")
+    expand DoomSignFive(192, ControlRow + 66, "F", "O", "R", "W", "A")
+    expand DoomSignLetter(197, ControlRow + 66, "R")
+    expand DoomSignLetter(198, ControlRow + 66, "D")
+    expand DoomSignFive(292, ControlRow + 66, "S", "I", "D", "E", " ")
+    expand DoomSignFive(297, ControlRow + 66, "T", "U", "R", "N", " ")
+    expand DoomSignFive(-550, ControlRow + 68, "P", "O", "W", "E", "R")
+    expand DoomSignFive(-544, ControlRow + 68, "B", "L", "I", "N", "K")
+}

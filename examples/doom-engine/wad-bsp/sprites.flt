@@ -31,13 +31,22 @@ type PreviewSprites struct {
     Count int
 }
 
-func cachePreviewSprites(mounts wad.Archives, actors play.MapActors, result PreviewSprites) PreviewSprites {
+func uncachedActorSprite(actor play.LevelActor, attempted [PreviewSpriteSlots]bit) int {
+    key := actor.Sprite
+    if actor.Valid && actor.Physics.Body.Flags & play.ActorNoSector == 0 &&
+        key >= 0 && key < PreviewSpriteSlots && !attempted[key] { return key }
+    return -1
+}
+
+func cachePreviewSprites(mounts wad.Archives, actors play.MapActors, result PreviewSprites) (PreviewSprites, bit) {
+    changed := false
+    player := actors.PlayerActors[0]
     for i := range actors.Count {
-        actor := actors.ActorAt(i)
-        key := actor.Sprite
-        if actor.Valid && i + 1 != actors.PlayerActors[0] && actor.Physics.Body.Flags & play.ActorNoSector == 0 &&
-            key >= 0 && key < PreviewSpriteSlots && !result.Attempted[key] {
+        key := -1
+        if i + 1 != player { key = uncachedActorSprite(actors.ActorAt(i), result.Attempted) }
+        if key >= 0 {
             result.Attempted[key] = true
+            changed = true
             name := actorinfo.SpriteNameLow(key)
             if name != 0 {
                 sprite := wad.LoadSprite(mounts, wad.LumpName{Low: name})
@@ -49,21 +58,25 @@ func cachePreviewSprites(mounts wad.Archives, actors play.MapActors, result Prev
             }
         }
     }
-    return result
+    return result, changed
 }
 
 type SpritePass struct {
-    Visible sprites.VisibleSprites
-    Visited play.PagedSlots<int>
+    Sprites SectorSprites
     Mapped MappedLines
     Columns walls.ColumnCache
     Geometry RenderGeometry
 }
 
+type SectorSprites struct {
+    Visible sprites.VisibleSprites
+    Visited play.PagedSlots<int>
+}
+
 // R_AddSprites visits a sector only once, even when several visible BSP
 // subsectors share it. Each nonempty list head uniquely identifies its sector
 // for this frame.
-func addSectorSprites(scene Scene, pass SpritePass, sector int, heights engine.SectorHeights, light int) SpritePass {
+func addSectorSprites(scene Scene, pass SectorSprites, sector int, heights engine.SectorHeights, light int) SectorSprites {
     if scene.ActorSprites.Count == 0 { return pass }
     handle := scene.ActorLinks.SectorFirst(sector)
     if handle == 0 { return pass }

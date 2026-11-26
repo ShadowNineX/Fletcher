@@ -25,6 +25,48 @@ type AnimationSet struct {
     Count int
 }
 
+const indexedAnimationLimit = 512
+const animationIndexWords = indexedAnimationLimit / 32
+
+// FrameAnimations records which resource indices can be animated.
+// The range list still resolves animated indices and indices beyond the mask.
+type FrameAnimations struct {
+    cycles AnimationSet
+    flats [animationIndexWords]bits<32>
+    textures [animationIndexWords]bits<32>
+}
+
+func IndexFrameAnimations(cycles AnimationSet) FrameAnimations {
+    result := FrameAnimations{cycles: cycles}
+    for id := range cycles.Count {
+        cycle := cycles.Ranges[id]
+        first, last := cycle.Base, cycle.Last
+        if first < 0 { first = 0 }
+        if last >= indexedAnimationLimit { last = indexedAnimationLimit - 1 }
+        for offset := range last - first + 1 {
+            index := first + offset
+            word := index >> 5
+            mask := bits<32>(1) << (index & 31)
+            if cycle.Texture {
+                result.textures[word] = result.textures[word] | mask
+            } else { result.flats[word] = result.flats[word] | mask }
+        }
+    }
+    return result
+}
+
+func (animations FrameAnimations) Active() bit { return animations.cycles.Count > 0 }
+
+func (animations FrameAnimations) TextureFrame(index int, tic int) int {
+    if index >= 0 && index < indexedAnimationLimit && !animations.textures[index >> 5][index & 31] { return index }
+    return AnimatedTextureIndex(animations.cycles, index, tic)
+}
+
+func (animations FrameAnimations) FlatFrame(index int, tic int) int {
+    if index >= 0 && index < indexedAnimationLimit && !animations.flats[index >> 5][index & 31] { return index }
+    return AnimatedFlatIndex(animations.cycles, index, tic)
+}
+
 const BuiltinFlatCount = 9
 const AnimationEndpointCount = BuiltinAnimationCount * 2
 

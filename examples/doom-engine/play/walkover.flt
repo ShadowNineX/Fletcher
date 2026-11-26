@@ -19,7 +19,7 @@ type WalkoverMetadata struct {
     RespawnMonsters bit
     Cues bits<8>
     LastSound int
-    WeaponSound int
+    WeaponRequests bits<16>
     Changed bit
 }
 

@@ -7,8 +7,8 @@ package engine
 
 const InlineVisplaneCount = 128
 const VisplaneWords = 10
-const visplaneColumnWords = InlineVisplaneCount * VisplaneWords
 const visplaneBuckets = 128
+const inlineRasterWords = InlineVisplaneCount / 32
 
 // TextureLow and TextureHigh are an exact eight-byte WAD flat name. Sky
 // planes retain that name while normalizing height and light.
@@ -29,10 +29,17 @@ type Visplane struct {
 }
 
 type VisplaneRaster struct {
+    // Set where the original plane's top[] is no longer the sentinel.
     Words [VisplaneWords]bits<32>
     Rows PlaneColumnBuffer
     HasRows bit
 }
+
+type visplaneRasterRef interface {
+    ReadRaster() VisplaneRaster
+}
+
+func (raster VisplaneRaster) ReadRaster() VisplaneRaster { return raster }
 
 type overflowVisplane struct {
     plane Visplane
@@ -83,10 +90,11 @@ func (keys visplaneKeys) WithPlane(index int, key PlaneKey, bucket int, previous
 
 type Visplanes struct {
     keys visplaneKeysRef
-    minColumn [InlineVisplaneCount]int
-    maxColumn [InlineVisplaneCount]int
-    // Set where the original plane's top[] is no longer the sentinel.
-    ColumnWords [visplaneColumnWords]bits<32>
+    // The inclusive right edge is signed so the empty range keeps Max = -1.
+    columns [InlineVisplaneCount]bits<32>
+    // Copies of the plane directory share rasters until a wall updates one.
+    rasters [InlineVisplaneCount]visplaneRasterRef
+    hasRaster [inlineRasterWords]bits<32>
     overflow PagedSlots<overflowVisplane>
     Count int
     Failed bit
@@ -113,19 +121,27 @@ func planeKeyBucket(key PlaneKey) int {
 func (state Visplanes) PlaneAt(index int) Visplane {
     if index >= InlineVisplaneCount { return state.overflow.At(index - InlineVisplaneCount).plane }
     if state.Count == 0 { return Visplane{} }
+    bounds := state.columns[index]
     return Visplane{Key: state.keys.KeyAt(index),
-        Min: state.minColumn[index], Max: state.maxColumn[index]}
+        Min: int(bounds >> 16), Max: int(bounds << 16) >> 16}
 }
 
-func (state Visplanes) OverflowRasterAt(index int) VisplaneRaster {
-    return state.overflow.At(index - InlineVisplaneCount).raster
+func (state Visplanes) RasterAt(index int) VisplaneRaster {
+    if index >= InlineVisplaneCount { return state.overflow.At(index - InlineVisplaneCount).raster }
+    if state.hasRaster[index >> 5][index & 31] { return state.rasters[index].ReadRaster() }
+    return VisplaneRaster{}
 }
 
-func (state Visplanes) WithOverflowRaster(index int, raster VisplaneRaster) Visplanes {
-    slot := index - InlineVisplaneCount
-    entry := state.overflow.At(slot)
-    entry.raster = raster
-    state.overflow = state.overflow.With(slot, entry)
+func (state Visplanes) WithRaster(index int, raster VisplaneRaster) Visplanes {
+    if index < InlineVisplaneCount {
+        state.rasters[index] = raster
+        state.hasRaster[index >> 5][index & 31] = true
+    } else {
+        slot := index - InlineVisplaneCount
+        entry := state.overflow.At(slot)
+        entry.raster = raster
+        state.overflow = state.overflow.With(slot, entry)
+    }
     return state
 }
 
@@ -135,13 +151,10 @@ func validPlaneRange(start int, end int) bit {
 
 func PlaneColumnUsed(state Visplanes, index int, column int) bit {
     if state.Failed || index < 0 || index >= state.Count || column < 0 || column >= MaxViewWidth { return false }
-    if index >= InlineVisplaneCount {
-        return state.OverflowRasterAt(index).Words[column >> 5][column & 31]
-    }
-    return state.ColumnWords[index * VisplaneWords + (column >> 5)][column & 31]
+    return state.RasterAt(index).Words[column >> 5][column & 31]
 }
 
-func newVisplane(state Visplanes, key PlaneKey, start int, end int, bucket int) PlaneResult {
+func newVisplane(state Visplanes, key PlaneKey, start int, end int, bucket int) (Visplanes, int) {
     index := state.Count
     state.Count = state.Count + 1
     keys := state.keys
@@ -152,12 +165,12 @@ func newVisplane(state Visplanes, key PlaneKey, start int, end int, bucket int) 
         state.keys = keys.WithPlane(index, key, bucket, previous)
     }
     if index < InlineVisplaneCount {
-        state.minColumn[index], state.maxColumn[index] = start, end - 1
+        state.columns[index] = (bits<32>(start) << 16) | bits<32>((end - 1) & 0xffff)
     } else {
         state.overflow = state.overflow.With(index - InlineVisplaneCount,
             overflowVisplane{plane: Visplane{Key: key, Min: start, Max: end - 1}, previousKey: previous})
     }
-    return PlaneResult{State: state, Index: index, Split: bucket < 0}
+    return state, index
 }
 
 func findPlaneIndex(state Visplanes, key PlaneKey, bucket int) int {
@@ -190,16 +203,23 @@ func FindPlane(state Visplanes, key PlaneKey) PlaneResult {
     key = normalizedPlaneKey(key)
     bucket := planeKeyBucket(key)
     index := findPlaneIndex(state, key, bucket)
-    if index >= 0 { return PlaneResult{State: state, Index: index} }
-    return newVisplane(state, key, MaxViewWidth, 0, bucket)
+    if index < 0 { state, index = newVisplane(state, key, MaxViewWidth, 0, bucket) }
+    return PlaneResult{State: state, Index: index}
 }
 
 // CheckPlane expands an unoccupied overlap or allocates a duplicate plane.
 // start and end are half-open Fletcher column bounds.
 func CheckPlane(state Visplanes, index int, start int, end int) PlaneResult {
+    checked, selected := CheckPlaneRange(state, index, start, end)
+    if selected < 0 { checked.Failed = true }
+    return PlaneResult{State: checked, Index: selected, Split: selected >= 0 && selected != index}
+}
+
+// Return the directory directly so a caller replacing its current snapshot
+// can reuse its storage. An invalid range leaves the directory untouched.
+func CheckPlaneRange(state Visplanes, index int, start int, end int) (Visplanes, int) {
     if state.Failed || index < 0 || index >= state.Count || !validPlaneRange(start, end) {
-        state.Failed = true
-        return PlaneResult{State: state, Index: -1}
+        return state, -1
     }
     var entry overflowVisplane
     var first int
@@ -209,7 +229,8 @@ func CheckPlane(state Visplanes, index int, start int, end int) PlaneResult {
         entry = state.overflow.At(index - InlineVisplaneCount)
         first, last = entry.plane.Min, entry.plane.Max
     } else {
-        first, last = state.minColumn[index], state.maxColumn[index]
+        bounds := state.columns[index]
+        first, last = int(bounds >> 16), int(bounds << 16) >> 16
     }
     overlapStart, unionStart := start, first
     if start < first {
@@ -222,14 +243,14 @@ func CheckPlane(state Visplanes, index int, start int, end int) PlaneResult {
     }
     if overlapStart <= overlapEnd {
         overlap := ColumnSpan{First: overlapStart, End: overlapEnd + 1}
-        base := index * VisplaneWords
+        var words [VisplaneWords]bits<32>
+        if spilled { words = entry.raster.Words } else { words = state.RasterAt(index).Words }
         firstWord, lastWord := overlap.First >> 5, (overlap.End - 1) >> 5
         for offset := range lastWord - firstWord + 1 {
             word := firstWord + offset
-            var occupied bits<32>
-            if spilled { occupied = entry.raster.Words[word] } else { occupied = state.ColumnWords[base + word] }
-            if occupied & spanMask(overlap, word) != 0 {
-                return newVisplane(state, state.PlaneAt(index).Key, start, end, -1)
+            if words[word] & spanMask(overlap, word) != 0 {
+                state, index = newVisplane(state, state.PlaneAt(index).Key, start, end, -1)
+                return state, index
             }
         }
     }
@@ -237,9 +258,9 @@ func CheckPlane(state Visplanes, index int, start int, end int) PlaneResult {
         entry.plane.Min, entry.plane.Max = unionStart, unionEnd
         state.overflow = state.overflow.With(index - InlineVisplaneCount, entry)
     } else {
-        state.minColumn[index], state.maxColumn[index] = unionStart, unionEnd
+        state.columns[index] = (bits<32>(unionStart) << 16) | bits<32>(unionEnd)
     }
-    return PlaneResult{State: state, Index: index}
+    return state, index
 }
 
 // MarkPlaneColumns models top[x] becoming non-sentinel after the wall loop.
@@ -250,19 +271,11 @@ func MarkPlaneColumns(state Visplanes, index int, start int, end int) Visplanes 
         return state
     }
     span := ColumnSpan{First: start, End: end}
-    base := index * VisplaneWords
     firstWord, lastWord := start >> 5, (end - 1) >> 5
-    if index >= InlineVisplaneCount {
-        raster := state.OverflowRasterAt(index)
-        for offset := range lastWord - firstWord + 1 {
-            word := firstWord + offset
-            raster.Words[word] = raster.Words[word] | spanMask(span, word)
-        }
-        return state.WithOverflowRaster(index, raster)
-    }
+    raster := state.RasterAt(index)
     for offset := range lastWord - firstWord + 1 {
         word := firstWord + offset
-        state.ColumnWords[base + word] = state.ColumnWords[base + word] | spanMask(span, word)
+        raster.Words[word] = raster.Words[word] | spanMask(span, word)
     }
-    return state
+    return state.WithRaster(index, raster)
 }

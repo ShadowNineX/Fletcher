@@ -40,6 +40,7 @@ function fixture() {
     // Both names decode to FLAT. The original renderer still compares all eight bytes.
     sectors.write("FLAT\0A", 4);
     sectors.write("FLAT\0B", 56);
+    sectors.write("f_sKy1\0X", 12);
     const segs = Buffer.alloc(2 * 12);
     segs.writeUInt16LE(3, 2);
     segs.writeUInt16LE(2, 6);
@@ -57,12 +58,14 @@ const Source = readFile("LINES.BIN")
 
 type LiveGeometry struct { Marker int }
 func (change LiveGeometry) ReadHeights(sector int, original engine.SectorHeights) engine.SectorHeights {
+    if sector == 0 { original.Floor, original.Ceiling = 16 << 16, 112 << 16 }
     if sector == 2 { original.Ceiling = 80 << 16 }
     return original
 }
 func (change LiveGeometry) ReadLineAction(index int, original int) int { return original }
 func (change LiveGeometry) ReadSectorSpecial(index int, original int) int { return original }
 func (change LiveGeometry) ReadFloorName(index int, original wad.LumpName) wad.LumpName {
+    if index == 0 { return wad.LumpName{Low: 0x74616c66, High: 50} } // flat2
     if index == 2 { return wad.LumpName{Low: 88} }
     return original
 }
@@ -109,6 +112,12 @@ map "Doom collision line parity" {
             refreshed := live.SegmentAt(0)
             log(refreshed, cached.ReadWall(live), live.MaterialAt(refreshed), cached.ReadWallMaterial(live))
             log(cached.ReadWall(level), cached.ReadWallMaterial(level), level.CacheWallAt(1).Base.Valid)
+            floor, ceiling := cached.ReadPlaneKeys(level, original)
+            log(level.PlaneKey(original, false), floor, level.PlaneKey(original, true), ceiling)
+            lit := refreshed
+            lit.Light = 171
+            floor, ceiling = cached.ReadPlaneKeys(live, lit)
+            log(live.PlaneKey(lit, false), floor, live.PlaneKey(lit, true), ceiling)
         }
     }
 }
@@ -142,6 +151,12 @@ try {
     assert.equal(logs[6][0].Back.Ceiling, 80 << 16);
     assert.equal(logs[6][3].OffsetU, 18 << 16);
     assert.deepEqual(logs[7], [logs[5][0], logs[5][2], false], "live changes leave the cached base intact");
+    for (const [directFloor, cachedFloor, directCeiling, cachedCeiling] of logs.slice(8, 10)) {
+        assert.deepEqual(cachedFloor, directFloor, "cached floor names follow live height, light and floor transfers");
+        assert.deepEqual(cachedCeiling, directCeiling, "cached sky names use live height and omit sector light");
+    }
+    assert.deepEqual(logs[9][1], { Height: 16 << 16, Light: 171, TextureLow: 0x54414c46, TextureHigh: 50, Sky: false });
+    assert.deepEqual(logs[9][3], { Height: 112 << 16, Light: 0, TextureLow: 0x4b535f46, TextureHigh: 0x3159, Sky: true });
     console.log("Doom collision lines and cached SEG geometry passed raw names, live sector changes, sidedef overrides, and invalid references.");
 } finally {
     assert.match(path.relative(temp, realpathSync(scratch)), /^fletcher-doom-lines-[^/\\]+$/);

@@ -50,8 +50,14 @@ func (wall MaskedWall) DrawMask(first int, end int, drawn [engine.CoverageWords]
     var columns wad.TextureColumns
     var lightRows bytes
     var lightBase int
+    var post wad.PostSource
+    var texture wad.TextureColumn
+    previousColumn := -1
     prepared := false
     center := run.Height / 2
+    // The whole masked range uses the same shading tables. Keep them in
+    // one raster value and update only the fields that depend on the column.
+    raster := PostRaster{Mid: wall.Tier.Middle, Center: center, Shade: wall.Shade}
     for offset := range end - first {
         x := first + offset
         word, bitIndex := x / 32, x % 32
@@ -73,25 +79,30 @@ func (wall MaskedWall) DrawMask(first int, end int, drawn [engine.CoverageWords]
                         row = int(lightRows[lightBase + index])
                     } else { row = engine.WallLightRow(wall.Light, wall.ExtraLight, scale, run.Width, wall.Shade.DetailShift) }
                 }
-                raster := PostRaster{Scale: scale, TopScreen: (center << 16) - cport.C_FixedMul(wall.Tier.Middle, scale),
-                    Mid: wall.Tier.Middle, Inverse: int(bits<32>(0xffffffff) / bits<32>(scale)), Center: center,
-                    LightBase: wall.Shade.ColorMaps.Offset + row * wad.ColorMapBytes, Shade: wall.Shade}
-                column := run.Columns[x]
-                var post wad.PostSource
-                if columns.Sheet.Valid {
-                    post = wad.TextureSheetPostSource(columns.Sheet, column & columns.Mask)
-                } else {
-                    texture := columns.ColumnAt(column)
-                    if texture.Valid && texture.Direct {
-                        post = wad.PatchPostSource(texture.DirectPatch, texture.DirectSourceColumn)
-                    } else if texture.Valid {
-                        // Overlapping patches use the bounded transparent composite cache.
-                        drawCompositeMask(raster, texture, x, clip)
+                raster.Scale = scale
+                raster.TopScreen = (center << 16) - cport.C_FixedMul(raster.Mid, scale)
+                raster.Inverse = int(bits<32>(0xffffffff) / bits<32>(scale))
+                raster.LightBase = wall.Shade.ColorMaps.Offset + row * wad.ColorMapBytes
+                // Magnified spans can share one wrapped source across several
+                // screen columns. Its posts and coverage are unlit.
+                column := run.Columns[x] & columns.Mask
+                if column != previousColumn {
+                    previousColumn = column
+                    if columns.Sheet.Valid {
+                        post = wad.TextureSheetPostSource(columns.Sheet, column)
+                    } else {
+                        texture = columns.ColumnAt(column)
+                        post = wad.PostSource{}
+                        if texture.Valid && texture.Direct {
+                            post = wad.PatchPostSource(texture.DirectPatch, texture.DirectSourceColumn)
+                        }
                     }
                 }
                 if post.Valid {
                     raster.Patch = post.Patch
                     drawPostColumn(raster, post.Offset, x, clip, 0)
+                } else if texture.Valid && !texture.Direct {
+                    drawCompositeMask(raster, texture, x, clip)
                 }
             }
         }

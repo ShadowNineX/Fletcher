@@ -14,33 +14,58 @@ const cueMechanism bits<8> = 16
 const cueImpact bits<8> = 32
 const cueStage bits<8> = 64
 const cueDenied bits<8> = 128
+
+// The menu chooses a sound by the game tic, then Logic Arrows plays the
+// corresponding synthesized cue on the existing physical audio bank.
+const episodeQuitSounds = [8]int{57, 26, 27, 31, 35, 36, 38, 52}
+const commercialQuitSounds = [8]int{80, 93, 95, 31, 56, 72, 78, 52}
+
+func previewQuitCue(commercial bit, gameTic int) bits<8> {
+    index := (gameTic >> 2) & 7
+    if commercial { return previewSoundCue(commercialQuitSounds[index]) }
+    return previewSoundCue(episodeQuitSounds[index])
+}
 const previewSoundVolume = 15
 
 func packMusicArrowTone(instrument int, octave int, note int) bits<12> {
     return bits<12>(instrument * 128 + octave * 16 + note)
 }
 
-// Synthesized presets for the weapon sounds the state machine requests.
-// Instrument, octave and note use the same packet layout as the MUS voices.
-func weaponCueTone(sound int) bits<12> {
+// Lanes correspond to the pre-tuned Music Arrows in WeaponCueBank.
+func weaponCueLane(sound int) int {
     switch sound {
-    case actorinfo.SoundShotgun: return packMusicArrowTone(3, 3, 7)
-    case actorinfo.SoundSuperShotgun: return packMusicArrowTone(3, 2, 11)
-    case 3: return packMusicArrowTone(18, 5, 1) // Shotgun cock.
-    case actorinfo.SoundShotgunOpen: return packMusicArrowTone(18, 4, 9)
-    case actorinfo.SoundShotgunLoad: return packMusicArrowTone(18, 4, 11)
-    case actorinfo.SoundShotgunClose: return packMusicArrowTone(18, 5, 0)
-    case 8: return packMusicArrowTone(19, 5, 7) // Plasma.
-    case actorinfo.SoundBfg: return packMusicArrowTone(21, 3, 4)
-    case actorinfo.SoundSawUp: return packMusicArrowTone(21, 3, 9)
-    case actorinfo.SoundSawIdle: return packMusicArrowTone(21, 2, 7)
-    case actorinfo.SoundSawMiss: return packMusicArrowTone(21, 3, 7)
-    case actorinfo.SoundSawHit: return packMusicArrowTone(21, 2, 11)
-    case 14: return packMusicArrowTone(18, 2, 7) // Rocket launch.
-    case actorinfo.SoundPunch: return packMusicArrowTone(3, 3, 0)
-    case audio.SoundChaingun: return packMusicArrowTone(3, 4, 1)
-    default: return packMusicArrowTone(3, 4, 0) // Pistol.
+    case actorinfo.SoundShotgun: return 1
+    case actorinfo.SoundSuperShotgun: return 2
+    case 3: return 3 // Shotgun cock.
+    case actorinfo.SoundShotgunOpen: return 4
+    case actorinfo.SoundShotgunLoad: return 5
+    case actorinfo.SoundShotgunClose: return 6
+    case 8: return 7 // Plasma.
+    case actorinfo.SoundBfg: return 8
+    case actorinfo.SoundSawUp: return 9
+    case actorinfo.SoundSawIdle: return 10
+    case actorinfo.SoundSawMiss: return 11
+    case actorinfo.SoundSawHit: return 12
+    case 14: return 13 // Rocket launch.
+    case actorinfo.SoundPunch: return 14
+    case audio.SoundChaingun: return 15
+    default: return 0 // Pistol.
     }
+}
+
+func weaponCueRequest(sound int) bits<16> {
+    return bits<16>(1) << weaponCueLane(sound)
+}
+
+func menuCueRequest(sound int) bits<28> {
+    switch sound {
+    case play.CampaignMenuSoundCursor: return 1 << 23
+    case play.CampaignMenuSoundAdjust: return 1 << 24
+    case play.CampaignMenuSoundBack: return 1 << 25
+    case play.CampaignMenuSoundClose: return 1 << 26
+    case play.CampaignMenuSoundSelect: return 1 << 27
+    }
+    return 0
 }
 
 // Convert vanilla sound IDs into short notes the native Music Arrows can
@@ -125,32 +150,3 @@ func previewMoverCues(level wad.BspLevel, listener play.ActorPhysics, bounds pla
     }
     return cues
 }
-
-// Each Source taps the lamp two rows above it. A change in the bus bit
-// represents one committed cue. Give the Music Arrow an off tick between
-// consecutive pulses so it receives two distinct onsets.
-const musicCueSource = "const { x, y } = getPosition();\n" +
-    "always(() => {\n" +
-    "    const phase = world.getSignal(x, y - 2) > 0;\n" +
-    "    if (phase !== !!state.previousPhase) {\n" +
-    "        state.pending = true;\n" +
-    "        if (x === -56) {\n" +
-    "            let packet = 0;\n" +
-    "            for (let bit = 0; bit < 12; bit++) {\n" +
-    "                if (world.getSignal(x + 8 * bit, y + 6) > 0) packet |= 1 << bit;\n" +
-    "            }\n" +
-    "            state.pendingExtra = ((packet >> 7) << 8) | (packet & 127);\n" +
-    "        }\n" +
-    "    }\n" +
-    "    state.previousPhase = phase;\n" +
-    "    const pulse = !!state.pending && !state.lastPulse;\n" +
-    "    if (pulse) {\n" +
-    "        state.pending = false;\n" +
-    "        if (x === -56 && state.pendingExtra !== state.extra) {\n" +
-    "            world.setArrow(x + 1, y, 29, 1, false, state.pendingExtra);\n" +
-    "            state.extra = state.pendingExtra;\n" +
-    "        }\n" +
-    "    }\n" +
-    "    state.lastPulse = pulse;\n" +
-    "    world.setSignal(x, y, pulse ? 1 : 0);\n" +
-    "});"

@@ -1,0 +1,64 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Page and demo order from D_DoAdvanceDemo in linuxdoom-1.10/d_main.c.
+
+package main
+
+import "audio"
+import "play"
+import "wad"
+import "walls"
+
+type PreviewAttract struct {
+    Stage int
+    Commercial bit
+    Retail bit
+    Page wad.LumpName
+    PageTics int
+    Music int
+    Demo play.DoomDemo
+    Marker int
+    Ready bit
+}
+
+func openAttract(mounts wad.Archives, commercial bit) PreviewAttract {
+    retail := !commercial && mounts.Find(wad.LumpName{Low: 0x314d3445}).Valid
+    return advanceAttract(mounts, PreviewAttract{Commercial: commercial, Retail: retail})
+}
+
+func advanceAttract(mounts wad.Archives, previous PreviewAttract) PreviewAttract {
+    stage := previous.Stage + 1
+    if stage > 7 || (stage == 7 && !previous.Retail) { stage = 1 }
+    nextStage := PreviewAttract{Stage: stage, Commercial: previous.Commercial, Retail: previous.Retail, Marker: -1}
+    if stage == 1 || (stage == 5 && previous.Commercial) {
+        nextStage.Page, nextStage.PageTics, nextStage.Music = titleMenuName(), 170, audio.MusicEpisodeTitle
+        if previous.Commercial { nextStage.PageTics, nextStage.Music = 385, audio.MusicCommercialTitle }
+    } else if stage == 3 || stage == 5 {
+        nextStage.Page, nextStage.PageTics = wad.LumpName{Low: 0x44455243, High: 0x5449}, 200 // CREDIT
+        if stage == 5 && !previous.Retail { nextStage.Page = wad.LumpName{Low: 0x504c4548, High: 50} } // HELP2
+    } else {
+        demoNumber := stage / 2
+        if stage == 7 { demoNumber = 4 }
+        demo := play.OpenDoomDemo(mounts.Find(wad.LumpName{Low: 0x4f4d4544, High: 48 + demoNumber}))
+        if demo.Valid {
+            name := wad.LumpName{Low: 0x004d0045 | ((48 + demo.Episode) << 8) | ((48 + demo.Map) << 24)}
+            if previous.Commercial {
+                name = wad.LumpName{Low: 0x50414d | ((48 + demo.Map / 10) << 24), High: 48 + demo.Map % 10}
+            }
+            lump := mounts.Find(name)
+            if lump.Valid && lump.Entry >= 0 && lump.Size == 0 {
+                nextStage.Demo, nextStage.Marker = demo, lump.Entry
+            }
+        }
+    }
+    return nextStage
+}
+
+func drawAttractPage(mounts wad.Archives, shade walls.WadShading, name wad.LumpName, gamma int) bit {
+    page := readIntermissionPatch(mounts, name)
+    if !fullPageMenuPatch(page) { return false }
+    pageShade := shade.WithPalette(0).WithGamma(gamma)
+    useDisplayPalette(pageShade)
+    drawIntermissionPatch(page, pageShade, 0, 0)
+    return true
+}

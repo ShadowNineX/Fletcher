@@ -7,7 +7,8 @@ package walls
 import "engine"
 import "wad"
 
-const ColumnCacheSlots = 128
+// This cache covers one clipped run. The frame cache retains columns across runs.
+const ColumnCacheSlots = 32
 
 type WallTier struct {
     Texture wad.TextureDef
@@ -30,7 +31,6 @@ type WallMaterials struct {
     OffsetU int
     Light int
     ExtraLight int
-    Shade WadShading
     Textured bit
 }
 
@@ -40,15 +40,15 @@ func resolveWallTexture(materials Materials, name wad.LumpName) WallTextureFrame
     index := wad.TextureIndex(materials.Textures, name)
     texture := wad.TextureAt(materials.Textures, index)
     result := WallTextureFrame{Texture: texture, OriginalHeight: texture.Height}
-    if texture.Valid && materials.Animations.Count > 0 && materials.LevelTime >= 0 {
-        frame := wad.AnimatedTextureIndex(materials.Animations, index, materials.LevelTime)
+    if texture.Valid && materials.LevelTime >= 0 {
+        frame := materials.Animations.TextureFrame(index, materials.LevelTime)
         if frame != index { result.Texture = wad.TextureAt(materials.Textures, frame) }
     }
     return result
 }
 
 func ResolveWallMaterials(materials Materials, wall wad.WallSegment, sidedef wad.SideMaterial, eye int) WallMaterials {
-    result := WallMaterials{OffsetU: sidedef.OffsetU, Light: wall.Light, ExtraLight: materials.ExtraLight, Shade: materials.Shade}
+    result := WallMaterials{OffsetU: sidedef.OffsetU, Light: wall.Light, ExtraLight: materials.ExtraLight}
     if wall.First.Y == wall.Last.Y {
         result.ExtraLight = result.ExtraLight - 1
     } else if wall.First.X == wall.Last.X {
@@ -98,6 +98,7 @@ func ResolveWallMaterials(materials Materials, wall wad.WallSegment, sidedef wad
 
 type TextureColumnRef interface {
     ReadColumn() wad.TextureColumn
+    DrawRows(shading WadShading, x int, first int, end int, fraction int, step int, light int, fallback color)
 }
 
 type CachedTextureColumn struct {
@@ -105,6 +106,13 @@ type CachedTextureColumn struct {
 }
 
 func (entry CachedTextureColumn) ReadColumn() wad.TextureColumn { return entry.Data }
+
+// The sampler reads the boxed column in place. ReadColumn returns a copy for
+// callers that need the column as a Fletcher value.
+func (entry CachedTextureColumn) DrawRows(shading WadShading, x int, first int, end int, fraction int, step int,
+    light int, fallback color) {
+    drawTextureRows(entry.Data, shading, x, first, end, fraction, step, light, fallback)
+}
 
 type textureColumnSource interface {
     ColumnAt(column int) wad.TextureColumn
@@ -126,6 +134,25 @@ func drawTextureRows(column wad.TextureColumn, shading WadShading, x int, first 
     detailShift := shading.DetailShift
     x = shading.ScreenX + (x << detailShift)
     screenTop := shading.ScreenY + first
+    if column.DirectRaw && detailShift == 0 && !shading.Dithered {
+        previousRow, index := -1, -1
+        swatch := fallback
+        for dy := range end - first {
+            row := (fraction >> 16) & 127
+            if row != previousRow {
+                previousRow = row
+                if row < column.Height {
+                    source := int(patch[column.DirectOffset + row])
+                    mapped := maps[table + source]
+                    index = int(mapped)
+                    swatch = shading.Palette[int(mapped)]
+                } else { swatch, index = fallback, -1 }
+            }
+            pixel(x, screenTop + dy, true, swatch, index)
+            fraction = fraction + step
+        }
+        return
+    }
     patternColumn, nextPatternColumn := x & 3, (x + 1) & 3
     dithered := shading.Dithered
     // A missing row breaks the run of indexed pixels. Matching source
@@ -176,8 +203,8 @@ func drawTextureRows(column wad.TextureColumn, shading WadShading, x int, first 
     }
 }
 
-func drawTextureRun(run WallTextureRun, tier WallTier, materials WallMaterials, rows [engine.MaxViewWidth]bits<32>,
-    fallback color, cache ColumnCache) ColumnCache {
+func drawTextureRun(run WallTextureRun, tier WallTier, shading WadShading, sectorLight int, extraLight int,
+    rows [engine.MaxViewWidth]bits<32>, band engine.ColumnSpan, fallback color, cache ColumnCache) ColumnCache {
     var cached [ColumnCacheSlots]TextureColumnRef
     var keys [ColumnCacheSlots]int
     var columns textureColumnSource
@@ -186,10 +213,10 @@ func drawTextureRun(run WallTextureRun, tier WallTier, materials WallMaterials, 
     lastScale, step, light := 0, 0, 0
     var lightRows bytes
     lightBase := -1
-    if !run.Sky { lightRows, lightBase = materials.Shade.WallLightTable(materials.Light, materials.ExtraLight) }
-    if run.Sky { step = (engine.DoomScreenWidth * engine.FracUnit / run.Width) >> materials.Shade.DetailShift }
-    for offset := range run.Bounds.End - run.Bounds.First {
-        x := run.Bounds.First + offset
+    if !run.Sky { lightRows, lightBase = shading.WallLightTable(sectorLight, extraLight) }
+    if run.Sky { step = (engine.DoomScreenWidth * engine.FracUnit / run.Width) >> shading.DetailShift }
+    for offset := range band.End - band.First {
+        x := band.First + offset
         packed := rows[x]
         if packed != 0 {
             wrapped := run.Columns[x] & mask
@@ -210,23 +237,23 @@ func drawTextureRun(run WallTextureRun, tier WallTier, materials WallMaterials, 
                 cached[slot] = entry
             }
             first, end := int(packed >> 16), int(packed & 0xffff)
-            scale := run.Scale.First + offset * run.Scale.Step
+            scale := run.Scale.First + (x - run.Bounds.First) * run.Scale.Step
             if !run.Sky && scale != lastScale {
                 step = int(bits<32>(0xffffffff) / bits<32>(scale))
-                light = materials.Shade.FixedRow
+                light = shading.FixedRow
                 if light == 0 {
                     if lightBase >= 0 {
                         index := int(bits<32>(scale) >> engine.LightScaleShift)
                         if index >= engine.MaxLightScale { index = engine.MaxLightScale - 1 }
                         light = int(lightRows[lightBase + index])
                     } else {
-                        light = engine.WallLightRow(materials.Light, materials.ExtraLight, scale, run.Width, materials.Shade.DetailShift)
+                        light = engine.WallLightRow(sectorLight, extraLight, scale, run.Width, shading.DetailShift)
                     }
                 }
                 lastScale = scale
             }
             fraction := tier.Middle + (first - run.Height / 2) * step
-            drawTextureRows(cached[slot].ReadColumn(), materials.Shade, x, first, end, fraction, step, light, fallback)
+            cached[slot].DrawRows(shading, x, first, end, fraction, step, light, fallback)
         }
     }
     return cache

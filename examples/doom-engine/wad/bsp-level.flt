@@ -343,11 +343,14 @@ func (level BspLevel) PlaneKey(wall WallSegment, ceiling bit) engine.PlaneKey {
     } else {
         name = level.floorNameAtOffset(wall.FrontSector)
     }
-    name = normalizeName(name)
+    return makePlaneKey(height, wall.Light, normalizeName(name))
+}
+
+func makePlaneKey(height int, light int, name LumpName) engine.PlaneKey {
     if name.Low == 0x4b535f46 && name.High == 0x3159 {
         return engine.PlaneKey{Height: height, TextureLow: 0x4b535f46, TextureHigh: 0x3159, Sky: true}
     }
-    return engine.PlaneKey{Height: height, Light: wall.Light, TextureLow: bits<32>(name.Low), TextureHigh: bits<32>(name.High)}
+    return engine.PlaneKey{Height: height, Light: light, TextureLow: bits<32>(name.Low), TextureHigh: bits<32>(name.High)}
 }
 
 func (level BspLevel) FindPlayerStart(limit int) PlayerStart {

@@ -29,6 +29,16 @@ type TextureSet struct {
     Valid bit
     names nameIndexRef
     indexed int
+    textureHeaders textureHeaderIndex
+}
+
+// Offset identifies a readable header even when its dimensions or patch
+// count are invalid. Name lookup must keep the first such definition.
+type textureHeader struct {
+    Offset int
+    Width int
+    Height int
+    PatchCount int
 }
 
 type TextureDef struct {
@@ -97,23 +107,34 @@ func textureOffset(lump LumpRef, index int) int {
     return offset
 }
 
-func textureDef(set TextureSet, lump LumpRef, index int) TextureDef {
+func readTextureHeader(lump LumpRef, index int) textureHeader {
     offset := textureOffset(lump, index)
-    if offset < 0 { return TextureDef{} }
+    if offset < 0 { return textureHeader{} }
     start := lump.Offset + offset
     width, height := signed16(U16(lump.File, start + 12)), signed16(U16(lump.File, start + 14))
     patches := signed16(U16(lump.File, start + 20))
     if width <= 0 || height <= 0 || patches < 0 || patches > (lump.Size - offset - TextureHeaderSize) / TexturePatchSize {
-        return TextureDef{}
+        return textureHeader{Offset: start}
     }
-    return TextureDef{Mounts: set.lookup, File: lump.File, PNames: set.PNames, Offset: start, Width: width, Height: height,
-        PatchCount: patches, Valid: true}
+    return textureHeader{Offset: start, Width: width, Height: height, PatchCount: patches}
 }
 
 func TextureAt(set TextureSet, index int) TextureDef {
     if !set.Valid || index < 0 || index >= TextureCount(set) { return TextureDef{} }
-    if index < set.FirstCount { return textureDef(set, set.First, index) }
-    return textureDef(set, set.Second, index - set.FirstCount)
+    var header textureHeader
+    if index < CachedTextureHeaders && index < set.indexed { header = set.textureHeaders.HeaderAt(index) } else {
+        header = readSetTextureHeader(set, index)
+    }
+    if header.Width == 0 { return TextureDef{} }
+    file := set.First.File
+    if index >= set.FirstCount { file = set.Second.File }
+    return TextureDef{Mounts: set.lookup, File: file, PNames: set.PNames, Offset: header.Offset,
+        Width: header.Width, Height: header.Height, PatchCount: header.PatchCount, Valid: true}
+}
+
+func readSetTextureHeader(set TextureSet, index int) textureHeader {
+    if index < set.FirstCount { return readTextureHeader(set.First, index) }
+    return readTextureHeader(set.Second, index - set.FirstCount)
 }
 
 func findTextureIn(lump LumpRef, count int, name LumpName) int {

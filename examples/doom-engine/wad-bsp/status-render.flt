@@ -68,6 +68,12 @@ func statusDigit(mounts wad.Archives, digit int, tall bit) IntermissionPatch {
     return statusShortDigit(mounts, digit)
 }
 
+func drawStatusReadout(patch IntermissionPatch, shade walls.WadShading, x int, y int, tall bit) {
+    ink := color.Yellow
+    if tall { ink = color.White }
+    drawPatchWithInk(patch, shade, x, y, false, CleanStatusBar, ink)
+}
+
 func drawStatusNumber(mounts wad.Archives, shade walls.WadShading, value int, x int, y int,
     digits int, tall bit) {
     if value < 0 || digits <= 0 { return }
@@ -76,15 +82,15 @@ func drawStatusNumber(mounts wad.Archives, shade walls.WadShading, value int, x 
     for range digits {
         digit := value % 10
         x = x - zero.Width
-        drawIntermissionPatch(statusDigit(mounts, digit, tall), shade, x, y)
+        drawStatusReadout(statusDigit(mounts, digit, tall), shade, x, y, tall)
         value = value / 10
         if value == 0 { return }
     }
 }
 
 func drawStatusPercent(mounts wad.Archives, shade walls.WadShading, value int, x int, y int) {
-    drawIntermissionPatch(readIntermissionPatch(mounts,
-        statusName(83, 84, 84, 80, 82, 67, 78, 84)), shade, x, y) // STTPRCNT
+    drawStatusReadout(readIntermissionPatch(mounts,
+        statusName(83, 84, 84, 80, 82, 67, 78, 84)), shade, x, y, true) // STTPRCNT
     drawStatusNumber(mounts, shade, value, x, y, 3, true)
 }
 
@@ -116,7 +122,17 @@ func StatusBarAvailable(mounts wad.Archives) bit {
 func DrawStatusBar(mounts wad.Archives, shade walls.WadShading, inventory play.PlayerInventory, faceIndex int) {
     statusBar := readIntermissionPatch(mounts, statusBarName())
     if !statusBarCompatible(statusBar) || !shade.Valid { return }
-    drawIntermissionPatch(statusBar, shade, 0, statusBarTop)
+    if CleanStatusBar {
+        for row := range Height - StatusViewHeight {
+            for column := range Width { pixel(column, StatusViewHeight + row, true, color.Black) }
+        }
+        if Width >= 160 && Height >= 120 {
+            labelY := Height - campaignGlyphHeight
+            drawCampaignText("AMMO", 10 * Width / intermissionWidth, labelY, color.Orange)
+            drawCampaignText("HEALTH", 53 * Width / intermissionWidth, labelY, color.Orange)
+            drawCampaignText("ARMOR", 184 * Width / intermissionWidth, labelY, color.Orange)
+        }
+    } else { drawIntermissionPatch(statusBar, shade, 0, statusBarTop) }
 
     weapon := actorinfo.WeaponAt(inventory.ReadyWeapon)
     if weapon.Valid && weapon.Ammo >= 0 && weapon.Ammo < play.AmmoCount {

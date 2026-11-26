@@ -11,6 +11,7 @@ import "engine"
 type CachedWallRef interface {
     ReadWall(level BspLevel) WallSegment
     ReadWallMaterial(level BspLevel) SideMaterial
+    ReadPlaneKeys(level BspLevel, live WallSegment) (engine.PlaneKey, engine.PlaneKey)
 }
 
 // CachedWall contains only WAD-derived render geometry. Base is safe to use
@@ -24,6 +25,8 @@ type CachedWall struct {
     frontFloorName LumpName
     backFloorName LumpName
     ceilingNamesDiffer bit
+    frontFloorPlane engine.PlaneKey
+    frontCeilingPlane engine.PlaneKey
 }
 
 // A SEG can be clipped using only its two immutable endpoints.
@@ -58,12 +61,16 @@ func (level BspLevel) CacheWallFor(edge WallEdge) CachedWall {
 
     file := level.File
     offset, front, back := refs.Offset, refs.FrontSector, refs.BackSector
+    frontLow, frontHigh := LE32(file, front + 4), LE32(file, front + 8)
+    frontFloorName := nameFromWords(frontLow, frontHigh)
+    floorPlane := makePlaneKey(0, 0, normalizeName(frontFloorName))
+    ceilingPlane := makePlaneKey(0, 0, normalizeName(lumpNameAt(file, front + 12)))
     base := WallSegment{
         First: edge.First, Last: edge.Last,
         Direction: bits<32>(U16(file, offset + 4)) << 16, Front: sectorAt(file, front),
         RecordOffset: offset, SideOffset: refs.SideOffset, LineOffset: refs.LineOffset,
         FrontSector: front,
-        FrontSky: skyFlatAt(file, front + 12),
+        FrontSky: ceilingPlane.Sky,
         Light: (U16(file, front + 20) << 16) >> 16,
     }
 
@@ -77,6 +84,7 @@ func (level BspLevel) CacheWallFor(edge WallEdge) CachedWall {
             OffsetV: signed16(U16(file, refs.SideOffset + 2)) << 16,
         },
         segmentOffsetU: signed16(U16(file, offset + 10)) << 16,
+        frontFloorName: frontFloorName, frontFloorPlane: floorPlane, frontCeilingPlane: ceilingPlane,
     }
     flags := U16(file, refs.LineOffset + 4)
     result.pegTop, result.pegBottom = flags & 8 != 0, flags & 16 != 0
@@ -87,9 +95,7 @@ func (level BspLevel) CacheWallFor(edge WallEdge) CachedWall {
         result.Base.Back = sectorAt(file, back)
         result.Base.BackLight = signed16(U16(file, back + 20))
         result.Base.SharedSky = result.Base.FrontSky && skyFlatAt(file, back + 12)
-        frontLow, frontHigh := LE32(file, front + 4), LE32(file, front + 8)
         backLow, backHigh := LE32(file, back + 4), LE32(file, back + 8)
-        result.frontFloorName = nameFromWords(frontLow, frontHigh)
         result.backFloorName = nameFromWords(backLow, backHigh)
         result.ceilingNamesDiffer = nameChanged(file, front + 12, back + 12)
         lightChanged := result.Base.Light != result.Base.BackLight
@@ -100,6 +106,23 @@ func (level BspLevel) CacheWallFor(edge WallEdge) CachedWall {
     }
     result.Base.Valid = true
     return result
+}
+
+// The front flat names are stable across camera movement. Heights, lighting,
+// and a moved sector's floor transfer still come from the current tic.
+func (wall CachedWall) ReadPlaneKeys(level BspLevel, live WallSegment) (engine.PlaneKey, engine.PlaneKey) {
+    floor, ceiling := wall.frontFloorPlane, wall.frontCeilingPlane
+    if level.Modified {
+        original := wall.frontFloorName
+        name := level.Changes.ReadFloorName(sectorId(level, live.FrontSector), original)
+        if name.Low != original.Low || name.High != original.High {
+            floor = makePlaneKey(0, 0, normalizeName(name))
+        }
+    }
+    floor.Height, ceiling.Height = live.Front.Floor, live.Front.Ceiling
+    if !floor.Sky { floor.Light = live.Light }
+    if !ceiling.Sky { ceiling.Light = live.Light }
+    return floor, ceiling
 }
 
 // ReadWall applies current sector state to a WAD-decoded wall. Its immutable

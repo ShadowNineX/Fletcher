@@ -102,14 +102,15 @@ function resources() {
     return lumps;
 }
 
-function previewSource(blocks = 10) {
-    const preview = path.join(scratch, `preview-${blocks}`);
+function previewSource(blocks = 10, nativeBlink = false, classicShortcuts = false) {
+    const preview = path.join(scratch, `preview-${blocks}${nativeBlink ? "-blink" : ""}${classicShortcuts ? "-shortcuts" : ""}`);
     mkdirSync(preview);
     for (const name of readdirSync(path.join(port, "wad-bsp")).filter(name => name.endsWith(".flt"))) {
         let source = readFileSync(path.join(port, "wad-bsp", name), "utf8");
         if (name === "display.flt") {
             assert.match(source, /^const ViewBlocks = 10\b/m);
             source = source.replace(/^const ViewBlocks = 10\b/m, `const ViewBlocks = ${blocks}`);
+            if (classicShortcuts) source = source.replace("const ClassicMenu = false", "const ClassicMenu = true");
         }
         if (name === "main.flt") {
             const anchor = "                invisible := weaponUsesFuzz(frame.Contacts.Inventory.Powers[play.PowerInvisibility])";
@@ -131,6 +132,25 @@ function previewSource(blocks = 10) {
                 }
                 if gameTime == 4 { frame.Contacts.Inventory.BonusCount = 0; frame.Contacts.Inventory.Powers[play.PowerIronFeet] = 200 }
 ${anchor}`);
+            if (nativeBlink) {
+                const tickCounters = 'combat.World = play.TickLivePlayerCountersWithBlink(combat.World, contacts.Handle, sharedBytes("doomPowerBlink"))';
+                const selectPalette = 'palette := play.StatusPaletteWithBlink(frame.Contacts.Inventory, sharedBytes("doomPowerBlink"))';
+                assert.ok(source.includes(tickCounters) && source.includes(selectPalette), "native blink test hooks moved");
+                source = source.replace(tickCounters, `
+                            if len(sharedBytes("doomPowerBlink")) == 4096 {
+                                player := combat.World.Players[0]
+                                player.Powers[play.PowerInvulnerability] = 0
+                                if gameTime & 1 == 0 { player.Powers[play.PowerInvulnerability] = 9 }
+                                player.Powers[play.PowerInfrared] = 9
+                                combat.World.Players[0] = player
+                            }
+                            ${tickCounters}`);
+                source = source.replace(selectPalette, `
+                nativeReady := len(sharedBytes("doomPowerBlink")) == 4096
+                if nativeReady { frame.Contacts.Inventory.Powers[play.PowerIronFeet] = 8 }
+                ${selectPalette}
+                if nativeReady { log("native-blink", gameTime & 1, palette, fixedColormap) }`);
+            }
             const detailAnchor = "        next lowDetail = selectedDetail";
             assert.ok(source.includes(detailAnchor), "detail selection test hook anchor moved");
             source = source.replace(detailAnchor, `${detailAnchor}
@@ -141,6 +161,12 @@ ${anchor}`);
             source = source.replace(gammaAnchor, `${gammaAnchor}
         log("gamma-state", selectedGamma)
         if gammaChanged { log("gamma-selection", selectedGamma) }`);
+            if (classicShortcuts) {
+                const messageTick = "messages = play.TickHudMessages(messages, messagesEnabled, hudPressed[6])";
+                assert.ok(source.includes(messageTick), "HUD settings trace anchor moved");
+                source = source.replace(messageTick, `${messageTick}
+                log("settings-hud", messagesEnabled, messages.Current)`);
+            }
             const drawResult = "return CameraDraw{Valid: true, FuzzPhase: masked.Phase,";
             const drawCommit = "if painted.Valid {";
             assert.ok(source.includes(drawResult) && source.includes(drawCommit), "detail projection test hooks moved");
@@ -169,7 +195,7 @@ ${resize}`);
     return path.join(preview, "main.flt");
 }
 
-function build(entry, commercial = false) {
+function build(entry, commercial = false, blinkBoard = "") {
     const map = level();
     if (commercial) map[0][0] = "MAP01";
     writeFileSync(path.join(scratch, "LEVEL.WAD"), wad([...map, ...resources()]));
@@ -178,7 +204,24 @@ function build(entry, commercial = false) {
         { cwd: root, encoding: "utf8", timeout: 30000 });
     if (result.error) throw result.error;
     assert.equal(result.status, 0, result.stderr || result.stdout);
-    return simulator(decode(JSON.parse(readFileSync(output, "utf8")).data), true);
+    const tiles = decode(JSON.parse(readFileSync(output, "utf8")).data);
+    if (blinkBoard) {
+        const bridge = tiles.find(tile => tile.type === 33 && tile.payload?.includes("doomPowerBlink = results"));
+        assert.ok(bridge, "power blink board is in the compiled preview");
+        if (blinkBoard === "disconnected") {
+            const pad = tiles.find(tile => tile.x === bridge.x + 77 && tile.y === bridge.y - 4);
+            assert.equal(pad?.type, 1, "lane 8 has a physical bit-3 input pad");
+            Object.assign(pad, { type: 25, extra: 7 });
+        }
+        tiles.push({ x: bridge.x - 1, y: bridge.y, type: 33, rotation: 0, flip: false, extra: 0,
+            payload: Buffer.from(`always(() => {
+                if (state.reported || !globalState.doomPowerBlink) return;
+                state.reported = true;
+                log("blink-table", globalState.doomPowerBlink);
+            });`),
+        });
+    }
+    return simulator(tiles, true);
 }
 
 function screen(sim) {
@@ -193,8 +236,8 @@ function tap(sim, key) {
     for (let host = 0; host < 4; host++) sim.step();
 }
 
-function waitFor(sim, predicate, description, keys = []) {
-    for (let tic = 0; tic < 160; tic++) {
+function waitFor(sim, predicate, description, keys = [], limit = 160) {
+    for (let tic = 0; tic < limit; tic++) {
         sim.step([], new Map(), keys);
         if (predicate()) return;
     }
@@ -364,7 +407,59 @@ try {
         assert.notEqual(pixel(oddOpening, 83, 48), pixel(oddOpening, 100, 48),
             "the same column belongs to the scene in high detail");
     }
-    console.log("WAD preview passed STBAR widgets, palette flashes, Doom and Doom II borders, runtime sizing and detail, and exact viewport checkpoint restoration.");
+    const blinkEntry = previewSource(10, true);
+    for (const cutWire of [false, true]) {
+        const blink = build(blinkEntry, false, cutWire ? "disconnected" : "intact");
+        const effects = () => blink.logs.filter(([tag]) => tag === "native-blink");
+        waitFor(blink, () => effects().length >= 3, "render frames using the native power blink board", [], 400);
+        const tables = blink.logs.filter(([tag]) => tag === "blink-table");
+        assert.equal(tables.length, 1, "the physical board publishes one table");
+        const table = tables[0][1];
+        assert.equal(table.length, 4096);
+        for (let timer = 0; timer < table.length; timer++) {
+            const delivered = cutWire && (timer & 15) === 8 ? timer & ~8 : timer;
+            assert.equal(table[timer], Number(delivered > 128 || (delivered & 8) !== 0), `power blink at timer ${timer}`);
+        }
+        const samples = effects().slice(-2).sort((a, b) => a[1] - b[1]);
+        const palette = cutWire ? 0 : 13;
+        assert.deepEqual(samples, [["native-blink", 0, palette, cutWire ? 0 : 32],
+            ["native-blink", 1, palette, cutWire ? 0 : 1]]);
+        assert.equal(pixel(screen(blink), 1, 90), cutWire ? 6 : 3,
+            "the radiation tint changes a real status bar tile only when the wire is connected");
+    }
+    const settings = build(previewSource(10, false, true));
+    waitFor(settings, () => settings.logs.some(([tag]) => tag === "settings-hud"), "start the shortcut fixture");
+    const detailEvents = () => settings.logs.filter(([tag]) => tag === "detail-selection").map(([, selected]) => selected);
+    const gammaEvents = () => settings.logs.filter(([tag]) => tag === "gamma-selection").map(([, selected]) => selected);
+    const lastMessage = () => settings.logs.findLast(([tag]) => tag === "settings-hud").slice(1);
+    for (let host = 0; host < 12; host++) settings.step([], new Map(), [41]); // F5
+    settings.step();
+    assert.deepEqual(detailEvents(), [true], "held F5 toggles the detail level once outside the menu");
+    tap(settings, 41);
+    assert.deepEqual(detailEvents(), [true, false], "a second F5 restores high detail");
+
+    tap(settings, 47); // F11
+    assert.deepEqual(gammaEvents(), [1]);
+    assert.deepEqual(lastMessage(), [true, "Gamma correction level 1"]);
+    tap(settings, 44); // F8
+    assert.deepEqual(lastMessage(), [false, "Messages OFF"], "F8 displays the acknowledgement even after disabling messages");
+    tap(settings, 47);
+    assert.deepEqual(gammaEvents(), [1, 2]);
+    assert.deepEqual(lastMessage(), [false, "Messages OFF"], "F11 changes gamma without forcing its HUD message");
+    tap(settings, 44);
+    assert.deepEqual(lastMessage(), [true, "Messages ON"]);
+    for (let row = 0; row < 3; row++) tap(settings, 47);
+    assert.deepEqual(gammaEvents(), [1, 2, 3, 4, 0], "F11 cycles the five original gamma rows");
+
+    tap(settings, 20); // T opens the menu.
+    waitFor(settings, () => settings.logs.some(([tag]) => tag === "Doom campaign menu opened"), "open the menu over the settings fixture");
+    for (const key of [41, 44, 47]) tap(settings, key);
+    assert.deepEqual(detailEvents(), [true, false], "F5 is ignored while the menu is open");
+    assert.deepEqual(gammaEvents(), [1, 2, 3, 4, 0], "F11 is ignored while the menu is open");
+    tap(settings, 20);
+    assert.equal(lastMessage()[0], true, "F8 is ignored while the menu is open");
+
+    console.log("WAD preview passed STBAR widgets, Doom and Doom II borders, runtime sizing and detail, and exact viewport checkpoint restoration. The native blink disconnection and physical F5/F8/F11 settings also passed.");
 } finally {
     assert.match(path.relative(temp, realpathSync(scratch)), /^fletcher-preview-status-[^/\\]+$/);
     rmSync(scratch, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });

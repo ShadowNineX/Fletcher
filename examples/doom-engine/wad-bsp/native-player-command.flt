@@ -1,0 +1,65 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
+package main
+
+// Both boards can receive one address per tick. A valid bit travels on
+// each board's routed bus so the collector can accept results independently.
+macro DoomCommandPads(x int, y int) {
+    place scriptBlock at (x - 3, y) with { code = commandBoardBridge }
+    place arrow at (x, y) facing right
+    place arrow at (x, y + 2) facing right
+    place arrow at (x, y + 4) facing right
+    place arrow at (x, y + 6) facing right
+    place arrow at (x + 100, y) facing right
+    place arrow at (x + 100, y + 2) facing right
+    place arrow at (x + 100, y + 4) facing right
+    place arrow at (x + 100, y + 6) facing right
+    place arrow at (x + 100, y + 8) facing right
+    place arrow at (x + 100, y + 10) facing right
+    place arrow at (x + 100, y + 12) facing right
+}
+
+// Keep offsets and pitch aligned with the forward and sideways packet ports.
+const commandBoardBridge = "const {x, y} = getPosition();\n" +
+    "const forward = {inputX: x + 3, outputX: x + 79, outputY: y + 94, addressBits: 3, dataBits: 7, sent: 0, rows: []};\n" +
+    "const sideways = {inputX: x + 103, outputX: x + 263, outputY: y + 218, addressBits: 6, dataBits: 8, sent: 0, rows: []};\n" +
+    "let previous, flush = 0, published = false;\n" +
+    "const send = (board, stamp) => {\n" +
+    "    for (let lane = 0; lane <= board.addressBits; lane++) world.setSignal(board.inputX, y + 2 * lane, (stamp >> lane) & 1);\n" +
+    "};\n" +
+    "const read = (board, lane) => world.getSignal(board.outputX + 2 * lane, board.outputY) > 0 ? 1 : 0;\n" +
+    "const advance = board => {\n" +
+    "    const count = 1 << board.addressBits;\n" +
+    "    if (board.rows.length < count && read(board, board.dataBits)) {\n" +
+    "        let value = 0;\n" +
+    "        for (let lane = 0; lane < board.dataBits; lane++) value |= read(board, lane) << lane;\n" +
+    "        board.rows.push(value);\n" +
+    "    }\n" +
+    "    if (board.sent <= count) {\n" +
+    "        send(board, board.sent < count ? board.sent | count : 0);\n" +
+    "        board.sent++;\n" +
+    "    }\n" +
+    "};\n" +
+    "always(() => {\n" +
+    "    if (published) return;\n" +
+    "    const tick = world.getTick();\n" +
+    "    if (previous !== undefined && tick !== previous + 1) {\n" +
+    "        forward.sent = sideways.sent = 0;\n" +
+    "        forward.rows.length = sideways.rows.length = 0;\n" +
+    "        flush = 256;\n" +
+    "        send(forward, 0); send(sideways, 0);\n" +
+    "    }\n" +
+    "    previous = tick;\n" +
+    "    if (flush > 0) { flush--; return; }\n" +
+    "    advance(forward); advance(sideways);\n" +
+    "    if (forward.rows.length !== 8 || sideways.rows.length !== 64) return;\n" +
+    "    const results = [];\n" +
+    "    for (let keys = 0; keys < 256; keys++) {\n" +
+    "        const forwardIndex = (keys & 3) | ((keys >> 4) & 4);\n" +
+    "        const packet = sideways.rows[keys >> 2];\n" +
+    "        results.push(forward.rows[forwardIndex], (packet & 31) << 2, packet >> 5);\n" +
+    "    }\n" +
+    "    globalState.doomKeyboardDeltas = results;\n" +
+    "    log('Doom native player command ready');\n" +
+    "    published = true;\n" +
+    "});"

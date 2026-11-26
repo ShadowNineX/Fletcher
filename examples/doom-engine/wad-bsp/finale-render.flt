@@ -187,6 +187,7 @@ func drawFinaleCast(mounts wad.Archives, shade walls.WadShading, cast play.Final
 func drawFinale(mounts wad.Archives, materials walls.Materials, state play.FinaleState, story wad.LumpRef, paused bit) bit {
     if !materials.Shade.Valid { materials.Shade = walls.LoadShading(mounts) }
     if !materials.Shade.Valid { return false }
+    useDisplayPalette(materials.Shade)
     switch state.Stage {
     case play.FinaleStory:
         drawFinaleBackdrop(materials, state.Route)

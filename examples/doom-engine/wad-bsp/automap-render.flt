@@ -88,17 +88,23 @@ func automapGridStart(start int, origin int) int {
     return start
 }
 
+func automapDisplayIndex(index int) int {
+    if DisplayUsesRgb { return index }
+    return -1
+}
+
 func drawAutomapGrid(window automap.Window, blocks wad.BlockMapInfo, shade color) {
+    index := automapDisplayIndex(104)
     right, top := window.X + window.MapWidth, window.Y + window.MapHeight
     start := automapGridStart(window.X, blocks.OriginX)
     for i := range window.MapWidth / automapGridStep + 1 {
         x := start + i * automapGridStep
-        if x < right { automap.DrawLine(window, x, window.Y, x, top, shade) }
+        if x < right { automap.DrawIndexedLine(window, x, window.Y, x, top, shade, index) }
     }
     start = automapGridStart(window.Y, blocks.OriginY)
     for i := range window.MapHeight / automapGridStep + 1 {
         y := start + i * automapGridStep
-        if y < top { automap.DrawLine(window, window.X, y, right, y, shade) }
+        if y < top { automap.DrawIndexedLine(window, window.X, y, right, y, shade, index) }
     }
 }
 
@@ -126,7 +132,8 @@ func drawAutomapWalls(window automap.Window, level wad.BspLevel, mapped MappedLi
             line := level.LineAt(i)
             index := automapWallColor(level, line, seen, allMap, reveal)
             if index >= 0 {
-                automap.DrawLine(window, line.First.X, line.First.Y, line.Last.X, line.Last.Y, automapColor(shade, index))
+                automap.DrawIndexedLine(window, line.First.X, line.First.Y, line.Last.X, line.Last.Y,
+                    automapColor(shade, index), automapDisplayIndex(index))
             }
         }
     }
@@ -138,12 +145,13 @@ func automapSymbolPoint(x int, y int, actor play.ActorPhysics, cosine int, sine 
 }
 
 func drawAutomapPlayer(window automap.Window, actor play.ActorPhysics, shade color) {
+    index := automapDisplayIndex(209)
     cosine, sine := engine.FracUnit, 0
     if actor.Angle != 0 { cosine, sine = engine.AngleCosine(actor.Angle), engine.AngleSine(actor.Angle) }
     for i := range 7 {
         first := automapSymbolPoint(automapArrowX[i * 2], automapArrowY[i * 2], actor, cosine, sine)
         last := automapSymbolPoint(automapArrowX[i * 2 + 1], automapArrowY[i * 2 + 1], actor, cosine, sine)
-        automap.DrawLine(window, first.X, first.Y, last.X, last.Y, shade)
+        automap.DrawIndexedLine(window, first.X, first.Y, last.X, last.Y, shade, index)
     }
 }
 
@@ -161,9 +169,10 @@ func drawAutomapThing(window automap.Window, actor play.ActorPhysics, shade colo
     lower := automapSymbolPoint(automapThingRear, -automapThingHalfWidth, actor, cosine, sine)
     tip := automapSymbolPoint(automapThingTip, 0, actor, cosine, sine)
     upper := automapSymbolPoint(automapThingRear, automapThingHalfWidth, actor, cosine, sine)
-    automap.DrawLine(window, lower.X, lower.Y, tip.X, tip.Y, shade)
-    automap.DrawLine(window, tip.X, tip.Y, upper.X, upper.Y, shade)
-    automap.DrawLine(window, upper.X, upper.Y, lower.X, lower.Y, shade)
+    index := automapDisplayIndex(112)
+    automap.DrawIndexedLine(window, lower.X, lower.Y, tip.X, tip.Y, shade, index)
+    automap.DrawIndexedLine(window, tip.X, tip.Y, upper.X, upper.Y, shade, index)
+    automap.DrawIndexedLine(window, upper.X, upper.Y, lower.X, lower.Y, shade, index)
 }
 
 func drawAutomapSectorThings(window automap.Window, actors play.MapActors, links play.ActorLinks, handle int, shade color) {
@@ -283,8 +292,9 @@ func drawAutomap(view automap.View, level wad.BspLevel, blocks wad.BlockMapInfo,
     revealMode int, actors play.MapActors, links play.ActorLinks) {
     window := view.Window
     background := automapColor(shade, 0)
+    backgroundIndex := automapDisplayIndex(0)
     for y := range window.Height {
-        for x := range window.Width { pixel(x, y, true, background) }
+        for x := range window.Width { pixel(x, y, true, background, backgroundIndex) }
     }
     if view.Grid { drawAutomapGrid(window, blocks, automapColor(shade, 104)) }
     drawAutomapWalls(window, level, mapped, allMap, shade, revealMode != 0)
@@ -297,7 +307,7 @@ func drawAutomap(view automap.View, level wad.BspLevel, blocks wad.BlockMapInfo,
         }
     }
     center := window.Width * (window.Height + 1) / 2
-    pixel(center % window.Width, center / window.Width, true, automapColor(shade, 96))
+    pixel(center % window.Width, center / window.Width, true, automapColor(shade, 96), automapDisplayIndex(96))
     drawAutomapMarks(window, marks, mounts, shade)
     drawAutomapTitle(mounts, level.MapName, shade)
 }

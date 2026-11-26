@@ -1,0 +1,149 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Save and load menus from linuxdoom-1.10/m_menu.c.
+
+package main
+
+import "play"
+import "wad"
+import "walls"
+
+// M_StringWidth gives spaces and unsupported characters four Doom pixels.
+func measureSaveMenuText(mounts wad.Archives, text string) (int, bit) {
+    width, complete := 0, true
+    for _, character := range text {
+        code := hudGlyphCode(character)
+        glyph := finaleGlyph(mounts, code)
+        if glyph.Width > 0 { width = width + glyph.Width
+        } else {
+            width = width + 4
+            if code >= 33 { complete = false }
+        }
+    }
+    return width, complete
+}
+
+func campaignSaveNameWidth(mounts wad.Archives, name string) int {
+    width, _ := measureSaveMenuText(mounts, name)
+    return width
+}
+
+func drawSaveMenuText(mounts wad.Archives, shade walls.WadShading, x int, y int, text string) {
+    for _, character := range text {
+        glyph := finaleGlyph(mounts, hudGlyphCode(character))
+        if glyph.Width > 0 {
+            if x + glyph.Width > intermissionWidth { return }
+            drawIntermissionPatch(glyph, shade, x, y)
+            x = x + glyph.Width
+        } else { x = x + 4 }
+    }
+}
+
+func saveMenuSlotText(menu play.CampaignMenu, names [play.CampaignSaveSlots]string, slot int) string {
+    if menu.Stage == play.CampaignMenuSaveName && menu.Cursor == slot { return menu.SaveName + "_" }
+    if names[slot] == "" { return "EMPTY SLOT" }
+    return names[slot]
+}
+
+// The C messages have one blank line between each of their printed lines.
+func saveMenuPrompt(menu play.CampaignMenu) ([3]string, int) {
+    var lines [3]string
+    if menu.Stage == play.CampaignMenuSaveUnavailable || (menu.Stage == play.CampaignMenuQuickLoad && menu.SaveName == "") {
+        lines[0] = "YOU CAN'T SAVE IF YOU AREN'T PLAYING!"
+        if menu.Stage == play.CampaignMenuQuickLoad { lines[0] = "YOU HAVEN'T PICKED A QUICKSAVE SLOT YET!" }
+        lines[1] = "PRESS A KEY."
+        return lines, 2
+    }
+    if menu.Stage != play.CampaignMenuQuickSave && menu.Stage != play.CampaignMenuQuickLoad { return lines, 0 }
+    lines[0] = "QUICKSAVE OVER YOUR GAME NAMED"
+    if menu.Stage == play.CampaignMenuQuickLoad { lines[0] = "DO YOU WANT TO QUICKLOAD THE GAME NAMED" }
+    lines[1], lines[2] = "'" + menu.SaveName + "'?", "PRESS Y OR N."
+    return lines, 3
+}
+
+func drawWadSaveMenu(mounts wad.Archives, shade walls.WadShading, menu play.CampaignMenu,
+    names [play.CampaignSaveSlots]string, skullAlternate bit) bit {
+    lines, count := saveMenuPrompt(menu)
+    if count > 0 {
+        height := finaleGlyph(mounts, 33).Height
+        if height <= 0 { return false }
+        var widths [3]int
+        for row := range count {
+            width, complete := measureSaveMenuText(mounts, lines[row])
+            if !complete { return false }
+            widths[row] = width
+        }
+        top := 100 - (2 * count - 1) * height / 2
+        for row := range count { drawSaveMenuText(mounts, shade, 160 - widths[row] / 2, top + 2 * row * height, lines[row]) }
+        return true
+    }
+
+    headingIndex := 3 // M_SAVEG
+    if menu.Stage == play.CampaignMenuLoad { headingIndex = 2 } // M_LOADG
+    heading := readIntermissionPatch(mounts, wad.LumpName{Low: mainMenuLow[headingIndex], High: mainMenuHigh[headingIndex]})
+    left := readIntermissionPatch(mounts, wad.LumpName{Low: 0x534c5f4d, High: 0x5446454c}) // M_LSLEFT
+    middle := readIntermissionPatch(mounts, wad.LumpName{Low: 0x534c5f4d, High: 0x52544e43}) // M_LSCNTR
+    right := readIntermissionPatch(mounts, wad.LumpName{Low: 0x534c5f4d, High: 0x54484752}) // M_LSRGHT
+    skull := campaignMenuSkull(mounts, skullAlternate)
+    if heading.Width <= 0 || left.Width <= 0 || middle.Width <= 0 || right.Width <= 0 || skull.Width <= 0 { return false }
+    var labels [play.CampaignSaveSlots]string
+    for row := range play.CampaignSaveSlots {
+        labels[row] = saveMenuSlotText(menu, names, row)
+        _, complete := measureSaveMenuText(mounts, labels[row])
+        if !complete { return false }
+    }
+    drawIntermissionPatch(heading, shade, 72, 28)
+    for row := range play.CampaignSaveSlots {
+        y := 54 + row * 16
+        drawIntermissionPatch(left, shade, 72, y + 7)
+        for segment := range 24 { drawIntermissionPatch(middle, shade, 80 + 8 * segment, y + 7) }
+        drawIntermissionPatch(right, shade, 272, y + 7)
+        drawSaveMenuText(mounts, shade, 80, y, labels[row])
+    }
+    drawIntermissionPatch(skull, shade, 48, 49 + 16 * menu.Cursor)
+    return true
+}
+
+func drawCompactSaveMenu(menu play.CampaignMenu, names [play.CampaignSaveSlots]string) {
+    lines, count := saveMenuPrompt(menu)
+    panelWidth, panelHeight := Width, Height
+    if panelWidth > 164 { panelWidth = 164 }
+    if panelHeight > 66 { panelHeight = 66 }
+    left, top := (Width - panelWidth) / 2, (Height - panelHeight) / 2
+    for y := range panelHeight {
+        for x := range panelWidth {
+            ink := color.Black
+            if x == 0 || y == 0 || x == panelWidth - 1 || y == panelHeight - 1 { ink = color.Purple }
+            pixel(left + x, top + y, true, ink)
+        }
+    }
+    if count > 0 {
+        if campaignTextWidth(lines[0]) > panelWidth - 4 {
+            lines[0] = "QUICKSAVE OVER"
+            if menu.Stage == play.CampaignMenuQuickLoad { lines[0] = "QUICKLOAD GAME" }
+            if menu.Stage == play.CampaignMenuQuickLoad && menu.SaveName == "" { lines[0] = "NO QUICKSAVE SLOT" }
+            if menu.Stage == play.CampaignMenuSaveUnavailable { lines[0] = "NO GAME TO SAVE" }
+        }
+        for row := range count {
+            drawCampaignText(lines[row], (Width - campaignTextWidth(lines[row])) / 2, (Height - count * 9) / 2 + row * 9, color.White)
+        }
+        return
+    }
+    title := "SAVE GAME"
+    if menu.Stage == play.CampaignMenuLoad { title = "LOAD GAME" }
+    drawCampaignText(title, (Width - campaignTextWidth(title)) / 2, top + 2, color.White)
+    spacing := (panelHeight - 10) / play.CampaignSaveSlots
+    for row := range play.CampaignSaveSlots {
+        y := top + 9 + row * spacing
+        ink := color.White
+        if row == menu.Cursor { ink = color.Yellow }
+        label := saveMenuSlotText(menu, names, row)
+        x := left + 5
+        if row == menu.Cursor && menu.Stage == play.CampaignMenuSaveName && campaignTextWidth(label) > panelWidth - 10 {
+            x = left + panelWidth - 5 - campaignTextWidth(label)
+        }
+        for _, character := range label {
+            if x >= left + 2 && x + campaignGlyphWidth <= left + panelWidth - 2 { drawCampaignGlyph(character, x, y, ink) }
+            if character == " " { x = x + 2 } else { x = x + campaignGlyphAdvance }
+        }
+    }
+}

@@ -21,6 +21,12 @@ type Surface struct {
     MarkFloor bit
     Shade color
     Materials WallMaterials
+}
+
+// The view's projection is shared by every wall in the frame.
+type WallView struct {
+    Height int
+    HasAngles bit
     ColumnAngles [engine.MaxViewWidth]bits<32>
 }
 
@@ -43,14 +49,8 @@ func paintColumn(column int, first int, end int, shade color, view engine.ViewPr
     }
 }
 
-func clipRow(row int, height int) int {
-    if row < 0 { return 0 }
-    if row > height { return height }
-    return row
-}
-
 func recordDrawSegment(coverage engine.ColumnCoverage, segment engine.DrawSegment, surface Surface, eyeZ int,
-    run WallTextureRun) engine.ColumnCoverage {
+    run WallTextureRun, shading WadShading) engine.ColumnCoverage {
     front, back := surface.Front, surface.Back
     if !surface.TwoSided || back.Floor >= front.Ceiling {
         segment.Top, segment.TopClosed, segment.TopHeight = true, true, -2147483648
@@ -70,7 +70,7 @@ func recordDrawSegment(coverage engine.ColumnCoverage, segment engine.DrawSegmen
         if !segment.Top { segment.Top, segment.TopHeight = true, -2147483648 }
         if !segment.Bottom { segment.Bottom, segment.BottomHeight = true, 2147483647 }
         segment.Masked = true
-        segment.Mask = MaskedWall{Run: run, Tier: surface.Materials.Masked, Shade: surface.Materials.Shade,
+        segment.Mask = MaskedWall{Run: run, Tier: surface.Materials.Masked, Shade: shading,
             Light: surface.Materials.Light, ExtraLight: surface.Materials.ExtraLight, Clips: coverage.Rows,
             Closed: segment.TopClosed || segment.BottomClosed}
     }
@@ -83,10 +83,14 @@ func recordDrawSegment(coverage engine.ColumnCoverage, segment engine.DrawSegmen
 }
 
 func paintRun(camera engine.Camera, wall engine.WallDistance, projection engine.WallTextureProjection,
-    rangeSegment engine.DrawSegment, surface Surface, height int, coverage engine.ColumnCoverage,
-    cache ColumnCache) (engine.ColumnCoverage, ColumnCache) {
+    rangeSegment engine.DrawSegment, surface Surface, view WallView, coverage engine.ColumnCoverage,
+    shading WadShading, cache ColumnCache) (engine.ColumnCoverage, ColumnCache) {
     span := rangeSegment.Span
-    scale := engine.ScaleWallSpan(camera, wall, span)
+    height := view.Height
+    var scale engine.WallScale
+    if view.HasAngles {
+        scale = engine.ScaleWallSpanFromAngles(camera, wall, span, view.ColumnAngles[span.First], view.ColumnAngles[span.End - 1])
+    } else { scale = engine.ScaleWallSpan(camera, wall, span) }
     center := (height / 2) << WallHeightBits
     frontCeiling := surface.Front.Ceiling
     if surface.SharedSky { frontCeiling = surface.Back.Ceiling }
@@ -103,38 +107,41 @@ func paintRun(camera engine.Camera, wall engine.WallDistance, projection engine.
     ceiling, floor := -1, -1
     var ceilingRows [engine.MaxViewWidth]bits<32>
     var floorRows [engine.MaxViewWidth]bits<32>
-    var ceilingSpill engine.VisplaneRaster
-    var floorSpill engine.VisplaneRaster
-    var middlePixels [engine.MaxViewWidth]bits<32>
-    var upperPixels [engine.MaxViewWidth]bits<32>
+    var ceilingRaster engine.VisplaneRaster
+    var floorRaster engine.VisplaneRaster
+    ceilingWritten, floorWritten := false, false
+    // A wall has either an opaque middle tier or an upper tier.
+    var middleOrUpperPixels [engine.MaxViewWidth]bits<32>
     var lowerPixels [engine.MaxViewWidth]bits<32>
+    middleOrUpperBand := engine.ColumnSpan{First: span.End, End: span.First}
+    lowerBand := engine.ColumnSpan{First: span.End, End: span.First}
+    opaqueMiddle := !surface.TwoSided && !surface.Materials.middleAbsent
+    textured := surface.Materials.Textured
+    middleTexture := surface.Materials.Middle.Texture.Valid
+    upperTexture := surface.Materials.Upper.Texture.Valid
+    lowerTexture := surface.Materials.Lower.Texture.Valid
+    maskedTexture := surface.Materials.Masked.Texture.Valid
+    var run WallTextureRun
+    if textured {
+        run.Bounds, run.Scale, run.Height, run.Width = span, scale, height, camera.View.Width
+    }
     if markCeiling && coverage.CeilingPlane != 0 {
-        checked := engine.CheckPlane(coverage.Planes, coverage.CeilingPlane - 1, span.First, span.End)
-        if checked.Index < 0 { coverage.Failed = true; return coverage, cache }
-        coverage.Planes = checked.State
-        ceiling = checked.Index
+        coverage.Planes, ceiling = engine.CheckPlaneRange(coverage.Planes, coverage.CeilingPlane - 1, span.First, span.End)
+        if ceiling < 0 { coverage.Failed = true; return coverage, cache }
         coverage.CeilingPlane = ceiling + 1
-        if ceiling >= engine.InlineVisplaneCount {
-            ceilingSpill = coverage.Planes.OverflowRasterAt(ceiling)
-            if ceilingSpill.HasRows { ceilingRows = ceilingSpill.Rows.ReadRows() }
-        } else if coverage.HasPlaneRows[ceiling] { ceilingRows = coverage.PlaneRows[ceiling].ReadRows() }
+        ceilingRaster = coverage.Planes.RasterAt(ceiling)
     }
     if markFloor && coverage.FloorPlane != 0 {
-        checked := engine.CheckPlane(coverage.Planes, coverage.FloorPlane - 1, span.First, span.End)
-        if checked.Index < 0 { coverage.Failed = true; return coverage, cache }
-        coverage.Planes = checked.State
-        floor = checked.Index
+        coverage.Planes, floor = engine.CheckPlaneRange(coverage.Planes, coverage.FloorPlane - 1, span.First, span.End)
+        if floor < 0 { coverage.Failed = true; return coverage, cache }
         coverage.FloorPlane = floor + 1
-        if floor >= engine.InlineVisplaneCount {
-            floorSpill = coverage.Planes.OverflowRasterAt(floor)
-            if floorSpill.HasRows { floorRows = floorSpill.Rows.ReadRows() }
-        } else if coverage.HasPlaneRows[floor] { floorRows = coverage.PlaneRows[floor].ReadRows() }
+        if floor != ceiling { floorRaster = coverage.Planes.RasterAt(floor) }
     }
+    sharedPlane := floor >= 0 && floor == ceiling
 
-    ceilingWords, floorWords := ceiling * engine.VisplaneWords, floor * engine.VisplaneWords
-    ceilingInline, floorInline := ceiling < engine.InlineVisplaneCount, floor < engine.InlineVisplaneCount
     for relative := range span.End - span.First {
         column := span.First + relative
+        textureColumn := maskedTexture
         clipTop, clipEnd := 0, height
         open := coverage.Rows[column]
         // Zero means untouched. Nonzero entries store the half-open row range
@@ -150,36 +157,43 @@ func paintRun(camera engine.Camera, wall engine.WallDistance, projection engine.
 
         // Record the plane fragments while the nearer portal's clipping is
         // still in force. Wall tiers then narrow the opening for deeper walls.
-        if ceiling >= 0 && clipTop < clipEnd && from > clipTop {
-            last := from
+        ceilingFragment := ceiling >= 0 && clipTop < clipEnd && from > clipTop
+        floorFragment := floor >= 0 && clipTop < clipEnd && end < clipEnd
+        if ceilingFragment || (sharedPlane && floorFragment) {
+            if !ceilingWritten && ceilingRaster.HasRows { ceilingRows = ceilingRaster.Rows.ReadRows() }
+            ceilingWritten = true
+            first, last := clipTop, from
+            // With a shared sky plane, Doom's floor write replaces the
+            // ceiling at this column only when the floor has visible rows.
+            if sharedPlane && floorFragment {
+                first, last = end, clipEnd
+                if first < clipTop { first = clipTop }
+            }
             if last > clipEnd { last = clipEnd }
-            ceilingRows[column] = (bits<32>(clipTop) << 16) | bits<32>(last)
+            ceilingRows[column] = (bits<32>(first) << 16) | bits<32>(last)
             word := column >> 5
             mask := bits<32>(1) << (column & 31)
-            if ceilingInline {
-                word = ceilingWords + word
-                coverage.Planes.ColumnWords[word] = coverage.Planes.ColumnWords[word] | mask
-            } else {
-                ceilingSpill.Words[word] = ceilingSpill.Words[word] | mask
-            }
+            ceilingRaster.Words[word] = ceilingRaster.Words[word] | mask
         }
-        if floor >= 0 && clipTop < clipEnd && end < clipEnd {
+        if floorFragment && !sharedPlane {
+            if !floorWritten && floorRaster.HasRows { floorRows = floorRaster.Rows.ReadRows() }
+            floorWritten = true
             first := end
             if first < clipTop { first = clipTop }
             floorRows[column] = (bits<32>(first) << 16) | bits<32>(clipEnd)
             word := column >> 5
             mask := bits<32>(1) << (column & 31)
-            if floorInline {
-                word = floorWords + word
-                coverage.Planes.ColumnWords[word] = coverage.Planes.ColumnWords[word] | mask
-            } else {
-                floorSpill.Words[word] = floorSpill.Words[word] | mask
-            }
+            floorRaster.Words[word] = floorRaster.Words[word] | mask
         }
 
-        if !surface.TwoSided && !surface.Materials.middleAbsent {
-            if surface.Materials.Middle.Texture.Valid {
-                if from < end { middlePixels[column] = (bits<32>(from) << 16) | bits<32>(end) }
+        if opaqueMiddle {
+            if middleTexture {
+                if from < end {
+                    middleOrUpperPixels[column] = (bits<32>(from) << 16) | bits<32>(end)
+                    if middleOrUpperBand.First == span.End { middleOrUpperBand.First = column }
+                    middleOrUpperBand.End = column + 1
+                    textureColumn = true
+                }
             } else {
                 paintColumn(column, from, end, surface.Shade, camera.View)
             }
@@ -187,82 +201,72 @@ func paintRun(camera engine.Camera, wall engine.WallDistance, projection engine.
             if upper {
                 bandEnd := (high.Row >> WallHeightBits) + 1
                 if bandEnd > clipEnd { bandEnd = clipEnd }
-                if surface.Materials.Upper.Texture.Valid {
-                    if from < bandEnd { upperPixels[column] = (bits<32>(from) << 16) | bits<32>(bandEnd) }
+                if upperTexture {
+                    if from < bandEnd {
+                        middleOrUpperPixels[column] = (bits<32>(from) << 16) | bits<32>(bandEnd)
+                        if middleOrUpperBand.First == span.End { middleOrUpperBand.First = column }
+                        middleOrUpperBand.End = column + 1
+                        textureColumn = true
+                    }
                 } else {
                     paintColumn(column, from, bandEnd, surface.Shade, camera.View)
                 }
                 clipTop = from
                 if bandEnd > clipTop { clipTop = bandEnd }
+                high.Row = high.Row + high.Step
             } else if markCeiling {
                 clipTop = from
             }
             if lower {
                 bandStart := (low.Row + WallHeightUnit - 1) >> WallHeightBits
                 if bandStart < clipTop { bandStart = clipTop }
-                if surface.Materials.Lower.Texture.Valid {
-                    if bandStart < end { lowerPixels[column] = (bits<32>(bandStart) << 16) | bits<32>(end) }
+                if lowerTexture {
+                    if bandStart < end {
+                        lowerPixels[column] = (bits<32>(bandStart) << 16) | bits<32>(end)
+                        if lowerBand.First == span.End { lowerBand.First = column }
+                        lowerBand.End = column + 1
+                        textureColumn = true
+                    }
                 } else {
                     paintColumn(column, bandStart, end, surface.Shade, camera.View)
                 }
                 clipEnd = end
                 if bandStart < clipEnd { clipEnd = bandStart }
+                low.Row = low.Row + low.Step
             } else if markFloor {
                 clipEnd = end
             }
-            coverage.Rows[column] = (bits<32>(clipRow(clipTop, height) + 1) << 16) | bits<32>(clipRow(clipEnd, height))
+            if clipTop < 0 { clipTop = 0 } else if clipTop > height { clipTop = height }
+            if clipEnd < 0 { clipEnd = 0 } else if clipEnd > height { clipEnd = height }
+            coverage.Rows[column] = (bits<32>(clipTop + 1) << 16) | bits<32>(clipEnd)
         }
         top.Row = top.Row + top.Step
         bottom.Row = bottom.Row + bottom.Step
-        high.Row = high.Row + high.Step
-        low.Row = low.Row + low.Step
-    }
-    var run WallTextureRun
-    if surface.Materials.Textured {
-        run = WallTextureRun{Bounds: span, Scale: scale, Height: height, Width: camera.View.Width}
-        for offset := range span.End - span.First {
-            x := span.First + offset
-            if surface.Materials.Masked.Texture.Valid || middlePixels[x] != 0 || upperPixels[x] != 0 || lowerPixels[x] != 0 {
-                run.Columns[x] = engine.WallTextureColumn(projection, surface.ColumnAngles[x])
-            }
-        }
-        if surface.Materials.Middle.Texture.Valid {
-            cache = drawTextureRun(run, surface.Materials.Middle, surface.Materials, middlePixels, surface.Shade, cache)
-        }
-        if surface.Materials.Upper.Texture.Valid {
-            cache = drawTextureRun(run, surface.Materials.Upper, surface.Materials, upperPixels, surface.Shade, cache)
-        }
-        if surface.Materials.Lower.Texture.Valid {
-            cache = drawTextureRun(run, surface.Materials.Lower, surface.Materials, lowerPixels, surface.Shade, cache)
+        if textured && textureColumn {
+            run.Columns[column] = engine.WallTextureColumn(projection, view.ColumnAngles[column])
         }
     }
-    if ceiling >= 0 {
-        if ceilingInline {
-            coverage.PlaneRows[ceiling] = engine.PlaneRows{Values: ceilingRows}
-            coverage.HasPlaneRows[ceiling] = true
-        } else if ceiling != floor {
-            ceilingSpill.Rows, ceilingSpill.HasRows = engine.PlaneRows{Values: ceilingRows}, true
-            coverage.Planes = coverage.Planes.WithOverflowRaster(ceiling, ceilingSpill)
-        }
+    if textured && middleOrUpperBand.First < middleOrUpperBand.End {
+        tier := surface.Materials.Upper
+        if opaqueMiddle { tier = surface.Materials.Middle }
+        cache = drawTextureRun(run, tier, shading, surface.Materials.Light, surface.Materials.ExtraLight,
+            middleOrUpperPixels, middleOrUpperBand, surface.Shade, cache)
     }
-    if floor >= 0 {
-        if floorInline {
-            coverage.PlaneRows[floor] = engine.PlaneRows{Values: floorRows}
-            coverage.HasPlaneRows[floor] = true
-        } else {
-            // Normalized sky keys can make the floor and ceiling share a plane.
-            if floor == ceiling {
-                for word := range engine.VisplaneWords {
-                    floorSpill.Words[word] = floorSpill.Words[word] | ceilingSpill.Words[word]
-                }
-            }
-            floorSpill.Rows, floorSpill.HasRows = engine.PlaneRows{Values: floorRows}, true
-            coverage.Planes = coverage.Planes.WithOverflowRaster(floor, floorSpill)
-        }
+    if textured && lowerBand.First < lowerBand.End {
+        cache = drawTextureRun(run, surface.Materials.Lower, shading, surface.Materials.Light, surface.Materials.ExtraLight,
+            lowerPixels, lowerBand, surface.Shade, cache)
     }
-    if coverage.TrackDrawSegments || surface.Materials.Masked.Texture.Valid {
+    if ceilingWritten {
+        ceilingRaster.Rows, ceilingRaster.HasRows = engine.PlaneRows{Values: ceilingRows}, true
+        coverage.Planes = coverage.Planes.WithRaster(ceiling, ceilingRaster)
+    }
+    if floorWritten {
+        floorRaster.Rows, floorRaster.HasRows = engine.PlaneRows{Values: floorRows}, true
+        coverage.Planes = coverage.Planes.WithRaster(floor, floorRaster)
+    }
+    if coverage.TrackDrawSegments || maskedTexture {
         rangeSegment.ScaleFirst, rangeSegment.ScaleLast = scale.First, scale.Last
-        coverage = recordDrawSegment(coverage, rangeSegment, surface, camera.Z, run)
+        coverage = recordDrawSegment(coverage, rangeSegment, surface, camera.Z, run, shading)
     }
     return coverage, cache
 }
@@ -277,19 +281,25 @@ type ProjectedWall struct {
 func ProjectWall(camera engine.Camera, coverage engine.ColumnCoverage, first engine.Vertex, last engine.Vertex) ProjectedWall {
     firstAngle := engine.PointToAngle(camera.X, camera.Y, first.X, first.Y)
     lastAngle := engine.PointToAngle(camera.X, camera.Y, last.X, last.Y)
+    return ProjectWallFromAngles(camera, coverage, firstAngle, lastAngle)
+}
+
+func ProjectWallFromAngles(camera engine.Camera, coverage engine.ColumnCoverage, firstAngle bits<32>,
+    lastAngle bits<32>) ProjectedWall {
     span := engine.WallColumns(camera.View, camera.Heading, firstAngle, lastAngle)
     if !engine.SpanOpen(coverage, span) { return ProjectedWall{} }
     return ProjectedWall{Span: span, FirstAngle: firstAngle}
 }
 
 func DrawProjectedWall(camera engine.Camera, coverage engine.ColumnCoverage, first engine.Vertex, last engine.Vertex,
-    direction bits<32>, surface Surface, height int, projected ProjectedWall) engine.ColumnCoverage {
-    drawn, _ := DrawProjectedWallCached(camera, coverage, first, last, direction, surface, height, projected, ColumnCache{})
+    direction bits<32>, surface Surface, view WallView, projected ProjectedWall, shading WadShading) engine.ColumnCoverage {
+    drawn, _ := DrawProjectedWallCached(camera, coverage, first, last, direction, surface, view, projected, shading, ColumnCache{})
     return drawn
 }
 
 func DrawProjectedWallCached(camera engine.Camera, coverage engine.ColumnCoverage, first engine.Vertex, last engine.Vertex,
-    direction bits<32>, surface Surface, height int, projected ProjectedWall, cache ColumnCache) (engine.ColumnCoverage, ColumnCache) {
+    direction bits<32>, surface Surface, view WallView, projected ProjectedWall, shading WadShading,
+    cache ColumnCache) (engine.ColumnCoverage, ColumnCache) {
     span, firstAngle := projected.Span, projected.FirstAngle
     coverage.StoredWallRange = false
     if span.First >= span.End { return coverage, cache }
@@ -299,31 +309,30 @@ func DrawProjectedWallCached(camera engine.Camera, coverage engine.ColumnCoverag
     if surface.Materials.Textured {
         projection = engine.PrepareWallTexture(wall, camera.Heading, firstAngle, surface.Materials.OffsetU)
     }
-    begin := -1
-    for relative := range span.End - span.First + 1 {
-        column := span.First + relative
-        if column < span.End && !coverage.Words[column / 32][column % 32] {
-            if begin < 0 {
-                begin = column
-            }
-        } else if begin >= 0 {
-            clipped := engine.DrawSegment{Span: engine.ColumnSpan{First: begin, End: column}, First: first, Last: last}
-            coverage, cache = paintRun(camera, wall, projection, clipped, surface, height, coverage, cache)
-            if coverage.Failed { return coverage, cache }
-            coverage.StoredWallRange = true
-            begin = -1
+    remaining := span
+    for range span.End - span.First {
+        open := engine.NextOpenSpan(coverage, remaining)
+        if open.First >= open.End {
+            if surface.Solid { return engine.CoverSpan(coverage, span), cache }
+            return coverage, cache
         }
+        clipped := engine.DrawSegment{Span: open, First: first, Last: last}
+        coverage, cache = paintRun(camera, wall, projection, clipped, surface, view, coverage, shading, cache)
+        if coverage.Failed { return coverage, cache }
+        coverage.StoredWallRange = true
+        remaining.First = open.End + 1
     }
     if surface.Solid { return engine.CoverSpan(coverage, span), cache }
     return coverage, cache
 }
 
 func DrawWall(camera engine.Camera, coverage engine.ColumnCoverage, first engine.Vertex, last engine.Vertex,
-    direction bits<32>, surface Surface, height int) engine.ColumnCoverage {
-    return DrawProjectedWall(camera, coverage, first, last, direction, surface, height, ProjectWall(camera, coverage, first, last))
+    direction bits<32>, surface Surface, view WallView, shading WadShading) engine.ColumnCoverage {
+    return DrawProjectedWall(camera, coverage, first, last, direction, surface, view, ProjectWall(camera, coverage, first, last), shading)
 }
 
 func DrawSolidWall(camera engine.Camera, coverage engine.ColumnCoverage, first engine.Vertex, last engine.Vertex, direction bits<32>,
     heights engine.SectorHeights, height int, shade color) engine.ColumnCoverage {
-    return DrawWall(camera, coverage, first, last, direction, Surface{Front: heights, Solid: true, Shade: shade}, height)
+    return DrawWall(camera, coverage, first, last, direction, Surface{Front: heights, Solid: true, Shade: shade},
+        WallView{Height: height}, WadShading{})
 }

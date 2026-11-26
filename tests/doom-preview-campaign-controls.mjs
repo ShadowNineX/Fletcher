@@ -8,7 +8,7 @@ import { parseArgs } from "node:util";
 import { fileURLToPath } from "node:url";
 import { extractFunction } from "./doom-native-actor-oracle.mjs";
 import { runNativeNightmareOracle } from "./doom-native-damage-oracle.mjs";
-import { decode, simulator } from "./logic-arrows-simulator.mjs";
+import { decode, destinations, keyOf, simulator } from "./logic-arrows-simulator.mjs";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const { values } = parseArgs({ options: { upstream: { type: "string" } } });
@@ -159,7 +159,7 @@ ${view}`);
 }
 
 function build({ skill = 2, fast = false, respawn = false, monsters = false, blocked = false, sectorSpecial = 0,
-    maps, things: explicitThings, signature = "PWAD", previousRoute = 0 } = {}) {
+    maps, things: explicitThings, signature = "PWAD", previousRoute = 0, disconnectRun = false, disconnectAction = false } = {}) {
     const entry = previewSource({ skill, fast, respawn, previousRoute });
     const things = explicitThings ?? (monsters ? [64, 64, 0, 3002, 7, 160, 0, 95, 3002, 15] : []);
     if (blocked) things.push(160, 0, 0, 2035, 7);
@@ -175,7 +175,24 @@ function build({ skill = 2, fast = false, respawn = false, monsters = false, blo
     assert.equal(result.status, 0, result.stderr || result.stdout);
     const data = JSON.parse(readFileSync(output, "utf8")).data;
     assert.equal(Buffer.from(data, "base64")[2], 1, "preview map stays compressed");
-    return simulator(decode(data), true);
+    const tiles = decode(data);
+    if (disconnectRun) {
+        const bridge = tiles.find(tile => tile.type === 33 && tile.payload?.includes("doomKeyboardDeltas = results"));
+        assert.ok(bridge);
+        const pad = tiles.find(tile => tile.x === bridge.x + 3 && tile.y === bridge.y + 4);
+        assert.equal(pad?.type, 1, "the forward command board has a physical Run input pad");
+        pad.type = 25;
+        pad.extra = 7;
+    }
+    if (disconnectAction) {
+        const hub = tiles.find(tile => tile.x === 54 && tile.y === 112);
+        assert.equal(hub?.type, 10, "Fire and Use share a native Blue Arrow activity gate");
+        const sources = tiles.filter(tile => tile.type === 21 && destinations(tile).includes(keyOf(hub)));
+        assert.deepEqual(sources.map(tile => tile.extra).sort((a, b) => a - b), [6, 18, 49, 53]);
+        hub.type = 25;
+        hub.extra = 7;
+    }
+    return simulator(tiles, true);
 }
 
 function checkMonsterRules(rules, expectedTiming, expectedRespawn) {
@@ -322,6 +339,55 @@ function checkKeyboardMovement(sim) {
             "I uses running movement rates while sharing the slow turn phase");
     }
     assert.deepEqual(command([9, 23, 19, 17, 5]), [0, 0, 0], "opposing running movement keys cancel");
+
+    const up = 56, down = 57, left = 58, right = 59, alt = 54, shift = 52;
+    assert.deepEqual(command([23, up]), [25, 0, 0], "W and ArrowUp share one forward direction");
+    assert.deepEqual(command([19, up]), [0, 0, 0], "opposite aliases cancel forward movement");
+    assert.deepEqual(command([up, down]), [0, 0, 0], "opposite forward arrows cancel");
+    assert.deepEqual(command([shift, down]), [-50, 0, 0], "Shift and ArrowDown reach the same command");
+    for (let tic = 1; tic <= 5; tic++) {
+        assert.deepEqual(command([1, left]), [0, 0, 320], "same-side turn aliases advance the hold count once");
+    }
+    assert.deepEqual(command([left]), [0, 0, 640], "ArrowLeft reaches full turn rate on the sixth tic");
+    assert.deepEqual(command([right, 1]), [0, 0, 0], "opposite aliases cancel turning");
+    assert.deepEqual(command([left, right]), [0, 0, 0], "opposite turn arrows cancel");
+    assert.deepEqual(command([right]), [0, 0, -640], "opposed and switched cursor keys retain the turn hold count");
+    command([]);
+    for (let tic = 1; tic <= 5; tic++) {
+        assert.deepEqual(command([alt, left]), [0, -24, 0], "Alt and ArrowLeft strafe without turning");
+    }
+    assert.deepEqual(command([left]), [0, 0, 640], "Alt-strafe advances the native turn hold count");
+    assert.deepEqual(command([shift, alt, right, 5]), [0, 50, 0], "running strafe and E add then clamp without turning");
+    assert.deepEqual(command([27, right]), [0, 24, 0], "the 0 strafe alias remains available");
+}
+
+function checkNativeCommandSource() {
+    const sim = build({ disconnectRun: true });
+    const commands = () => logs(sim, "movement-command");
+    function runningCommand() {
+        const before = commands().length;
+        pulseButtons(sim, [56, 52]); // ArrowUp + Shift
+        return Array.from(commands()[before]).slice(1);
+    }
+    stepsUntil(sim, undefined, () => commands().length > 0, "enter the playable room");
+    assert.deepEqual(runningCommand(), [50, 0, 0], "startup fallback can run while the circuit fills the table");
+    stepsUntil(sim, undefined, () => logs(sim, "Doom native player command ready").length === 1, "receive the physical command table", 720);
+    assert.deepEqual(runningCommand(), [25, 0, 0], "disconnecting the physical Run pad changes the live movement command");
+}
+
+function checkNativeActionGuard() {
+    for (const disconnectAction of [false, true]) {
+        const sim = build({ disconnectAction });
+        stepsUntil(sim, undefined, () => logs(sim, "player-buttons").length > 0, "enter the playable room");
+        for (let tic = 0; tic < 18; tic++) pulseButtons(sim, []);
+        const uses = logs(sim, "use-lines").length;
+        const [, , , , attack] = pulseButtons(sim, [53, 49]); // Ctrl and Space for a single host tick.
+        assert.equal(attack, disconnectAction ? 0 : 1, "the native gate admits the attack chord");
+        assert.equal(logs(sim, "use-lines").length, uses + (disconnectAction ? 0 : 1), "the native gate also admits Use");
+        let ammo;
+        for (let tic = 0; tic < 12; tic++) [ammo] = pulseButtons(sim, []);
+        assert.equal(ammo, disconnectAction ? 50 : 49, "Doom consumes the ammo after the pistol's attack wind-up");
+    }
 }
 
 function checkMouseMovement() {
@@ -347,6 +413,8 @@ function checkMouseMovement() {
     assert.deepEqual(command(), neutral, "a consumed delta never repeats across logical tics");
     mouse(664, 448);
     assert.deepEqual(command([strafe, 4, 23]), [50, 50, 0], "mouse and keyboard combine and clamp with strafe held");
+    mouse(676, 448);
+    assert.deepEqual(command([54]), [0, 24, 0], "Alt routes mouse X to strafing without a direction key");
     assert.deepEqual(command([13]), neutral, "open the automap");
     mouse(800, 576);
     assert.deepEqual(command(), neutral, "pointer motion belongs to the automap while it is open");
@@ -632,6 +700,10 @@ try {
         checkMonsterRules(rules, timing, thinkers);
     });
     console.log("WAD preview passed Nightmare fast timing, ordered monster respawn, independent fast/respawn flags and blocked spawn RNG.");
+    checkNativeCommandSource();
+    checkNativeActionGuard();
+    console.log("The campaign consumes its physical arithmetic circuit: disconnecting Run changed Shift+Up from +50 to +25.");
+    console.log("Single-host Ctrl+Space reached Fire and Use together. Disconnecting their physical gate suppressed both actions.");
 } finally {
     assert.match(path.relative(temp, realpathSync(scratch)), /^fletcher-campaign-controls-[^/\\]+$/);
     rmSync(scratch, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });

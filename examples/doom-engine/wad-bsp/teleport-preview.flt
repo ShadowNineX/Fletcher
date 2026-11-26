@@ -13,7 +13,7 @@ func previewCallbackContext(scene PreviewCombat) play.WalkoverContext {
         Base: scene.Base, View: scene.View, Heard: scene.Hearing.Targets, Brain: scene.Brain,
         FirstActive: scene.FirstActive, MapActors: scene.MapActors, GameTic: scene.GameTic,
         Rules: scene.Rules, RespawnMonsters: scene.RespawnMonsters,
-        Cues: scene.Cues, LastSound: scene.LastSound, WeaponSound: scene.WeaponSound, Changed: scene.Changed}}
+        Cues: scene.Cues, LastSound: scene.LastSound, WeaponRequests: scene.WeaponRequests, Changed: scene.Changed}}
 }
 
 func resumePreviewCallback(scene PreviewCombat, callback play.WalkoverContext) PreviewCombat {
@@ -22,7 +22,7 @@ func resumePreviewCallback(scene PreviewCombat, callback play.WalkoverContext) P
     scene.FirstActive, scene.MapActors, scene.GameTic, scene.Rules = state.FirstActive, state.MapActors, state.GameTic, state.Rules
     scene.RespawnMonsters = state.RespawnMonsters
     scene.Cues, scene.LastSound, scene.Changed = state.Cues, state.LastSound, state.Changed
-    scene.WeaponSound = state.WeaponSound
+    scene.WeaponRequests = state.WeaponRequests
     return scene
 }
 

@@ -140,9 +140,12 @@ map "Doom projection parity" {
                 if tickIndex == 164 { viewHeight = 81 }
                 view := engine.NewPlaneView(engine.Camera{Z: 41 * Unit, View: engine.NewViewProjection(128),
                     Heading: PlaneHeadings[tickIndex - 162]}, viewHeight)
-                var angles [engine.MaxViewWidth]bits<32>
-                if tickIndex == 164 { angles = engine.ViewColumnAngles(view.Camera.View) }
-                cache := engine.NewPlaneSpanCache(view, angles, tickIndex == 164)
+                cache := engine.NewPlaneSpanCache(view, [engine.MaxViewWidth]bits<32>{}, false)
+                if tickIndex == 164 {
+                    angles := engine.ViewColumnAngles(view.Camera.View)
+                    scales := engine.PlaneDistanceScales(view.Camera.View.Width, angles)
+                    cache = engine.NewPlaneSpanCacheWithScales(view, angles, true, scales)
+                }
                 for pass, height := range [6]int{41, 0, 82, 64, 0, 41} {
                     painter := CachedSpanTrace{View: view, Z: height * Unit, Pass: pass}
                     cache = engine.MakeProjectedPlaneSpans(painter, columns, bounds, painter.Z, cache)
@@ -170,6 +173,38 @@ map "Doom projection parity" {
             }
             odd := engine.NewLowDetailProjection(127)
             log(odd.Width, odd.DetailShift)
+        } else if tickIndex <= 173 {
+            profile := tickIndex - 166
+            width := Widths[profile & 3]
+            view := engine.NewViewProjection(width)
+            if profile >= 4 { view = engine.NewLowDetailProjection(width) }
+            angles := engine.ViewColumnAngles(view)
+            camera := engine.Camera{View: view, Heading: 0xf0543210}
+            wall := engine.WallDistance{Normal: 0xf1000000, Distance: 48 * Unit + 321}
+            matches := true
+            for column := range view.Width {
+                span := engine.ColumnSpan{First: column, End: view.Width}
+                direct := engine.ScaleWallSpan(camera, wall, span)
+                cached := engine.ScaleWallSpanFromAngles(camera, wall, span, angles[column], angles[view.Width - 1])
+                if direct.First != cached.First || direct.Last != cached.Last || direct.Step != cached.Step { matches = false }
+            }
+            log(view.Width, view.DetailShift, matches)
+        } else if tickIndex == 174 {
+            var coverage engine.ColumnCoverage
+            clear := engine.NextOpenSpan(coverage, engine.ColumnSpan{First: 30, End: 320})
+            log(clear.First, clear.End)
+            for _, rangeBounds := range [5][2]int{
+                [2]int{0,31}, [2]int{32,64}, [2]int{66,96}, [2]int{128,300}, [2]int{319,320},
+            } {
+                coverage = engine.CoverSpan(coverage, engine.ColumnSpan{First: rangeBounds[0], End: rangeBounds[1]})
+            }
+            for _, bounds := range [10][2]int{
+                [2]int{-1,15}, [2]int{29,66}, [2]int{31,32}, [2]int{32,64}, [2]int{62,100},
+                [2]int{66,130}, [2]int{128,319}, [2]int{318,320}, [2]int{319,320}, [2]int{319,321},
+            } {
+                open := engine.NextOpenSpan(coverage, engine.ColumnSpan{First: bounds[0], End: bounds[1]})
+                log(open.First, open.End)
+            }
         }
     }
 }
@@ -249,6 +284,20 @@ map "Doom projection parity" {
         [5803982, -4701986, 0, 64342, 5148657], [-71507235, -136694189, 1809920, -288960, 146800640],
         [-939608, 4381301, -34767, 14394, 3013848], [127, 0],
     ]);
+
+    const afterLowDetail = sim.logs.length;
+    for (let i = 0; i < 8; i++) sim.step();
+    assert.deepEqual(JSON.parse(JSON.stringify(sim.logs.slice(afterLowDetail))), [
+        [2, 0, true], [95, 0, true], [160, 0, true], [320, 0, true],
+        [2, 0, true], [95, 0, true], [80, 1, true], [160, 1, true],
+    ], "cached wall scale uses the same endpoints through the last visible column");
+
+    const afterWallScale = sim.logs.length;
+    sim.step();
+    assert.deepEqual(JSON.parse(JSON.stringify(sim.logs.slice(afterWallScale))), [
+        [30, 320], [0, 0], [31, 32], [31, 32], [64, 64], [64, 66],
+        [96, 128], [300, 319], [318, 319], [320, 320], [0, 0],
+    ], "the next uncovered wall span respects word boundaries, covered gaps, and clipping limits");
 
     const demo = simulator(build(path.join(port, "bsp-demo", "main.flt")));
     const middle = () => Array.from({ length: 96 }, (_, i) => demo.tileAt({x: i - 48, y: 0}).extra);

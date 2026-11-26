@@ -4,6 +4,25 @@ import "play"
 import "wad"
 import "walls"
 
+func campaignSaveCharacter(letters bits<26>, digits bits<10>, space bit) string {
+    // Native Key tiles buffer each press. A batch of simultaneous keys has
+    // no defined character order.
+    if space {
+        if letters == 0 && digits == 0 { return " " }
+        return ""
+    }
+    if letters == 0 {
+        for index, character := range "0123456789" {
+            if digits == bits<10>(1 << index) { return character }
+        }
+    } else if digits == 0 {
+        for index, character := range "ABCDEFGHIJKLMNOPQRSTUVWXYZ" {
+            if letters == bits<26>(1 << index) { return character }
+        }
+    }
+    return ""
+}
+
 func campaignMarker(mounts wad.Archives, route play.CampaignRoute) int {
     lump := mounts.Find(route.NextName)
     if !lump.Valid || lump.Entry < 0 || lump.Size != 0 { return -1 }
@@ -50,7 +69,10 @@ func drawFinaleBackdrop(materials walls.Materials, route play.CampaignRoute) {
         row := flat.Offset + ((y * intermissionHeight / Height) & 63) * 64
         for x := range Width {
             column := (x * intermissionWidth / Width) & 63
-            pixel(x, y, true, materials.Shade.ColorAt(int(flat.File[row + column]), x, y))
+            index := int(flat.File[row + column])
+            swatch := materials.Shade.ColorAt(index, x, y)
+            if DisplayUsesRgb { pixel(x, y, true, swatch, index)
+            } else { pixel(x, y, true, swatch) }
         }
     }
 }

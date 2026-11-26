@@ -108,7 +108,7 @@ function previewSource() {
             assert.match(source, /register mapView automap\.View/, "automap preview state is exposed");
             assert.match(source, /register automapActive bit/, "automap visibility is exposed");
             assert.match(source, /next mapView = updatedMapView/, "automap input is committed once per preview tic");
-            const held = "                    redraw := mapChanged ||";
+            const held = "                    redraw := gammaChanged || mapChanged ||";
             assert.equal(source.split(held).length, 2, "trace the held-world automap");
             source = source.replace(held, `                    log("held-map", mapOpen, updatedMapView.Follow, updatedMapView.Grid,
                         updatedMapView.Full, updatedMapView.Window.X, updatedMapView.Window.Y, updatedMapView.Window.Scale,
@@ -199,7 +199,7 @@ function checkPausedAutomap(sim) {
     const zoomed = command(26, view => view.scale > following.scale);
     assert.deepEqual(decodeState(rows().at(-1)), zoomed, "stationary follow stays at the selected zoom");
     command(21, view => !view.follow);
-    const panned = command(23, view => view.y > zoomed.y);
+    const panned = command(56, view => view.y > zoomed.y); // The physical Up key pans while paused.
     command(7, view => view.grid !== panned.grid);
     command(14, view => view.marks === 1);
     command(22, view => view.marks === 0);

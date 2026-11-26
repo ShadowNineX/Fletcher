@@ -1,4 +1,4 @@
-// Check Doom's two-sided portal clipping when either tier has no texture.
+// Check Doom's absent wall tiers and the write order for a shared sky plane.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
@@ -64,7 +64,7 @@ map "Doom missing portal tiers" {
     screen at (0, 0) size (Width, Height) with { style = "solid", hold = true }
     tick {
         profile := currentTick()
-        if profile < 7 {
+        if profile < 9 {
             for y := range Height { pixel(8, y, true, color.Green) }
             camera := engine.Camera{View: engine.NewViewProjection(Width)}
             first := engine.Vertex{X: 64 << 16, Y: 128 << 16}
@@ -72,6 +72,8 @@ map "Doom missing portal tiers" {
             wall := wad.WallSegment{First: first, Last: last, Direction: 0xc0000000, TwoSided: profile != 6, Light: 255,
                 Front: engine.SectorHeights{Floor: -32 << 16, Ceiling: 32 << 16},
                 Back: engine.SectorHeights{Floor: -16 << 16, Ceiling: 16 << 16}}
+            sharedSky := profile >= 7
+            if profile == 7 { wall.Front.Floor = -64 << 16 }
             dash, tier := wad.LumpName{Low: 45}, wad.LumpName{Low: 0x52454954}
             sides := wad.SideMaterial{Upper: dash, Lower: dash}
             if profile == 1 || profile == 3 { sides.Upper = tier }
@@ -81,17 +83,27 @@ map "Doom missing portal tiers" {
                 sides.Upper, sides.Lower, sides.Middle = reserved, reserved, reserved
             }
             var materials walls.WallMaterials
+            var shading walls.WadShading
             if profile != 4 {
                 mounted := wad.OpenArchive(Art)
-                textures := walls.Materials{Textures: wad.LoadMountedTextureSet(mounted), Shade: walls.LoadShading(mounted)}
+                shading = walls.LoadShading(mounted)
+                textures := walls.Materials{Textures: wad.LoadMountedTextureSet(mounted)}
                 materials = walls.ResolveWallMaterials(textures, wall, sides, camera.Z)
-                if !materials.Shade.Valid { log("missing fixture art") }
+                if !shading.Valid { log("missing fixture art") }
             }
             surface := walls.Surface{Front: wall.Front, Back: wall.Back, Solid: !wall.TwoSided, TwoSided: wall.TwoSided,
-                MarkCeiling: true, MarkFloor: true,
-                Shade: color.Red, Materials: materials, ColumnAngles: engine.ViewColumnAngles(camera.View)}
-            projected := walls.ProjectWall(camera, engine.ColumnCoverage{}, first, last)
-            drawn := walls.DrawProjectedWall(camera, engine.ColumnCoverage{}, first, last, wall.Direction, surface, Height, projected)
+                MarkCeiling: true, MarkFloor: true, FrontSky: sharedSky,
+                Shade: color.Red, Materials: materials}
+            view := walls.WallView{Height: Height, ColumnAngles: engine.ViewColumnAngles(camera.View)}
+            var coverage engine.ColumnCoverage
+            if sharedSky {
+                sky := engine.PlaneKey{TextureLow: 0x4b535f46, TextureHigh: 0x3159, Sky: true}
+                floor, ceiling := sky, sky
+                floor.Height, ceiling.Height = wall.Front.Floor, wall.Front.Ceiling
+                coverage = engine.BeginSubsectorPlanes(coverage, camera.Z, floor, ceiling)
+            }
+            projected := walls.ProjectWall(camera, coverage, first, last)
+            drawn := walls.DrawProjectedWall(camera, coverage, first, last, wall.Direction, surface, view, projected, shading)
             // Feed the pinned column loop the same projected wall heights.
             // The renderer independently determines whether to clip/paint the tiers.
             distance := engine.PrepareWall(camera, first, wall.Direction, projected.FirstAngle)
@@ -101,8 +113,16 @@ map "Doom missing portal tiers" {
             top, bottom := edge(wall.Front.Ceiling, center, scale, columnOffset), edge(wall.Front.Floor, center, scale, columnOffset)
             high, low := edge(wall.Back.Ceiling, center, scale, columnOffset), edge(wall.Back.Floor, center, scale, columnOffset)
             clip := drawn.Rows[8]
+            skyFirst, skyEnd := -1, -1
+            if sharedSky && drawn.CeilingPlane == drawn.FloorPlane && drawn.CeilingPlane > 0 {
+                raster := drawn.Planes.RasterAt(drawn.CeilingPlane - 1)
+                if raster.HasRows {
+                    rows := raster.Rows.ReadRows()
+                    skyFirst, skyEnd = int(rows[8] >> 16), int(rows[8] & 65535)
+                }
+            }
             log(Height, top, bottom, high, low, profile == 1 || profile == 3, profile == 1 || profile == 2,
-                int(clip >> 16) - 1, int(clip & 65535), drawn.Failed)
+                sharedSky, int(clip >> 16) - 1, int(clip & 65535), skyFirst, skyEnd, drawn.Failed)
         }
     }
 }`);
@@ -113,14 +133,15 @@ map "Doom missing portal tiers" {
     assert.equal(built.status, 0, built.stderr || built.stdout);
     const sim = simulator(decode(JSON.parse(readFileSync(output, "utf8")).data), true);
     const inputs = [], rows = [];
-    for (let profile = 0; profile < 7; profile++) {
+    for (let profile = 0; profile < 9; profile++) {
         sim.step();
         const row = Array.from(sim.logs[profile], Number);
         assert.equal(row.pop(), 0, "the wall range renders");
-        inputs.push(row.slice(0, 7));
+        inputs.push(row.slice(0, 8));
         const pixel = y => sim.tileAt({ x: 8, y })?.extra;
         const painted = Array.from({ length: 16 }, (_, y) => pixel(y)).filter(value => value !== pixel(0)).length;
-        rows.push([...row.slice(7), painted]);
+        const clipAndPaint = [...row.slice(8, 10), painted];
+        rows.push(profile < 7 ? clipAndPaint : [...clipAndPaint, ...row.slice(10)]);
     }
     const [missing, textured, lower, upper, diagnostic, namedZero, missingMiddle] = rows;
     assert.equal(missing[2], 0, "explicitly absent tiers leave the existing framebuffer visible");
@@ -128,13 +149,15 @@ map "Doom missing portal tiers" {
     assert.deepEqual(diagnostic, textured, "the asset-free geometry diagnostic still uses fallback color");
     assert.deepEqual(namedZero, missing, "naming texture zero also leaves an empty upper and lower tier");
     assert.deepEqual(missingMiddle, missing, "texture zero leaves the one-sided middle tier undrawn");
+    assert.ok(rows[7][3] === 0 && rows[7][4] > 0 && rows[7][4] < 8, "ceiling-only sky fragment survives");
+    assert.ok(rows[8][3] > 8 && rows[8][4] === 16, "visible floor replaces ceiling on the shared sky column");
     if (values.upstream) {
         const { runNativeMissingTiersOracle } = await import("./doom-native-missing-tiers-oracle.mjs");
         const withMaterials = (_, profile) => profile !== 4;
         assert.deepEqual(rows.filter(withMaterials), runNativeMissingTiersOracle(path.resolve(root, values.upstream), scratch, inputs.filter(withMaterials)),
             "the wall pixels and remaining portal span match pinned R_RenderSegLoop");
     }
-    console.log("Missing wall tiers matched Doom's opaque drawing and portal clipping.");
+    console.log("Missing wall tiers and shared sky matched Doom's opaque drawing and portal clipping.");
 } finally {
     assert.match(path.relative(temp, realpathSync(scratch)), /^fletcher-missing-tiers-[^/\\]+$/);
     rmSync(scratch, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });

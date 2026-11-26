@@ -1,16 +1,57 @@
 package main
 
+import "walls"
+
 // The compact profile keeps native fixture coordinates and game ticks small.
 // Use Width = 320 and Height = 200 for Doom's original framebuffer size.
 const Width = 128
 const Height = 96
-const DitherColors = true
+const DitherColors = false
+// Direct solid colors with visible shade bands for very dark scenes.
+const ContrastColors = true
+// Initial campaign gamma, from 0 through 4. J cycles it in the menu.
+const DisplayGamma = 0
 // Starting 3D detail mode. G toggles it in the campaign menu.
 const LowDetail = false
+// Enlarge each rendered pixel to a square of display tiles.
+const DisplayScale = 1
+// Use "rgb-lamps" at scale 3 for paired RGB subpixels, "rgb" at scale 2 for wall mixtures,
+// or "arrows" at scale 4 for the legacy physical lamp circuit.
+const DisplayStyle = "solid"
+const DisplayUsesRgb = DisplayStyle == "rgb" || DisplayStyle == "rgb-lamps"
+// Give the status bar a matte background and solid, high-contrast readouts.
+const CleanStatusBar = false
+// Start on the mounted WAD's title screen and use its campaign menu art.
+const ClassicMenu = false
+// Leave empty for automatic framing, or pass a camera scale such as "8".
+const DisplayZoom = ""
+// Work checkpoints per host tick. Zero uses Fletcher's default.
+const DisplaySliceWork = 0
 // Doom's view size with the status bar visible. Use 3–10 screen blocks.
 const ViewBlocks = 10
-const ControlRow = Height / 2
+const ControlRow = Height * DisplayScale / 2
+const DisplayLeft = -(Width * DisplayScale) / 2
+const DisplayTop = -(Height * DisplayScale) / 2
 
-// The focus marker sits two tiles left and two rows below the framebuffer.
+// The focus marker sits in the gap above the key rows, clear of the controls
+// even when a small framebuffer places its left edge close to a key.
 const previewCameraFocus = "const { x, y } = getPosition();\n" +
-    "onStart(() => game.focusCamera(x - 2, -y - 1, -x + 2, y + 16));"
+    "onStart(async () => {\n" +
+    "    await game.focusCamera(x - 2, -y - 2, -x + 2, y + 17);\n" +
+    "    const zoom = Number('" + DisplayZoom + "');\n" +
+    "    if (zoom) await game.zoomCamera(zoom);\n" +
+    "    else if (['rgb', 'rgb-lamps'].includes('" + DisplayStyle + "')) await game.zoomCamera(4);\n" +
+    "});"
+
+func prepareDisplayShade(shade walls.WadShading) walls.WadShading {
+    if DisplayUsesRgb { return shade.WithRGBPalette() }
+    if ContrastColors { return shade.WithContrast() }
+    if DitherColors { return shade.WithDithering() }
+    return shade
+}
+
+func useDisplayPalette(shade walls.WadShading) {
+    if DisplayUsesRgb && shade.Valid && shade.Palettes.Valid {
+        screenPalette(shade.RGBPalette())
+    }
+}

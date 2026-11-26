@@ -7,7 +7,17 @@ package play
 const inversePlayerColormap = 32
 const powerBlinkTics = 4 * 32
 
+func powerColormapOn(tics int, blink bytes) bit {
+    if tics >= 0 && tics < len(blink) { return blink[tics] != 0 }
+    return tics > powerBlinkTics || tics & 8 != 0
+}
+
 func TickLivePlayerCounters(world CombatWorld, handle int) CombatWorld {
+    var blink bytes
+    return TickLivePlayerCountersWithBlink(world, handle, blink)
+}
+
+func TickLivePlayerCountersWithBlink(world CombatWorld, handle int, blink bytes) CombatWorld {
     actor := world.Actors.ActorAt(handle - 1)
     slot := combatPlayer(actor)
     if slot < 0 { return world }
@@ -29,10 +39,10 @@ func TickLivePlayerCounters(world CombatWorld, handle int) CombatWorld {
     player.FixedColormap = 0
     if player.Powers[PowerInvulnerability] != 0 {
         tics := player.Powers[PowerInvulnerability]
-        if tics > powerBlinkTics || tics & 8 != 0 { player.FixedColormap = inversePlayerColormap }
+        if powerColormapOn(tics, blink) { player.FixedColormap = inversePlayerColormap }
     } else {
         tics := player.Powers[PowerInfrared]
-        if tics > powerBlinkTics || tics & 8 != 0 { player.FixedColormap = 1 }
+        if powerColormapOn(tics, blink) { player.FixedColormap = 1 }
     }
     world.Players[slot] = player
     return world

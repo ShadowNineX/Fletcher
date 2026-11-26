@@ -1,0 +1,90 @@
+// SPDX-License-Identifier: GPL-2.0-only
+package main
+
+// One lane computes (timer > 128) || timer[3]. A nonzero bit above bit 7
+// is sufficient. Otherwise bit 7 needs at least one lower bit. Bit 3
+// enables the blink directly, so its path bypasses the threshold AND.
+macro PowerBlinkLane(x int, y int) {
+    // Input pads, in order from bit 0 to bit 11.
+    place arrow at (x - 4, y) facing right
+    place arrow at (x - 3, y + 1) facing up
+    place arrow at (x - 3, y - 1) facing down
+    place arrow at (x, y - 4) facing down
+    place arrow at (x - 1, y + 2) facing left
+    place arrow at (x - 2, y + 3) facing up
+    place arrow at (x - 3, y + 2) facing right
+    place arrow at (x - 2, y - 2) facing down
+    place arrow at (x - 1, y - 3) facing right
+    place arrow at (x + 1, y - 3) facing left
+    place arrow at (x + 2, y - 2) facing left
+    place arrow at (x + 1, y - 1) facing up
+
+    // Reduce the low bits and align bit 7 at the AND.
+    place arrow at (x - 3, y) facing right
+    place blueArrow at (x - 2, y + 2) facing up
+    place arrow at (x - 2, y) facing right
+    place arrow at (x - 2, y - 1) facing right
+    place arrow at (x - 1, y - 1) facing down
+    place and at (x - 1, y) facing right
+
+    // Reduce the high bits and the direct blink bit, then join both paths.
+    place arrow at (x, y - 3) facing down
+    place arrow at (x + 1, y - 2) facing left
+    place arrow at (x, y - 2) facing down
+    place arrow at (x, y - 1) facing down
+    place arrow at (x, y) facing down
+}
+
+// Reserve x through x + 142 and y - 4 through y + 3.
+macro DoomPowerBlinkBoard(x int, y int) {
+    place scriptBlock at (x, y) with { code = powerBlinkBridge }
+    expand PowerBlinkLane(x + 5, y)
+    expand PowerBlinkLane(x + 14, y)
+    expand PowerBlinkLane(x + 23, y)
+    expand PowerBlinkLane(x + 32, y)
+    expand PowerBlinkLane(x + 41, y)
+    expand PowerBlinkLane(x + 50, y)
+    expand PowerBlinkLane(x + 59, y)
+    expand PowerBlinkLane(x + 68, y)
+    expand PowerBlinkLane(x + 77, y)
+    expand PowerBlinkLane(x + 86, y)
+    expand PowerBlinkLane(x + 95, y)
+    expand PowerBlinkLane(x + 104, y)
+    expand PowerBlinkLane(x + 113, y)
+    expand PowerBlinkLane(x + 122, y)
+    expand PowerBlinkLane(x + 131, y)
+    expand PowerBlinkLane(x + 140, y)
+}
+
+// Each result travels four host ticks from its pads. Restarting the row
+// index on rewind leaves four ticks for the old pipeline contents to drain.
+const powerBlinkBridge = "const {x, y} = getPosition();\n" +
+    "const lanes = 16, rows = 256, delay = 4;\n" +
+    "const pads = [[-4,0],[-3,1],[-3,-1],[0,-4],[-1,2],[-2,3],[-3,2],[-2,-2],[-1,-3],[1,-3],[2,-2],[1,-1]];\n" +
+    "const results = new Array(rows * lanes);\n" +
+    "let row = 0, previous, published = false;\n" +
+    "always(() => {\n" +
+    "    if (published) return;\n" +
+    "    const tick = world.getTick();\n" +
+    "    if (previous !== undefined && tick !== previous + 1) row = 0;\n" +
+    "    previous = tick;\n" +
+    "    if (row >= delay) {\n" +
+    "        const first = (row - delay) * lanes;\n" +
+    "        for (let lane = 0; lane < lanes; lane++) {\n" +
+    "            results[first + lane] = world.getSignal(x + 5 + 9 * lane, y) > 0 ? 1 : 0;\n" +
+    "        }\n" +
+    "    }\n" +
+    "    if (row < rows) {\n" +
+    "        for (let lane = 0; lane < lanes; lane++) {\n" +
+    "            const origin = x + 5 + 9 * lane, address = row * lanes + lane;\n" +
+    "            for (let bit = 0; bit < pads.length; bit++) {\n" +
+    "                const [dx, dy] = pads[bit];\n" +
+    "                world.setSignal(origin + dx, y + dy, (address >> bit) & 1);\n" +
+    "            }\n" +
+    "        }\n" +
+    "    }\n" +
+    "    if (++row === rows + delay) {\n" +
+    "        globalState.doomPowerBlink = results;\n" +
+    "        published = true;\n" +
+    "    }\n" +
+    "});"

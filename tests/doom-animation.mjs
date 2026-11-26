@@ -79,6 +79,25 @@ map "Doom animation parity" {
         }
         log(wad.AnimationTextureIndex(flat, 4, 8), wad.AnimationFlatIndex(texture, 10, 8))
         log(wad.AnimationTextureIndex(texture, 9, 8), wad.AnimationTextureIndex(missing, 10, 8), wad.AnimationIndex(texture, 10, -1))
+        var overlapping wad.AnimationSet
+        overlapping.Count = 4
+        overlapping.Ranges[0] = wad.NewTextureAnimation(503, 519)
+        overlapping.Ranges[1] = wad.NewTextureAnimation(508, 514)
+        overlapping.Ranges[2] = wad.NewFlatAnimation(510, 523)
+        overlapping.Ranges[3] = wad.NewFlatAnimation(0, 4)
+        indexed := wad.IndexFrameAnimations(overlapping)
+        equal := indexed.Active() && !wad.FrameAnimations{}.Active()
+        for cycle := range 5 {
+            tic := cycle * 8 - 1
+            for _, first := range [2]int{-1, 502} {
+                for offset := range 24 {
+                    resource := first + offset
+                    equal = equal && indexed.TextureFrame(resource, tic) == wad.AnimatedTextureIndex(overlapping, resource, tic) &&
+                        indexed.FlatFrame(resource, tic) == wad.AnimatedFlatIndex(overlapping, resource, tic)
+                }
+            }
+        }
+        log(equal)
     }
 }
 `);
@@ -95,7 +114,7 @@ map "Doom animation parity" {
         ...Array.from({ length: 8 }, () => [11, 12, 10, 7, 6]),
         [12, 10, 11, 4, 7],
     ]);
-    assert.deepEqual(rows.slice(34), [[4, 10], [9, 10, 10]]);
+    assert.deepEqual(rows.slice(34), [[4, 10], [9, 10, 10], [true]]);
 
     // A partial archive exposes only two of Doom's 22 built-in cycles. The
     // other 20 must be skipped exactly like the source's optional episode

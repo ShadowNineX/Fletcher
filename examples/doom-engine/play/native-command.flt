@@ -1,0 +1,52 @@
+// SPDX-License-Identifier: GPL-2.0-only
+package play
+
+backend circuit
+
+// The forward component depends only on forward, reverse, and run.
+func NativeForwardDeltas(keys bits<3>) bits<7> {
+    forward := keys[0] != keys[1]
+    reverse := keys[1]
+    running := keys[2]
+    var deltas bits<7>
+
+    // The four nonzero forward patterns are 25, 50, -25, and -50.
+    forwardSign := forward && reverse
+    deltas[0] = forward && !running
+    deltas[1] = forward && (reverse || running)
+    deltas[2] = forwardSign
+    deltas[3] = forward && (running == reverse)
+    deltas[4] = forward && !reverse
+    deltas[5] = forward && (running != reverse)
+    deltas[6] = forwardSign
+    return deltas
+}
+
+// Left, right, sidestep left, sidestep right, run, and Alt form a second
+// address. Pack signed side units of eight and turn units of 640.
+func NativeSideAndTurnDeltas(keys bits<6>) bits<8> {
+    turning := keys[0] != keys[1]
+    running, strafing := keys[4], keys[5]
+    var deltas bits<8>
+    // A single side step is three or five units of eight. Two steps in the
+    // same direction shift that signed value left. Opposite steps cancel.
+    sideFromKeys := keys[2] != keys[3]
+    sideFromTurn := turning && strafing
+    single := sideFromKeys != sideFromTurn
+    double := sideFromKeys && sideFromTurn && (keys[2] == keys[0])
+    negative := (sideFromKeys && keys[2]) || (sideFromTurn && keys[0])
+    secondBit := running == negative
+    deltas[0] = single
+    deltas[1] = double || (single && secondBit)
+    deltas[2] = (double && secondBit) || (single && !secondBit)
+    deltas[3] = (double && !secondBit) || (single && negative)
+    deltas[4] = (single || double) && negative
+
+    // Accelerated turns are one or two units. Alt diverts them into side movement.
+    rotate := turning && !strafing
+    deltas[5] = rotate && !running
+    deltas[6] = rotate && (running || keys[1])
+    deltas[7] = rotate && keys[1]
+
+    return deltas
+}

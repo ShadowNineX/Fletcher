@@ -1,4 +1,4 @@
-// Compile Doom's pinned wall-tier loop with a one-column framebuffer oracle.
+// Compile Doom's pinned wall loop with a one-column framebuffer and visplane oracle.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
@@ -22,11 +22,11 @@ export function runNativeMissingTiersOracle(upstream, scratch, cases) {
     const segs = readFileSync(path.join(upstream, "r_segs.c"), "utf8").replaceAll("\r\n", "\n");
     const renderLoop = extractFunction(segs, "void", "R_RenderSegLoop");
     const fixture = cases.map((entry, index) => {
-        assert.equal(entry.length, 7, `case ${index} has seven fields`);
-        const [height, topfrac, bottomfrac, pixhigh, pixlow, hasUpper, hasLower] = entry;
+        assert.equal(entry.length, 8, `case ${index} has eight fields`);
+        const [height, topfrac, bottomfrac, pixhigh, pixlow, hasUpper, hasLower, sharedSky] = entry;
         return `{${integer(height, `case ${index} height`)},${integer(topfrac, `case ${index} topfrac`)},` +
             `${integer(bottomfrac, `case ${index} bottomfrac`)},${integer(pixhigh, `case ${index} pixhigh`)},` +
-            `${integer(pixlow, `case ${index} pixlow`)},${Number(nativeBoolean(hasUpper))},${Number(nativeBoolean(hasLower))}}`;
+            `${integer(pixlow, `case ${index} pixlow`)},${Number(nativeBoolean(hasUpper))},${Number(nativeBoolean(hasLower))},${Number(sharedSky)}}`;
     }).join(",\n    ");
     const scratchDirectory = path.resolve(scratch);
     const source = path.join(scratchDirectory, "missing-tiers-native.c");
@@ -66,7 +66,7 @@ static colfunc_t colfunc=countColumn;
 
 ${renderLoop}
 
-typedef struct { int height,topfrac,bottomfrac,pixhigh,pixlow,upper,lower; } fixture_t;
+typedef struct { int height,topfrac,bottomfrac,pixhigh,pixlow,upper,lower,sharedSky; } fixture_t;
 static const fixture_t fixtures[] = {
     ${fixture}
 };
@@ -77,8 +77,11 @@ static void runCase(fixture_t item) {
     toptexture=item.upper; bottomtexture=item.lower; midtexture=0; maskedtexture=false;
     ceilingclip[0]=-1; floorclip[0]=item.height; painted=0;
     ceilingStore=(visplane_t){{0},{0}}; floorStore=(visplane_t){{0},{0}};
+    floorplane=item.sharedSky ? &ceilingStore : &floorStore;
     R_RenderSegLoop();
-    printf("[%d,%d,%d]\\n", ceilingclip[0]+1, floorclip[0], painted);
+    printf("[%d,%d,%d", ceilingclip[0]+1, floorclip[0], painted);
+    if (item.sharedSky) printf(",%d,%d", floorplane->top[0], floorplane->bottom[0]+1);
+    puts("]");
 }
 int main(void) {
     for (int index=0; index<MAXLIGHTSCALE; ++index) walllightRows[index]=&light;

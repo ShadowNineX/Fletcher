@@ -138,7 +138,8 @@ map "Doom texture name index" {
                 firstHash := wad.TextureIndex(working, wad.LumpName{Low: ${firstHashLow}, High: ${firstHashHigh}})
                 secondHash := wad.TextureIndex(working, wad.LumpName{Low: ${sharedLow}, High: ${sharedHigh}})
                 last := wad.TextureIndex(working, wad.LumpName{Low: ${endLow}, High: ${endHigh}})
-                log(firstHash, secondHash, last, wad.TextureAt(working, secondHash).Width)
+                beyondCache := wad.TextureAt(working, last)
+                log(firstHash, secondHash, last, wad.TextureAt(working, secondHash).Width, beyondCache.Valid, beyondCache.Width)
             }
         }
         next textures = working
@@ -151,7 +152,7 @@ map "Doom texture name index" {
     assert.deepEqual(logs[0], [1, -1, 3, 6, true, false]);
     assert.deepEqual(logs.slice(1, 8), Array.from({ length: 7 }, (_, i) =>
         [1, -1, 7, 3, 6, false, true, i >= 3]));
-    assert.deepEqual(logs.slice(8), [[true, false, dense.length + 2], [1, 2, dense.length + 1, 16]]);
+    assert.deepEqual(logs.slice(8), [[true, false, dense.length + 2], [1, 2, dense.length + 1, 16, true, 8]]);
     console.log("Doom texture-name index passed batching, malformed entries, layered TEXTURE2, and a dense directory with exact hash collisions.");
 } finally {
     assert.match(path.relative(temp, realpathSync(scratch)), /^fletcher-doom-texture-index-[^/\\]+$/);

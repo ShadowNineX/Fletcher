@@ -10,29 +10,89 @@ const CampaignMenuClosed = 0
 const CampaignMenuEpisode = 1
 const CampaignMenuSkill = 2
 const CampaignMenuNightmare = 3
+const CampaignMenuMain = 4
+const CampaignMenuOptions = 5
+const CampaignMenuHelp = 6
+const CampaignMenuEndGame = 7
+const CampaignMenuSound = 8
+const CampaignMenuLoad = 9
+const CampaignMenuSave = 10
+const CampaignMenuSaveName = 11
+const CampaignMenuQuickSave = 12
+const CampaignMenuQuickLoad = 13
+const CampaignMenuSaveUnavailable = 14
+const CampaignMenuHelpSecond = 15
+const CampaignMenuQuit = 16
+const CampaignSaveSlots = 6
+const CampaignSaveNameLimit = 23
+
+const CampaignOptionEndGame = 0
+const CampaignOptionMessages = 1
+const CampaignOptionDetail = 2
+const CampaignOptionScreen = 3
+const CampaignOptionMouse = 5
+const CampaignOptionSound = 7
+
+const CampaignMenuSoundSelect = 1 // sfx_pistol
+const CampaignMenuSoundCursor = 19 // sfx_pstop
+const CampaignMenuSoundAdjust = 22 // sfx_stnmov
+const CampaignMenuSoundBack = 23 // sfx_swtchn
+const CampaignMenuSoundClose = 24 // sfx_swtchx
+const campaignEpisodeLetters = [4]string{"K", "T", "I", "T"}
 
 type CampaignMenu struct {
     Stage int
     Commercial bit
+    Retail bit
     Episodes [4]int
     Count int
     Cursor int
+    FromMain bit
+    PanelTitle bit
+    SaveName string
+    mainRow int
     markers [4]int
     episodeRow int
     skill int
+    optionRow int
+    soundRow int
+    loadRow int
+    saveRow int
 }
 
 type CampaignMenuInput struct {
     Up bit
     Down bit
+    Left bit
+    Right bit
     Confirm bit
     Back bit
+    Yes bit
+    Dismiss bit
+    Erase bit
+    Character string
+    TextFits bit
+    CursorKey int // One-based row, or zero if no key selected a row.
+    SaveAllowed bit
+    SaveNames [CampaignSaveSlots]string
 }
 
 type CampaignMenuStep struct {
     Menu CampaignMenu
     Changed bit
+    Sound int
     Start bit
+    LoadCheckpoint bit
+    SaveCheckpoint bit
+    Slot int
+    EndGame bit
+    Quit bit
+    ToggleMessages bit
+    ToggleDetail bit
+    ScreenDelta int
+    SensitivityDelta int
+    EffectsDelta int
+    MusicDelta int
     Marker int
     Skill int
 }
@@ -75,23 +135,275 @@ func OpenCampaignMenu(mounts wad.Archives, commercial bit, currentSkill int) Cam
     return menu
 }
 
+func OpenCampaignMain(mounts wad.Archives, commercial bit, currentSkill int, title bit) CampaignMenu {
+    menu := OpenCampaignMenu(mounts, commercial, currentSkill)
+    menu.FromMain, menu.PanelTitle = true, title
+    menu.Retail = !commercial && mounts.Find(wad.LumpName{Low: 0x314d3445}).Valid // E4M1
+    menu.Stage, menu.Cursor = CampaignMenuMain, 0
+    return menu
+}
+
+func (menu CampaignMenu) WithSelections(previous CampaignMenu) CampaignMenu {
+    if menu.Commercial == previous.Commercial && previous.mainRow < menu.MainRows() {
+        menu.mainRow, menu.Cursor = previous.mainRow, previous.mainRow
+    }
+    menu.optionRow, menu.soundRow = previous.optionRow, previous.soundRow
+    menu.loadRow, menu.saveRow = previous.loadRow, previous.saveRow
+    return menu
+}
+
+func (menu CampaignMenu) MainRows() int {
+    if menu.Commercial { return 5 }
+    return 6
+}
+
+func (menu CampaignMenu) rows() int {
+    switch menu.Stage {
+    case CampaignMenuMain: return menu.MainRows()
+    case CampaignMenuSkill: return 5
+    case CampaignMenuNightmare, CampaignMenuEndGame: return 2
+    case CampaignMenuOptions: return 8
+    case CampaignMenuSound: return 4
+    case CampaignMenuLoad, CampaignMenuSave: return CampaignSaveSlots
+    case CampaignMenuHelp, CampaignMenuHelpSecond: return 1
+    }
+    return menu.Count
+}
+
+// M_Responder looks beyond the current row first, then wraps to the start.
+// The current row is included at the end, so pressing its key still clicks.
+func (menu CampaignMenu) LetterCursor(letter string) int {
+    if !menu.FromMain || letter == "" || letter == " " { return 0 }
+    var letters string
+    switch menu.Stage {
+    case CampaignMenuMain:
+        letters = "NOLSRQ"
+        if menu.Commercial { letters = "NOLSQ" }
+    case CampaignMenuEpisode:
+        for row := range menu.Count { letters = letters + campaignEpisodeLetters[menu.Episodes[row] - 1] }
+    case CampaignMenuSkill: letters = "IHHUN"
+    case CampaignMenuOptions: letters = "EMGS M S"
+    case CampaignMenuSound: letters = "S M "
+    default: return 0
+    }
+    first := 0
+    for row, key := range letters {
+        if key == letter {
+            if row > menu.Cursor { return row + 1 }
+            if first == 0 { first = row + 1 }
+        }
+    }
+    return first
+}
+
+func (menu CampaignMenu) OpenHelp(shortcut bit) CampaignMenu {
+    menu.Stage, menu.Cursor = CampaignMenuHelp, 0
+    if shortcut && menu.Retail { menu.Stage = CampaignMenuHelpSecond }
+    return menu
+}
+
+func (menu CampaignMenu) OpenSoundShortcut() CampaignMenu {
+    menu.Stage, menu.Cursor = CampaignMenuSound, 0
+    return menu
+}
+
+func (menu CampaignMenu) IsSaveMenu() bit {
+    return menu.Stage >= CampaignMenuLoad && menu.Stage <= CampaignMenuSaveUnavailable
+}
+
+func (menu CampaignMenu) IsConfirmPrompt() bit {
+    return menu.Stage == CampaignMenuQuit ||
+        (menu.FromMain && (menu.Stage == CampaignMenuEndGame || menu.Stage == CampaignMenuNightmare))
+}
+
+func (menu CampaignMenu) OpenCheckpointList(save bit, allowed bit) CampaignMenu {
+    if !save { menu.Stage, menu.Cursor = CampaignMenuLoad, menu.loadRow
+    } else if allowed { menu.Stage, menu.Cursor = CampaignMenuSave, menu.saveRow
+    } else if menu.PanelTitle { menu.Stage, menu.SaveName = CampaignMenuSaveUnavailable, "" }
+    return menu
+}
+
+func tickCampaignPrompt(menu CampaignMenu, keys CampaignMenuInput) CampaignMenuStep {
+    step := CampaignMenuStep{Menu: menu, Marker: -1, Slot: -1}
+    if !keys.Back && !keys.Dismiss && !keys.Yes { return step }
+    step.Menu.Stage, step.Changed = CampaignMenuClosed, true
+    if keys.Yes && !keys.Back && !keys.Dismiss {
+        switch menu.Stage {
+        case CampaignMenuNightmare:
+            step.Start, step.Marker, step.Skill = true, menu.markers[menu.episodeRow], menu.skill
+        case CampaignMenuEndGame: step.EndGame = true
+        case CampaignMenuQuit: step.Quit = true
+        }
+    }
+    if !step.Quit { step.Sound = CampaignMenuSoundClose }
+    return step
+}
+
+func (menu CampaignMenu) OpenQuickCheckpoint(save bit, slot int, name string) CampaignMenu {
+    menu.SaveName = name
+    if save {
+        if slot < 0 { menu.Stage, menu.Cursor = CampaignMenuSave, menu.saveRow
+        } else { menu.Stage, menu.Cursor = CampaignMenuQuickSave, slot }
+    } else { menu.Stage, menu.Cursor = CampaignMenuQuickLoad, slot }
+    return menu
+}
+
+func tickCheckpointPrompt(menu CampaignMenu, keys CampaignMenuInput) CampaignMenuStep {
+    step := CampaignMenuStep{Menu: menu, Marker: -1, Slot: -1}
+    if keys.Back || keys.Dismiss || keys.Yes {
+        step.Menu.Stage, step.Changed = CampaignMenuClosed, true
+        step.Sound = CampaignMenuSoundClose
+        if !keys.Back && keys.Yes && menu.SaveName != "" {
+            step.Slot = menu.Cursor
+            step.SaveCheckpoint = menu.Stage == CampaignMenuQuickSave && keys.SaveAllowed
+            step.LoadCheckpoint = menu.Stage == CampaignMenuQuickLoad
+        }
+    }
+    return step
+}
+
+func tickSaveName(menu CampaignMenu, keys CampaignMenuInput) CampaignMenuStep {
+    step := CampaignMenuStep{Menu: menu, Marker: -1, Slot: -1}
+    count := 0
+    for range menu.SaveName { count = count + 1 }
+    if keys.Back || keys.Confirm {
+        if !keys.Back && menu.SaveName != "" && keys.SaveAllowed {
+            step.Slot, step.SaveCheckpoint = menu.Cursor, true
+            menu.Stage = CampaignMenuClosed
+        } else { menu.Stage, menu.SaveName = CampaignMenuSave, "" }
+    } else if keys.Erase && menu.SaveName != "" {
+        name := ""
+        for index, character := range menu.SaveName {
+            if index + 1 < count { name = name + character }
+        }
+        menu.SaveName = name
+    } else if keys.Character != "" && keys.TextFits && count < CampaignSaveNameLimit {
+        menu.SaveName = menu.SaveName + keys.Character
+    } else { return step }
+    step.Menu, step.Changed = menu, true
+    return step
+}
+
 func TickCampaignMenu(menu CampaignMenu, keys CampaignMenuInput) CampaignMenuStep {
-    step := CampaignMenuStep{Menu: menu, Marker: -1}
+    step := CampaignMenuStep{Menu: menu, Marker: -1, Slot: -1}
     if menu.Stage == CampaignMenuClosed { return step }
-    if keys.Back {
+    if menu.IsConfirmPrompt() { return tickCampaignPrompt(menu, keys) }
+    switch menu.Stage {
+    case CampaignMenuSaveName: return tickSaveName(menu, keys)
+    case CampaignMenuQuickSave, CampaignMenuQuickLoad, CampaignMenuSaveUnavailable: return tickCheckpointPrompt(menu, keys)
+    }
+    if keys.Dismiss && menu.FromMain {
+        switch menu.Stage {
+        case CampaignMenuMain: menu.mainRow = menu.Cursor
+        case CampaignMenuOptions: menu.optionRow = menu.Cursor
+        case CampaignMenuSound: menu.soundRow = menu.Cursor
+        case CampaignMenuLoad: menu.loadRow = menu.Cursor
+        case CampaignMenuSave: menu.saveRow = menu.Cursor
+        }
+        menu.Stage = CampaignMenuClosed
+        step.Sound = CampaignMenuSoundClose
+    } else if keys.Back {
         switch menu.Stage {
         case CampaignMenuNightmare:
             menu.Stage, menu.Cursor = CampaignMenuSkill, menu.skill
         case CampaignMenuSkill:
             menu.skill = menu.Cursor
-            if menu.Commercial { menu.Stage = CampaignMenuClosed } else {
+            if !menu.Commercial {
                 menu.Stage, menu.Cursor = CampaignMenuEpisode, menu.episodeRow
-            }
+            } else if menu.FromMain {
+                menu.Stage, menu.Cursor = CampaignMenuMain, menu.mainRow
+            } else { menu.Stage = CampaignMenuClosed }
         case CampaignMenuEpisode:
+            if menu.FromMain { menu.Stage, menu.Cursor = CampaignMenuMain, menu.mainRow
+            } else { menu.Stage = CampaignMenuClosed }
+        case CampaignMenuMain:
+            menu.mainRow = menu.Cursor
             menu.Stage = CampaignMenuClosed
+        case CampaignMenuOptions:
+            menu.optionRow = menu.Cursor
+            menu.Stage, menu.Cursor = CampaignMenuMain, menu.mainRow
+        case CampaignMenuEndGame:
+            menu.Stage, menu.Cursor = CampaignMenuOptions, CampaignOptionEndGame
+        case CampaignMenuSound:
+            menu.soundRow = menu.Cursor
+            menu.Stage, menu.Cursor = CampaignMenuOptions, CampaignOptionSound
+        case CampaignMenuHelp:
+            menu.Stage, menu.Cursor = CampaignMenuMain, menu.mainRow
+        case CampaignMenuHelpSecond:
+            menu = menu.OpenHelp(false)
+        case CampaignMenuLoad:
+            menu.loadRow = menu.Cursor
+            menu.Stage, menu.Cursor = CampaignMenuMain, menu.mainRow
+        case CampaignMenuSave:
+            menu.saveRow = menu.Cursor
+            menu.Stage, menu.Cursor = CampaignMenuMain, menu.mainRow
         }
+        if menu.Stage == CampaignMenuClosed || keys.Dismiss {
+            step.Sound = CampaignMenuSoundClose
+        } else { step.Sound = CampaignMenuSoundBack }
     } else if keys.Confirm {
+        sound := CampaignMenuSoundSelect
         switch menu.Stage {
+        case CampaignMenuMain:
+            menu.mainRow = menu.Cursor
+            switch menu.Cursor {
+            case 0:
+                if menu.Count == 0 { return step }
+                if menu.Commercial { menu.Stage, menu.Cursor = CampaignMenuSkill, menu.skill
+                } else { menu.Stage, menu.Cursor = CampaignMenuEpisode, menu.episodeRow }
+            case 1:
+                menu.Stage, menu.Cursor = CampaignMenuOptions, menu.optionRow
+            case 2:
+                menu = menu.OpenCheckpointList(false, false)
+            case 3:
+                menu = menu.OpenCheckpointList(true, keys.SaveAllowed)
+                if menu.Stage == CampaignMenuMain { return step }
+            case 4:
+                if menu.Commercial { menu.Stage = CampaignMenuQuit } else { menu = menu.OpenHelp(false) }
+            case 5:
+                menu.Stage = CampaignMenuQuit
+            }
+        case CampaignMenuOptions:
+            switch menu.Cursor {
+            case CampaignOptionEndGame:
+                if menu.PanelTitle {
+                    step.Sound = sound
+                    return step
+                }
+                menu.Stage, menu.Cursor = CampaignMenuEndGame, 0
+            case CampaignOptionMessages: step.ToggleMessages = true
+            case CampaignOptionDetail: step.ToggleDetail = true
+            case CampaignOptionScreen: step.ScreenDelta, sound = 1, CampaignMenuSoundAdjust
+            case CampaignOptionMouse: step.SensitivityDelta, sound = 1, CampaignMenuSoundAdjust
+            case CampaignOptionSound:
+                menu.Stage, menu.Cursor = CampaignMenuSound, menu.soundRow
+            default: sound = 0
+            }
+        case CampaignMenuEndGame:
+            if menu.Cursor == 0 {
+                menu.Stage, menu.Cursor = CampaignMenuOptions, CampaignOptionEndGame
+            } else {
+                menu.Stage, step.EndGame = CampaignMenuClosed, true
+            }
+        case CampaignMenuSound:
+            if menu.Cursor == 0 {
+                step.EffectsDelta, sound = 1, CampaignMenuSoundAdjust
+            } else {
+                step.MusicDelta, sound = 1, CampaignMenuSoundAdjust
+            }
+        case CampaignMenuHelp:
+            if menu.Commercial { menu.Stage, menu.Cursor = CampaignMenuMain, menu.mainRow
+            } else { menu.Stage = CampaignMenuHelpSecond }
+        case CampaignMenuHelpSecond:
+            menu.Stage, menu.Cursor = CampaignMenuMain, menu.mainRow
+        case CampaignMenuLoad:
+            if keys.SaveNames[menu.Cursor] == "" { return step }
+            menu.loadRow = menu.Cursor
+            menu.Stage, step.LoadCheckpoint, step.Slot = CampaignMenuClosed, true, menu.Cursor
+        case CampaignMenuSave:
+            if !keys.SaveAllowed { return step }
+            menu.saveRow = menu.Cursor
+            menu.Stage, menu.SaveName = CampaignMenuSaveName, keys.SaveNames[menu.Cursor]
         case CampaignMenuEpisode:
             menu.episodeRow = menu.Cursor
             menu.Stage, menu.Cursor = CampaignMenuSkill, menu.skill
@@ -104,14 +416,38 @@ func TickCampaignMenu(menu CampaignMenu, keys CampaignMenuInput) CampaignMenuSte
             if menu.Cursor == 0 { menu.Stage, menu.Cursor = CampaignMenuSkill, menu.skill } else {
                 menu.Stage, step.Start = CampaignMenuClosed, true
             }
+        default: sound = 0
         }
+        step.Sound = sound
         if step.Start { step.Marker, step.Skill = menu.markers[menu.episodeRow], menu.skill }
+    } else if keys.CursorKey > 0 && keys.CursorKey <= menu.rows() {
+        step.Sound = CampaignMenuSoundCursor
+        if menu.Cursor == keys.CursorKey - 1 { return step }
+        menu.Cursor = keys.CursorKey - 1
     } else if keys.Up != keys.Down {
-        rows := menu.Count
-        if menu.Stage == CampaignMenuSkill { rows = 5 }
-        if menu.Stage == CampaignMenuNightmare { rows = 2 }
+        rows := menu.rows()
+        if rows > 0 { step.Sound = CampaignMenuSoundCursor }
         if rows < 2 { return step }
-        if keys.Up { menu.Cursor = (menu.Cursor + rows - 1) % rows } else { menu.Cursor = (menu.Cursor + 1) % rows }
+        direction := 1
+        if keys.Up { direction = rows - 1 }
+        menu.Cursor = (menu.Cursor + direction) % rows
+        if (menu.Stage == CampaignMenuOptions && (menu.Cursor == 4 || menu.Cursor == 6)) ||
+            (menu.Stage == CampaignMenuSound && menu.Cursor % 2 == 1) {
+            menu.Cursor = (menu.Cursor + direction) % rows
+        }
+    } else if keys.Left != keys.Right {
+        direction := 1
+        if keys.Left { direction = -1 }
+        if menu.Stage == CampaignMenuOptions {
+            switch menu.Cursor {
+            case CampaignOptionScreen: step.ScreenDelta = direction
+            case CampaignOptionMouse: step.SensitivityDelta = direction
+            default: return step
+            }
+        } else if menu.Stage == CampaignMenuSound {
+            if menu.Cursor == 0 { step.EffectsDelta = direction } else { step.MusicDelta = direction }
+        } else { return step }
+        step.Sound = CampaignMenuSoundAdjust
     } else { return step }
     step.Menu, step.Changed = menu, true
     return step

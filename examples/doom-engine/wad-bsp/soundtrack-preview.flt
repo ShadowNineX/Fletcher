@@ -61,11 +61,44 @@ macro SoundtrackVoice(x int, y int) {
     expand SoundtrackBank(x + 2, y)
 }
 
+// The conductor sends each cue to a native splitter. A splitter can drive
+// its main voice and accent together.
+// On a clock jump the next published epoch is the baseline for the restored world.
 const soundtrackSource = "const { x, y } = getPosition();\n" +
     "always(() => {\n" +
     "    const tick = world.getTick() - 1;\n" +
     "    const frame = tick % 2 === 0 ? globalState.__fletcherEven : globalState.__fletcherOdd;\n" +
-    "    const packets = tick >= 0 && frame?.t === tick ? frame.p?.soundtrackNotes : undefined;\n" +
+    "    const published = tick >= 0 && frame?.t === tick ? frame.p : undefined;\n" +
+    "    if (state.cueTick !== undefined && tick !== state.cueTick + 1) state.resyncCueEpoch = true;\n" +
+    "    state.cueTick = tick;\n" +
+    "    const epoch = published?.soundCueEpoch;\n" +
+    "    if (epoch !== undefined && (state.resyncCueEpoch || epoch !== state.cueEpoch)) {\n" +
+    "        let requests = state.resyncCueEpoch || epoch === 0 ? 0 : published.soundCueRequests;\n" +
+    "        state.cueEpoch = epoch;\n" +
+    "        state.resyncCueEpoch = false;\n" +
+    "        let fastCuePhases = state.fastCuePhases ?? 0;\n" +
+    "        const previousCommon = state.commonTick === tick - 1 ? state.commonPrimary : 0;\n" +
+    "        let commonPrimary = 0;\n" +
+    "        while (requests) {\n" +
+    "            const lane = 31 - Math.clz32(requests & -requests);\n" +
+    "            if (lane < 7) {\n" +
+    "                const mask = 1 << lane;\n" +
+    "                const alternate = (previousCommon & mask) !== 0;\n" +
+    "                world.setSignal(x - 57 + 8 * lane - (alternate ? 4 : 0), y - 2, 1);\n" +
+    "                if (!alternate) commonPrimary |= mask;\n" +
+    "            } else {\n" +
+    "                const voice = lane - 7, mask = 1 << voice;\n" +
+    "                const bank = (fastCuePhases & mask) !== 0 ? -4 : 0;\n" +
+    "                world.setSignal(x - 73 + 8 * voice + bank, y + 11, 1);\n" +
+    "                fastCuePhases ^= mask;\n" +
+    "            }\n" +
+    "            requests &= requests - 1;\n" +
+    "        }\n" +
+    "        state.fastCuePhases = fastCuePhases;\n" +
+    "        state.commonPrimary = commonPrimary;\n" +
+    "        state.commonTick = tick;\n" +
+    "    }\n" +
+    "    const packets = published?.soundtrackNotes;\n" +
     "    const voiceCount = packets?.length ?? state.voiceCount ?? 0;\n" +
     "    state.voiceCount = voiceCount;\n" +
     "    let phases = state.phases ?? 0;\n" +

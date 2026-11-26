@@ -75,6 +75,15 @@ func planeDistanceScale(offset bits<32>) int {
     return int(distanceScale)
 }
 
+// The distance multiplier depends on the column angle alone. A renderer can
+// keep it with the angle table when several frames use the same viewport.
+func PlaneDistanceScales(width int, angles [MaxViewWidth]bits<32>) [MaxViewWidth]int {
+    var scales [MaxViewWidth]int
+    if width > MaxViewWidth { width = MaxViewWidth }
+    for column := range width { scales[column] = planeDistanceScale(angles[column]) }
+    return scales
+}
+
 func mapPlaneColumn(view PlaneView, projection planeRow, offset bits<32>, distanceScale int) PlaneSample {
     camera := view.Camera
     length := cport.C_FixedMul(projection.Distance, distanceScale)
@@ -109,7 +118,13 @@ type PlaneSpanCache struct {
 }
 
 func NewPlaneSpanCache(view PlaneView, angles [MaxViewWidth]bits<32>, anglesReady bit) PlaneSpanCache {
-    return PlaneSpanCache{enabled: true, view: view, angles: angles, anglesReady: anglesReady}
+    return NewPlaneSpanCacheWithScales(view, angles, anglesReady, [MaxViewWidth]int{})
+}
+
+func NewPlaneSpanCacheWithScales(view PlaneView, angles [MaxViewWidth]bits<32>, anglesReady bit,
+    scales [MaxViewWidth]int) PlaneSpanCache {
+    if !anglesReady { return PlaneSpanCache{enabled: true, view: view, angles: angles} }
+    return PlaneSpanCache{enabled: true, view: view, angles: angles, anglesReady: anglesReady, distanceScales: scales}
 }
 
 type unprojectedSpans<T extends PlaneSpanSink> struct { Sink T }

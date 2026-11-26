@@ -23,6 +23,8 @@ const NewPlayerHealth = [wad.VanillaPlayers]int{100, 100, 100, 100}
 const castHostLetters bits<26> = (1 << 11) | (1 << 14) | (1 << 19) | (1 << 24) // L, O, T, Y
 const menuNavigationLetters bits<26> = (1 << 5) | (1 << 18) | (1 << 22) // F, S, W
 const HostMusicTickBatch = 64
+const gammaHudMessages = [engine.DoomGammaCount]string{"Gamma correction OFF", "Gamma correction level 1",
+    "Gamma correction level 2", "Gamma correction level 3", "Gamma correction level 4"}
 
 type Scene struct {
     Level wad.BspLevel
@@ -30,11 +32,10 @@ type Scene struct {
     Materials walls.Materials
     Scrolls play.LineScrolls
     Lights play.LevelLights
-    ColumnAngles [engine.MaxViewWidth]bits<32>
+    WallView walls.WallView
     Actors play.MapActors
     ActorLinks play.ActorLinks
     ActorSprites PreviewSprites
-    ViewHeight int
 }
 
 func (scene Scene) NodeCount() int { return scene.Level.NodeCount() }
@@ -52,6 +53,7 @@ func (geometry RenderGeometry) wallEntry(level wad.BspLevel, index int) (RenderW
 func (geometry RenderGeometry) keepWall(entry RenderWall) RenderGeometry {
     slot := (entry.SegmentID - 1) & (WallCacheSlots - 1)
     geometry.Walls = geometry.Walls.With(slot, entry)
+    geometry.Revision = geometry.Revision + 1
     return geometry
 }
 
@@ -73,7 +75,6 @@ func lightWall(level wad.BspLevel, wall wad.WallSegment, lights play.LevelLights
 }
 
 func (scene Scene) DrawBspSubsector(index int, frame engine.BspFrame<SpritePass>) engine.BspFrame<SpritePass> {
-    coverage := frame.Coverage
     leaf := scene.Level.SubsectorAt(index)
     entry, _ := frame.Data.Geometry.wallEntry(scene.Level, leaf.FirstSegment)
     if !entry.Decoded {
@@ -82,14 +83,29 @@ func (scene Scene) DrawBspSubsector(index int, frame engine.BspFrame<SpritePass>
     }
     wall := entry.Wall.ReadWall(scene.Level)
     if scene.Lights.Count > 0 { wall = lightWall(scene.Level, wall, scene.Lights) }
-    coverage = engine.BeginSubsectorPlanes(coverage, scene.Camera.Z, scene.Level.PlaneKey(wall, false), scene.Level.PlaneKey(wall, true))
-    if coverage.Failed { frame.Coverage = coverage; return frame }
+    floor, ceiling := entry.Wall.ReadPlaneKeys(scene.Level, wall)
+    frame.Coverage = engine.BeginSubsectorPlanes(frame.Coverage, scene.Camera.Z, floor, ceiling)
+    if frame.Coverage.Failed { return frame }
     sector := (wall.FrontSector - scene.Level.Sectors.Offset) / wad.SectorSize
-    frame.Data = addSectorSprites(scene, frame.Data, sector, wall.Front, wall.Light)
+    frame.Data.Sprites = addSectorSprites(scene, frame.Data.Sprites, sector, wall.Front, wall.Light)
+    // Consecutive SEGs can share either endpoint in this camera view.
+    previousFirstX, previousFirstY, previousLastX, previousLastY := 0, 0, 0, 0
+    previousFirstAngle, previousLastAngle := bits<32>(0), bits<32>(0)
     for i := range leaf.SegmentCount {
         cached := true
         if i != 0 { entry, cached = frame.Data.Geometry.wallEntry(scene.Level, leaf.FirstSegment + i) }
-        projected := walls.ProjectWall(scene.Camera, coverage, entry.Edge.First, entry.Edge.Last)
+        firstX, firstY := entry.Edge.First.X, entry.Edge.First.Y
+        lastX, lastY := entry.Edge.Last.X, entry.Edge.Last.Y
+        firstAngle, lastAngle := previousLastAngle, previousFirstAngle
+        if i == 0 || firstX != previousLastX || firstY != previousLastY {
+            firstAngle = engine.PointToAngle(scene.Camera.X, scene.Camera.Y, firstX, firstY)
+        }
+        if i == 0 || lastX != previousFirstX || lastY != previousFirstY {
+            lastAngle = engine.PointToAngle(scene.Camera.X, scene.Camera.Y, lastX, lastY)
+        }
+        previousFirstX, previousFirstY, previousLastX, previousLastY = firstX, firstY, lastX, lastY
+        previousFirstAngle, previousLastAngle = firstAngle, lastAngle
+        projected := walls.ProjectWallFromAngles(scene.Camera, frame.Coverage, firstAngle, lastAngle)
         visible := projected.Span.First < projected.Span.End
         if visible && !entry.Decoded {
             entry = entry.decodeWall(scene.Level)
@@ -116,29 +132,26 @@ func (scene Scene) DrawBspSubsector(index int, frame engine.BspFrame<SpritePass>
             if geometry || materials.Masked.Texture.Valid {
                 shade := color.Orange
                 if wall.Light < 128 { shade = color.Purple }
-                surface := walls.Surface{Front: wall.Front, Back: wall.Back, Solid: solid, TwoSided: wall.TwoSided,
-                    FrontSky: wall.FrontSky, SharedSky: wall.SharedSky,
-                    MarkCeiling: wall.MarkCeiling, MarkFloor: wall.MarkFloor, Shade: shade,
-                    Materials: materials, ColumnAngles: scene.ColumnAngles}
-                coverage, frame.Data.Columns = walls.DrawProjectedWallCached(scene.Camera, coverage, wall.First, wall.Last,
-                    wall.Direction, surface, scene.ViewHeight, projected, frame.Data.Columns)
-                if coverage.Failed { frame.Coverage = coverage; return frame }
-                if coverage.StoredWallRange {
+                frame.Coverage, frame.Data.Columns = walls.DrawProjectedWallCached(scene.Camera, frame.Coverage, wall.First, wall.Last,
+                    wall.Direction, walls.Surface{Front: wall.Front, Back: wall.Back, Solid: solid, TwoSided: wall.TwoSided,
+                        FrontSky: wall.FrontSky, SharedSky: wall.SharedSky,
+                        MarkCeiling: wall.MarkCeiling, MarkFloor: wall.MarkFloor, Shade: shade, Materials: materials},
+                    scene.WallView, projected, scene.Materials.Shade, frame.Data.Columns)
+                if frame.Coverage.Failed { return frame }
+                if frame.Coverage.StoredWallRange {
                     line := (wall.LineOffset - scene.Level.Lines.Offset) / wad.LineSize
                     if line < LineReferenceWords * 32 { frame.Data.Mapped.Words[line / 32][line % 32] = true }
-                    if solid && i + 1 < leaf.SegmentCount && coverage.Words[0][0] &&
-                        !engine.SpanOpen(coverage, engine.ColumnSpan{End: scene.Camera.View.Width}) {
+                    if solid && i + 1 < leaf.SegmentCount && frame.Coverage.Words[0][0] &&
+                        !engine.SpanOpen(frame.Coverage, engine.ColumnSpan{End: scene.Camera.View.Width}) {
                         // Sprites and visplanes have already been collected for this leaf.
                         // The remaining SEGs have no uncovered columns to contribute.
-                        coverage.StoredWallRange = false
-                        frame.Coverage = coverage
+                        frame.Coverage.StoredWallRange = false
                         return frame
                     }
                 }
             }
-        } else { coverage.StoredWallRange = false }
+        } else { frame.Coverage.StoredWallRange = false }
     }
-    frame.Coverage = coverage
     return frame
 }
 
@@ -152,9 +165,12 @@ type RenderWall struct {
 type RenderGeometry struct {
     Valid bit
     Marker int
+    Revision int
     // Entries start with endpoints. The walker decodes the remaining data
     // when a SEG survives clipping or supplies a subsector's front sector.
     Walls engine.PagedSlots<RenderWall>
+    HasProjection bit
+    Projection PreviewProjectionRef
 }
 
 // Called after checking that every non-root child has one parent. A cycle
@@ -237,7 +253,7 @@ func loadRenderGeometry(level wad.BspLevel, marker int) RenderGeometry {
     return RenderGeometry{Marker: marker, Valid: true}
 }
 
-func previewMaterials(materials walls.Materials, animations wad.AnimationSet, levelTime int) walls.Materials {
+func previewMaterials(materials walls.Materials, animations wad.FrameAnimations, levelTime int) walls.Materials {
     if materials.Shade.Valid {
         materials.Animations = animations
         materials.LevelTime = levelTime
@@ -266,6 +282,7 @@ type CameraDisplay struct {
     Border ViewBorderCache
     Inventory play.PlayerInventory
     StatusVisible bit
+    ReuseStatus bit
     ViewBlocks int
     LowDetail bit
     Face int
@@ -349,11 +366,12 @@ func nextStatusFace(previous play.StatusFace, inventory play.PlayerInventory, ac
     return play.TickStatusFace(previous, inventory, moved.Angle, attackerAngle, otherAttacker, attackHeld, randomValue)
 }
 
-func updateMessageToggle(messages play.HudMessages, enabled bit, toggle bit) (play.HudMessages, bit) {
+func updateSettingsMessages(messages play.HudMessages, enabled bit, toggle bit, gammaMessage string) (play.HudMessages, bit) {
+    if gammaMessage != "" { messages = play.QueueHudMessage(messages, gammaMessage, false) }
     if !toggle { return messages, enabled }
     enabled = !enabled
-    label := "MESSAGE DISPLAY OFF"
-    if enabled { label = "MESSAGE DISPLAY ON" }
+    label := "Messages OFF"
+    if enabled { label = "Messages ON" }
     return play.QueueHudMessage(messages, label, true), enabled
 }
 
@@ -371,10 +389,17 @@ func drawCamera(level wad.BspLevel, mounts wad.Archives, actors play.MapActors, 
     // to the border so every column of the 3D view belongs to a pixel pair.
     roundedWidth := display.LowDetail && window.Width >= 4 && window.Width & 1 != 0
     if roundedWidth { window.Width = window.Width - 1 }
-    var view engine.ViewProjection
-    if display.LowDetail {
-        view = engine.NewLowDetailProjection(window.Width)
-    } else { view = engine.NewViewProjection(window.Width) }
+    geometry := display.Geometry
+    var projection PreviewProjection
+    if geometry.HasProjection { projection = geometry.Projection.Read() }
+    if projection.Width != window.Width || projection.LowDetail != display.LowDetail ||
+        (materials.Textures.Valid && !projection.AnglesReady) {
+        projection = buildPreviewProjection(window.Width, display.LowDetail, materials.Textures.Valid)
+        geometry.Projection = projection
+        geometry.HasProjection = true
+        geometry.Revision = geometry.Revision + 1
+    }
+    view := projection.View
     view.ScreenX, view.ScreenY = window.X, window.Y
     camera := engine.Camera{
         X: x, Y: y, Z: eyeZ, Heading: heading,
@@ -396,16 +421,17 @@ func drawCamera(level wad.BspLevel, mounts wad.Archives, actors play.MapActors, 
     }
     materials.ExtraLight = weapon.ExtraLight
     scene := Scene{Level: level, Camera: camera, Materials: materials, Scrolls: scrolls, Lights: lights,
-        Actors: actors, ActorLinks: links, ActorSprites: actorsSprites, ViewHeight: viewHeight}
-    if materials.Textures.Valid { scene.ColumnAngles = previewAnglesForView(camera.View) }
+        Actors: actors, ActorLinks: links, ActorSprites: actorsSprites,
+        WallView: walls.WallView{Height: viewHeight, HasAngles: projection.AnglesReady, ColumnAngles: projection.Angles}}
     border := display.Border
     if window.Width != Width { border = border.Draw(mounts, display.Shade, level.MapName, window) }
     projected := engine.RenderBspFrame(scene, camera.View, camera.Heading, camera.X, camera.Y,
         engine.BspFrame<SpritePass>{Coverage: engine.ColumnCoverage{TrackDrawSegments: actorsSprites.Count > 0 && materials.Shade.Valid},
-            Data: SpritePass{Mapped: display.Mapped, Columns: display.Columns, Geometry: display.Geometry}})
-    result, visible := projected.Coverage, projected.Data.Visible
+            Data: SpritePass{Mapped: display.Mapped, Columns: display.Columns, Geometry: geometry}})
+    result, visible := projected.Coverage, projected.Data.Sprites.Visible
     if result.Failed { return CameraDraw{} }
-    columns := walls.DrawPlanesCached(camera, viewHeight, result, materials, scene.ColumnAngles, projected.Data.Columns)
+    columns := walls.DrawPlanesCached(camera, viewHeight, result, materials, scene.WallView.ColumnAngles,
+        projection.PlaneDistanceScales, projected.Data.Columns)
     masked := walls.MaskedPassResult{Phase: display.FuzzPhase}
     if result.DrawSegments.Count > 0 || visible.Count > 0 {
         masked = walls.DrawMaskedPass(result, visible, viewHeight, materials.Shade, masked.Phase)
@@ -415,25 +441,40 @@ func drawCamera(level wad.BspLevel, mounts wad.Archives, actors play.MapActors, 
         masked.Phase = DrawWeaponView(weapon, mounts, materials.Shade, lights.LightAt(sector, level.SectorLight(sector)),
             window, display.Invisible, masked.Phase)
     }
-    if display.StatusVisible { DrawStatusBar(mounts, display.Shade, display.Inventory, display.Face) }
+    if display.StatusVisible {
+        if display.ReuseStatus { preserveScreen(StatusViewHeight, Height - StatusViewHeight)
+        } else { DrawStatusBar(mounts, display.Shade, display.Inventory, display.Face) }
+    }
     return CameraDraw{Valid: true, FuzzPhase: masked.Phase,
         FuzzVisible: masked.FuzzVisible || (drawWeapon && display.Invisible && materials.Shade.Valid),
         Mapped: projected.Data.Mapped, Columns: columns, Geometry: projected.Data.Geometry, Border: border}
 }
 
 map "Original WAD BSP View" {
-    screen at (-Width / 2, -Height / 2) size (Width, Height) with { style = "solid", hold = true, slice = true }
-    place scriptBlock at (-Width / 2 - 2, ControlRow + 2) with { code = previewCameraFocus }
+    screen at (DisplayLeft, DisplayTop) size (Width, Height) with {
+        style = DisplayStyle, hold = true, slice = true, sliceWork = DisplaySliceWork, scale = DisplayScale
+    }
+    place scriptBlock at (DisplayLeft - 2, ControlRow + 1) with { code = previewCameraFocus }
+    expand DoomMapSigns()
     expand DoomLightBoard(-Width / 2, ControlRow + 52)
-    input forward bit at (-46, ControlRow + 2) with { key = "W", buffer = true }
-    input reverse bit at (-34, ControlRow + 2) with { key = "S", buffer = true }
+    expand DoomPowerBlinkBoard(-550, ControlRow + 76)
+    // These gates and the individual direction keys reach the controller at
+    // the same depth, including when a key is pressed during a render slice.
+    input turnActivity bit at (-69, ControlRow + 20) with { keys = "A D ArrowLeft ArrowRight", buffer = true, gateReads = true }
+    input forwardActivity bit at (-9, ControlRow + 20) with { keys = "W S ArrowUp ArrowDown", buffer = true, gateReads = true }
+    input lowWeaponActivity bit at (6, ControlRow + 20) with { keys = "1234", buffer = true, gateReads = true }
+    input highWeaponActivity bit at (21, ControlRow + 20) with { keys = "5678", buffer = true, gateReads = true }
+    input automapControlsActive bit at (36, ControlRow + 20) with { keys = "MGUB", buffer = true, gateReads = true }
+    input hudControlsActive bit at (51, ControlRow + 20) with { keys = "NVJK", buffer = true, gateReads = true }
+    input forwardLetter bit at (-46, ControlRow + 2) with { key = "W", buffer = true }
+    input reverseLetter bit at (-34, ControlRow + 2) with { key = "S", buffer = true }
     input toggleStatus bit at (-25, ControlRow + 2) with { key = "H", buffer = true }
-    input turnLeft bit at (-16, ControlRow + 2) with { key = "A", buffer = true }
-    input turnRight bit at (0, ControlRow + 2) with { key = "D", buffer = true }
+    input leftLetter bit at (-16, ControlRow + 2) with { key = "A", buffer = true }
+    input rightLetter bit at (0, ControlRow + 2) with { key = "D", buffer = true }
     input strafeLeft bit at (18, ControlRow + 2) with { key = "Q", buffer = true }
     input strafeRight bit at (32, ControlRow + 2) with { key = "E", buffer = true }
-    input use bit at (49, ControlRow + 2) with { key = "F", buffer = true }
-    input fire bit at (61, ControlRow + 2) with { key = "R", buffer = true }
+    input useLetter bit at (49, ControlRow + 2) with { key = "F", buffer = true }
+    input fireLetter bit at (61, ControlRow + 2) with { key = "R", buffer = true }
     input cycleWeapon bit at (-60, ControlRow + 2) with { key = "X", buffer = true }
     input toggleAutomap bit at (-60, ControlRow + 5) with { key = "M", buffer = true }
     input toggleMapGrid bit at (-46, ControlRow + 5) with { key = "G", buffer = true }
@@ -445,14 +486,14 @@ map "Original WAD BSP View" {
     input clearAutomapMarks bit at (38, ControlRow + 5) with { key = "V", buffer = true }
     input refreshHudMessage bit at (51, ControlRow + 5) with { key = "J", buffer = true }
     input toggleHudMessages bit at (63, ControlRow + 5) with { key = "K", buffer = true }
-    input run bit at (-60, ControlRow + 8) with { key = "I", buffer = true }
+    input runLetter bit at (-60, ControlRow + 8) with { key = "I", buffer = true }
     input toggleSound bit at (-46, ControlRow + 8) with { key = "O", buffer = true }
     input togglePause bit at (-32, ControlRow + 8) with { key = "P", buffer = true }
     input toggleCampaignMenu bit at (-18, ControlRow + 8) with { key = "T", buffer = true }
     input quickSave bit at (-4, ControlRow + 8) with { key = "Y", buffer = true }
     input quickLoad bit at (10, ControlRow + 8) with { key = "L", buffer = true }
     input toggleMouse bit at (24, ControlRow + 8) with { key = "9", buffer = true }
-    input strafeModifier bit at (38, ControlRow + 8) with { key = "0", buffer = true }
+    input zeroKey bit at (38, ControlRow + 8) with { key = "0", buffer = true }
     input weapon1 bit at (-56, ControlRow + 11) with { key = "1", buffer = true }
     input weapon2 bit at (-40, ControlRow + 11) with { key = "2", buffer = true }
     input weapon3 bit at (-24, ControlRow + 11) with { key = "3", buffer = true }
@@ -461,22 +502,66 @@ map "Original WAD BSP View" {
     input weapon6 bit at (24, ControlRow + 11) with { key = "6", buffer = true }
     input weapon7 bit at (40, ControlRow + 11) with { key = "7", buffer = true }
     input weapon8 bit at (56, ControlRow + 11) with { key = "8", buffer = true }
-    script {
-        output musicCueBus bits<8> at (-56, ControlRow + 12) with { forward = "down" } = musicCuePhase
-        output weaponCuePacket bits<12> at (-56, ControlRow + 20) = weaponCueNote
+    input menuEditActive bit at (-60, ControlRow + 38) with { keys = "Backspace Enter Tab Space", buffer = true, gateReads = true }
+    input menuArrowsActive bit at (-45, ControlRow + 38) with { keys = "ArrowUp ArrowDown ArrowLeft ArrowRight", buffer = true, gateReads = true }
+    input saveShortcutsActive bit at (-30, ControlRow + 38) with { keys = "F2 F3 F6 F9", buffer = true, gateReads = true }
+    input titleShortcutsActive bit at (-15, ControlRow + 38) with { keys = "F1 F10", buffer = true, gateReads = true }
+    input panelShortcutsActive bit at (90, ControlRow + 38) with { keys = "F4 F7", buffer = true, gateReads = true }
+    input settingShortcutsActive bit at (110, ControlRow + 38) with { keys = "F5 F8 F11", buffer = true, gateReads = true }
+    input menuBackspace bit at (-75, ControlRow + 33) with { key = "Backspace", buffer = true }
+    input menuEnter bit at (-63, ControlRow + 33) with { key = "Enter", buffer = true }
+    input menuTab bit at (-51, ControlRow + 33) with { key = "Tab", buffer = true }
+    input menuSpace bit at (-39, ControlRow + 33) with { key = "Space", buffer = true }
+    input menuUp bit at (-27, ControlRow + 33) with { key = "ArrowUp", buffer = true }
+    input menuDown bit at (-15, ControlRow + 33) with { key = "ArrowDown", buffer = true }
+    input menuLeft bit at (-3, ControlRow + 33) with { key = "ArrowLeft", buffer = true }
+    input menuRight bit at (9, ControlRow + 33) with { key = "ArrowRight", buffer = true }
+    input saveMenuKey bit at (21, ControlRow + 33) with { key = "F2", buffer = true }
+    input loadMenuKey bit at (33, ControlRow + 33) with { key = "F3", buffer = true }
+    input quickSaveKey bit at (45, ControlRow + 33) with { key = "F6", buffer = true }
+    input quickLoadKey bit at (57, ControlRow + 33) with { key = "F9", buffer = true }
+    // Preserve the original Doom action keys and the existing map aliases.
+    // Each pair is combined by a physical OR before the game command samples it.
+    input use bit at (-60, ControlRow + 45) with { keys = "F Space", buffer = true }
+    input fire bit at (-45, ControlRow + 45) with { keys = "R Ctrl", buffer = true }
+    input run bit at (-30, ControlRow + 45) with { keys = "I Shift", buffer = true, gateReads = true }
+    input controlFire bit at (-17, ControlRow + 45) with { key = "Ctrl", buffer = true }
+    input helpMenuKey bit at (-3, ControlRow + 45) with { key = "F1", buffer = true }
+    input quitMenuKey bit at (12, ControlRow + 45) with { key = "F10", buffer = true }
+    input strafeModifier bit at (27, ControlRow + 45) with { keys = "0 Alt", buffer = true, gateReads = true }
+    input altKey bit at (39, ControlRow + 45) with { key = "Alt", buffer = true }
+    input soundMenuKey bit at (90, ControlRow + 45) with { key = "F4", buffer = true }
+    input detailKey bit at (104, ControlRow + 45) with { key = "F5", buffer = true }
+    input endGameKey bit at (118, ControlRow + 45) with { key = "F7", buffer = true }
+    input messagesKey bit at (132, ControlRow + 45) with { key = "F8", buffer = true }
+    input gammaKey bit at (146, ControlRow + 45) with { key = "F11", buffer = true }
+    // Each direction merges its aliases in one physical hop. The command
+    // builder cancels opposite directions after reading the buffered groups.
+    input forward bit at (-66, ControlRow + 64) with { keys = "W ArrowUp", buffer = true }
+    input reverse bit at (-51, ControlRow + 64) with { keys = "S ArrowDown", buffer = true }
+    input turnLeft bit at (-36, ControlRow + 64) with { keys = "A ArrowLeft", buffer = true }
+    input turnRight bit at (-21, ControlRow + 64) with { keys = "D ArrowRight", buffer = true }
+    input sidestepActivity bit at (39, ControlRow + 64) with { keys = "QE", buffer = true, gateReads = true }
+    // The physical OR arrives alongside both individual action hubs. The
+    // sliced controller can skip their reads when all four keys are idle.
+    input actionActivity bit at (54, ControlRow + 64) with { keys = "R Ctrl F Space", buffer = true, gateReads = true }
+    expand DoomCommandPads(192, ControlRow + 76)
+    input forwardAddress bits<4> at (192, ControlRow + 76) with { tap = true, tapPitch = 2 }
+    input sidewaysAddress bits<7> at (292, ControlRow + 76) with { tap = true, tapPitch = 2 }
+    circuit {
+        output forwardPacket bits<8> at (268, ControlRow + 170) with { pitch = 2 } =
+            bits<8>(play.NativeForwardDeltas(bits<3>(forwardAddress))) | (bits<8>(forwardAddress & 8) << 4)
+        output sidewaysPacket bits<9> at (452, ControlRow + 294) with { pitch = 2 } =
+            bits<9>(play.NativeSideAndTurnDeltas(bits<6>(sidewaysAddress))) | (bits<9>(sidewaysAddress & 64) << 2)
     }
+    publish soundCueEpoch bits<32> = cueEpoch
+    publish soundCueRequests bits<28> = cueRequests
     // Publish each host callback so the Music Arrow conductor is independent
     // of a renderer logical tick that can span many host ticks.
     publish host soundtrackNotes [audio.MusVoiceCount]bits<13> = musicPackets
-    place scriptSource at (-56, ControlRow + 14) facing right with { code = musicCueSource }
-    place music at (-55, ControlRow + 14) facing right with { instrument = 3, octave = 4, note = 0 }
-    expand FixedCue(-48, ControlRow + 12, 8, 5, 7)
-    expand FixedCue(-40, ControlRow + 12, 19, 3, 4)
-    expand FixedCue(-32, ControlRow + 12, 1, 3, 1)
-    expand FixedCue(-24, ControlRow + 12, 18, 3, 7)
-    expand FixedCue(-16, ControlRow + 12, 21, 3, 10)
-    expand FixedCue(-8, ControlRow + 12, 7, 4, 7)
-    expand FixedCue(0, ControlRow + 12, 3, 4, 6)
+    expand WeaponCueBank(-64, ControlRow + 25)
+    expand MenuCueBank(64, ControlRow + 25)
+    expand CommonCueBank(-48, ControlRow + 12)
     place scriptSource at (16, ControlRow + 16) facing right with { code = soundtrackSource }
     place music at (17, ControlRow + 16) facing right with { octave = 4 }
     expand SoundtrackBank(18, ControlRow + 16)
@@ -501,7 +586,7 @@ map "Original WAD BSP View" {
     register archives wad.Archives = wad.Archives{}
     register materialSource walls.Materials = walls.Materials{}
     register blockMap wad.BlockMapInfo = wad.BlockMapInfo{}
-    register animations wad.AnimationSet = wad.AnimationSet{}
+    register animations wad.FrameAnimations = wad.FrameAnimations{}
     register scrolls play.LineScrolls = play.LineScrolls{}
     register soundBounds play.PagedSlots<sectorSoundBounds> = play.PagedSlots<sectorSoundBounds>{}
     register lightState play.LevelLightStep = play.LevelLightStep{}
@@ -528,11 +613,20 @@ map "Original WAD BSP View" {
     register newCampaignMarker int = -1
     register newCampaignSkill int = previewCombatSkill
     register campaignMenu play.CampaignMenu = play.CampaignMenu{}
-    register campaignMenuKeys bits<10> = 0
-    register campaignMenuPending bits<10> = 0
+    register campaignMenuInitialized bit = false
+    register campaignMenuKeys bits<12> = 0
+    register campaignMenuPending bits<12> = 0
+    register campaignNamedKeys bits<20> = 0
+    register campaignNamedPending bits<20> = 0
+    register campaignLettersPending bits<26> = 0
+    register campaignSkullCountdown int = 10
+    register campaignSkullAlternate bit = false
     register mouseSensitivity int = play.DefaultMouseSensitivity
     register campaignMenuBackdrop string = ""
-    register checkpoint CheckpointSlot = CheckpointSlot{}
+    register attract PreviewAttract = PreviewAttract{}
+    register attractWakePending bit = false
+    register checkpointSlots [play.CampaignSaveSlots]CheckpointSlot = [play.CampaignSaveSlots]CheckpointSlot{}
+    register quickSlot int = -1
     register checkpointKeys bits<2> = 0
     register intermission play.IntermissionState = play.IntermissionState{}
     register intermissionBackdrop play.IntermissionBackdrop = play.IntermissionBackdrop{}
@@ -557,7 +651,7 @@ map "Original WAD BSP View" {
     register statusHidden bit = false
     register viewBlocks int = configuredViewBlocks
     register lowDetail bit = LowDetail
-    register gammaLevel int = engine.DefaultDoomGamma
+    register gammaLevel int = DisplayGamma
     register statusKeyDown bit = false
     register screenStatusVisible bit = false
     register statusFace play.StatusFace = play.StatusFace{}
@@ -582,9 +676,11 @@ map "Original WAD BSP View" {
     register mouseKeyDown bit = false
     register pointerX int = -1
     register pointerY int = -1
-    register musicCuePhase bits<8> = 0
-    register weaponCueNote bits<12> = 0
+    register cueEpoch bits<32> = 0
+    register cueRequests bits<28> = 0
     register soundMuted bit = false
+    register soundEffectsEnabled bit = true
+    register soundtrackEnabled bit = true
     register soundKeyDown bit = false
     // The game tick owns requests. The host tick owns the live MUS cursor and
     // packet phase, so rendering work cannot slow the soundtrack transport.
@@ -605,19 +701,27 @@ map "Original WAD BSP View" {
     register soundtrackTicDebt int = 0
     register musicPackets [audio.MusVoiceCount]bits<13> = [audio.MusVoiceCount]bits<13>{}
     tick {
-        requestedWeapon := previewWeaponNumber([numberedWeaponCount]bit{
-            weapon1, weapon2, weapon3, weapon4, weapon5, weapon6, weapon7, weapon8,
-        })
+        requestedWeapon := play.WeaponNoChange
+        if lowWeaponActivity || highWeaponActivity {
+            requestedWeapon = previewWeaponNumber([numberedWeaponCount]bit{
+                weapon1, weapon2, weapon3, weapon4, weapon5, weapon6, weapon7, weapon8,
+            })
+        }
         var soundCues bits<8>
-        var weaponSound int
+        var weaponRequests bits<16>
         requestedTrack := -1
         musicPaused := soundtrackPaused
         castActive := finale.Stage == play.FinaleCastStage
+        attractActive := attract.Stage != 0
+        attractInput := attractActive || (ClassicMenu && !campaignMenuInitialized)
+        menuWasOpen := campaignMenu.Stage != play.CampaignMenuClosed
+        classicNavigation := menuWasOpen && campaignMenu.FromMain
+        menuOwnsText := classicNavigation || campaignMenu.Stage == play.CampaignMenuSaveName
         muted := soundMuted
-        if toggleSound && !soundKeyDown { muted = !muted }
+        if !attractActive && !menuOwnsText && toggleSound && !soundKeyDown { muted = !muted }
         next soundMuted = muted
         next soundKeyDown = toggleSound
-        mouseActive := mouseEnabled != (toggleMouse && !mouseKeyDown && !castActive)
+        mouseActive := mouseEnabled != (!attractActive && !menuOwnsText && toggleMouse && !mouseKeyDown && !castActive)
         if mouseActive != mouseEnabled {
             if mouseActive { log("Doom mouse enabled") } else { log("Doom mouse disabled") }
         }
@@ -630,40 +734,71 @@ map "Original WAD BSP View" {
         next pointerY = cursorY
         startingNew := newCampaignMarker >= 0
         levelHalted := floors.PlatformOverflow || doors.Switches.ButtonOverflow
-        var menuKeys bits<10>
-        menuKeys[0], menuKeys[1], menuKeys[2], menuKeys[3] = toggleCampaignMenu, forward, reverse, use
-        menuKeys[4], menuKeys[5] = turnLeft, turnRight
+        var menuKeys bits<12>
+        menuKeys[0], menuKeys[1], menuKeys[2], menuKeys[3] = toggleCampaignMenu, forwardLetter, reverseLetter, useLetter
+        menuKeys[4], menuKeys[5] = leftLetter, rightLetter
         menuKeys[6], menuKeys[7] = strafeLeft, strafeRight
         menuKeys[8] = toggleMapGrid
         menuKeys[9] = refreshHudMessage
+        if attractInput { menuKeys[10], menuKeys[11] = fire, run }
+        var namedKeys bits<20>
+        if menuEditActive { namedKeys[0], namedKeys[1], namedKeys[2], namedKeys[3] = menuBackspace, menuEnter, menuTab, menuSpace }
+        if menuArrowsActive { namedKeys[4], namedKeys[5], namedKeys[6], namedKeys[7] = menuUp, menuDown, menuLeft, menuRight }
+        if saveShortcutsActive { namedKeys[8], namedKeys[9], namedKeys[10], namedKeys[11] = saveMenuKey, loadMenuKey, quickSaveKey, quickLoadKey }
+        if titleShortcutsActive { namedKeys[12], namedKeys[13] = helpMenuKey, quitMenuKey }
+        namedKeys[14] = altKey
+        if panelShortcutsActive { namedKeys[15], namedKeys[17] = soundMenuKey, endGameKey }
+        if settingShortcutsActive { namedKeys[16], namedKeys[18], namedKeys[19] = detailKey, messagesKey, gammaKey }
         menuPressed := (menuKeys & ~campaignMenuKeys) | campaignMenuPending
+        namedPressed := (namedKeys & ~campaignNamedKeys) | campaignNamedPending
         next campaignMenuKeys = menuKeys
+        next campaignNamedKeys = namedKeys
         if screenWipe.Melt.Active {
             // The wipe presents frames before the next menu or game tic.
             next campaignMenuPending = menuPressed
-            menuPressed = 0
-        } else { next campaignMenuPending = 0 }
-        menuWasOpen := campaignMenu.Stage != play.CampaignMenuClosed
+            next campaignNamedPending = namedPressed
+            menuPressed, namedPressed = 0, 0
+        } else {
+            next campaignMenuPending = 0
+            next campaignNamedPending = 0
+        }
+        saveNavigation := campaignMenu.IsSaveMenu()
         stableCampaign := done && marker >= 0 && !restartPending && advanceMarker < 0 && !startingNew &&
             !screenWipe.Melt.Active
+        skullChanged := ClassicMenu && stableCampaign && campaignSkullCountdown <= 1
+        if ClassicMenu && stableCampaign {
+            if skullChanged {
+                next campaignSkullCountdown = 8
+                next campaignSkullAlternate = !campaignSkullAlternate
+            } else { next campaignSkullCountdown = campaignSkullCountdown - 1 }
+        }
         var letters bits<26>
         var digits bits<10>
         reveal := automapReveal
-        if automapActive || toggleAutomap || levelExited {
+        classicInput := ClassicMenu && (classicNavigation || menuPressed[0] || namedPressed & 0xfff00 != 0 || quickSave || quickLoad)
+        if automapActive || toggleAutomap || levelExited || attractInput || classicInput || saveNavigation || campaignMenu.IsConfirmPrompt() {
             // The host buffers physical key states. Compare them at logical tic
             // boundaries so a held key is seen only once by the responder.
-            letters[0], letters[1], letters[2], letters[3] = turnLeft, toggleMapFull, zoomMapOut, turnRight
-            letters[4], letters[5], letters[6], letters[7] = strafeRight, use, toggleMapGrid, toggleStatus
-            letters[8], letters[9], letters[10], letters[11] = run, refreshHudMessage, toggleHudMessages, quickLoad
+            letters[0], letters[1], letters[2], letters[3] = leftLetter, toggleMapFull, zoomMapOut, rightLetter
+            letters[4], letters[5], letters[6], letters[7] = strafeRight, useLetter, toggleMapGrid, toggleStatus
+            letters[8], letters[9], letters[10], letters[11] = runLetter, refreshHudMessage, toggleHudMessages, quickLoad
             letters[12], letters[13], letters[14], letters[15] = toggleAutomap, markAutomap, toggleSound, togglePause
-            letters[16], letters[17], letters[18], letters[19] = strafeLeft, fire, reverse, toggleCampaignMenu
-            letters[20], letters[21], letters[22], letters[23] = toggleMapFollow, clearAutomapMarks, forward, cycleWeapon
+            letters[16], letters[17], letters[18], letters[19] = strafeLeft, fireLetter, reverseLetter, toggleCampaignMenu
+            letters[20], letters[21], letters[22], letters[23] = toggleMapFollow, clearAutomapMarks, forwardLetter, cycleWeapon
             letters[24], letters[25] = quickSave, zoomMapIn
-            digits[0], digits[1], digits[2], digits[3], digits[4] = strafeModifier, weapon1, weapon2, weapon3, weapon4
+            digits[0], digits[1], digits[2], digits[3], digits[4] = zeroKey, weapon1, weapon2, weapon3, weapon4
             digits[5], digits[6], digits[7], digits[8], digits[9] = weapon5, weapon6, weapon7, weapon8, toggleMouse
         }
         freshLetters := letters & ~keyboardLetters
         freshDigits := digits & ~keyboardDigits
+        mnemonicLetters := freshLetters
+        if campaignLettersPending != 0 { mnemonicLetters = campaignLettersPending }
+        var mnemonicCursor int
+        if classicNavigation && namedPressed & 0xff == 0 && mnemonicLetters != 0 {
+            mnemonicCursor = campaignMenu.LetterCursor(campaignSaveCharacter(mnemonicLetters, freshDigits, false))
+        }
+        if screenWipe.Melt.Active && mnemonicCursor > 0 { next campaignLettersPending = mnemonicLetters
+        } else { next campaignLettersPending = 0 }
         if stableCampaign && automapActive && !menuWasOpen && !levelHalted && !levelExited && (freshLetters != 0 || freshDigits != 0) {
             // Several fresh keys in one sample have no known order.
             key := -1
@@ -685,53 +820,190 @@ map "Original WAD BSP View" {
         saveKeys[0], saveKeys[1] = quickSave, quickLoad
         savePressed := saveKeys & ~checkpointKeys
         next checkpointKeys = saveKeys
-        checkpointReady := stableCampaign && !menuWasOpen && !menuPressed[0]
-        loadCheckpoint := checkpointReady && savePressed[1]
-        saveCheckpoint := checkpointReady && !loadCheckpoint && savePressed[0] && !levelHalted && !levelExited && !inventory.Dead && blockMap.Valid
-        checkpointHold := saveCheckpoint || (loadCheckpoint && checkpoint.Valid)
-        if loadCheckpoint && !checkpoint.Valid { log("No Doom checkpoint saved") }
-        if checkpointReady && savePressed[0] && !loadCheckpoint && !saveCheckpoint { log("Doom checkpoint requires a living player in an active level") }
         menuHold := menuWasOpen
         var menuStep play.CampaignMenuStep
+        bootTitle := ClassicMenu && !campaignMenuInitialized && stableCampaign && screenShade.Valid && wadMenuAvailable(archives) &&
+            fullPageMenuPatch(readIntermissionPatch(archives, titleMenuName()))
+        if stableCampaign { next campaignMenuInitialized = true }
+        wakeMenu := attractInput && (attractWakePending || freshLetters != 0 || freshDigits != 0 ||
+            namedPressed & 0x7fff != 0 || menuPressed[10] || menuPressed[11])
+        next attractWakePending = wakeMenu && !stableCampaign && !menuWasOpen
+        canSave := stableCampaign && !attractActive && !bootTitle && !levelHalted && !levelExited && blockMap.Valid
+        classicShortcut := ClassicMenu && (savePressed != 0 || namedPressed & 0x0f00 != 0)
+        titleShortcut := ClassicMenu && namedPressed & 0x3000 != 0
+        soundShortcut := ClassicMenu && namedPressed[15]
+        endGameShortcut := ClassicMenu && namedPressed[17]
+        userGame := !attractActive && !bootTitle
+        classicCheckpointKeys := false
+        var saveNames [play.CampaignSaveSlots]string
+        if saveNavigation {
+            for slot := range play.CampaignSaveSlots { saveNames[slot] = checkpointSlots[slot].Name }
+        }
         if menuWasOpen {
-            menuStep = play.TickCampaignMenu(campaignMenu,
-                play.CampaignMenuInput{Back: menuPressed[0], Up: menuPressed[1], Down: menuPressed[2], Confirm: menuPressed[3]})
-        } else if menuPressed[0] && stableCampaign {
+            keys := play.CampaignMenuInput{Back: menuPressed[0] || (namedPressed[0] && campaignMenu.Stage != play.CampaignMenuMain) ||
+                    (namedPressed[2] && !campaignMenu.FromMain), Dismiss: namedPressed[2],
+                Up: menuPressed[1] || namedPressed[4], Down: menuPressed[2] || namedPressed[5],
+                Confirm: menuPressed[3] || namedPressed[1], Left: menuPressed[4] || namedPressed[6],
+                Right: menuPressed[5] || namedPressed[7], SaveAllowed: canSave, SaveNames: saveNames}
+            if mnemonicCursor > 0 && !screenWipe.Melt.Active {
+                // The original row key takes precedence over Fletcher's letter aliases.
+                keys = play.CampaignMenuInput{CursorKey: mnemonicCursor}
+            } else if campaignMenu.Stage == play.CampaignMenuSaveName {
+                keys.Back = namedPressed[2]
+                keys.Confirm = namedPressed[1]
+                keys.Erase = namedPressed[0]
+                keys.Character = campaignSaveCharacter(freshLetters, freshDigits, namedPressed[3])
+                keys.TextFits = keys.Character != "" && campaignSaveNameWidth(archives, campaignMenu.SaveName) < 176
+            } else if campaignMenu.Stage == play.CampaignMenuLoad || campaignMenu.Stage == play.CampaignMenuSave {
+                for slot := range play.CampaignSaveSlots {
+                    if freshDigits == bits<10>(1 << (slot + 1)) && freshLetters == 0 { keys.CursorKey = slot + 1 }
+                }
+            } else if campaignMenu.IsConfirmPrompt() {
+                keys.Back = menuPressed[0]
+                keys.Yes = savePressed[0]
+                keys.Dismiss = namedPressed[2] || namedPressed[3] || freshLetters[13]
+            } else if saveNavigation && campaignMenu.Stage >= play.CampaignMenuQuickSave {
+                keys.Yes = savePressed[0]
+                keys.Dismiss = namedPressed[2] || namedPressed[3] || freshLetters[13]
+                if campaignMenu.SaveName == "" { keys.Dismiss = freshLetters != 0 || freshDigits != 0 || namedPressed != 0 }
+            }
+            menuStep = play.TickCampaignMenu(campaignMenu, keys)
+        } else if stableCampaign && (wakeMenu || menuPressed[0] || classicShortcut || titleShortcut || soundShortcut || (endGameShortcut && userGame)) {
             currentLevel := wad.LoadBspLevel(Archive, marker)
-            menuStep.Menu = play.OpenCampaignMenu(archives, currentLevel.MapName.Low & 0xffffff == 0x50414d, campaignSkill)
+            commercial := currentLevel.MapName.Low & 0xffffff == 0x50414d
+            if ClassicMenu && wadMenuAvailable(archives) {
+                menuSkill := campaignSkill
+                if attractActive || bootTitle { menuSkill = 2 }
+                menuStep.Menu = play.OpenCampaignMain(archives, commercial, menuSkill, attractActive || bootTitle).WithSelections(campaignMenu)
+                menuStep.Sound = play.CampaignMenuSoundBack
+                if titleShortcut {
+                    if namedPressed[12] { menuStep.Menu = menuStep.Menu.OpenHelp(true)
+                    } else { menuStep.Menu.Stage = play.CampaignMenuQuit }
+                } else if soundShortcut {
+                    menuStep.Menu = menuStep.Menu.OpenSoundShortcut()
+                } else if endGameShortcut && userGame {
+                    menuStep.Menu.Stage, menuStep.Menu.Cursor = play.CampaignMenuEndGame, 0
+                } else if classicShortcut {
+                    classicCheckpointKeys = true
+                    if namedPressed[8] {
+                        menuStep.Menu = menuStep.Menu.OpenCheckpointList(true, canSave)
+                    } else if namedPressed[9] {
+                        menuStep.Menu = menuStep.Menu.OpenCheckpointList(false, false)
+                    } else if namedPressed[11] || savePressed[1] {
+                        name := ""
+                        if quickSlot >= 0 { name = checkpointSlots[quickSlot].Name }
+                        menuStep.Menu = menuStep.Menu.OpenQuickCheckpoint(false, quickSlot, name)
+                    } else if canSave {
+                        name := ""
+                        if quickSlot >= 0 { name = checkpointSlots[quickSlot].Name
+                        } else { next quickSlot = -2 }
+                        menuStep.Menu = menuStep.Menu.OpenQuickCheckpoint(true, quickSlot, name)
+                    } else { menuStep.Menu.Stage = play.CampaignMenuClosed }
+                }
+            } else { menuStep.Menu = play.OpenCampaignMenu(archives, commercial, campaignSkill) }
             menuHold = menuStep.Menu.Stage != play.CampaignMenuClosed
             menuStep.Changed = menuHold
-            if !menuHold { log("No campaign starting map in the supplied WAD") }
+            if !menuHold && !classicCheckpointKeys { log("No campaign starting map in the supplied WAD") }
         }
+        settingsShortcut := ClassicMenu && stableCampaign && !menuWasOpen && !menuHold
+        if settingsShortcut {
+            if endGameShortcut && !userGame {
+                menuStep.Sound = play.CampaignMenuSoundBack
+                soundCues = soundCues | cueDenied
+            }
+            menuStep.ToggleDetail, menuStep.ToggleMessages = namedPressed[16], namedPressed[18]
+            if menuStep.ToggleDetail || menuStep.ToggleMessages { menuStep.Sound = play.CampaignMenuSoundBack }
+        }
+        checkpointReady := stableCampaign && !attractActive && !menuHold && !menuPressed[0] && !classicCheckpointKeys
+        loadCheckpoint := stableCampaign && (menuStep.LoadCheckpoint || (checkpointReady && savePressed[1]))
+        saveRequested := stableCampaign && (menuStep.SaveCheckpoint || (checkpointReady && savePressed[0]))
+        saveCheckpoint := saveRequested && !loadCheckpoint && canSave && (campaignMenu.FromMain || !inventory.Dead)
+        checkpointIndex := 0
+        if menuStep.SaveCheckpoint || menuStep.LoadCheckpoint { checkpointIndex = menuStep.Slot }
+        var checkpoint CheckpointSlot
+        if loadCheckpoint { checkpoint = checkpointSlots[checkpointIndex] }
+        checkpointHold := saveCheckpoint || (loadCheckpoint && checkpoint.Valid)
+        if loadCheckpoint && !checkpoint.Valid { log("No Doom checkpoint saved") }
+        if saveRequested && !loadCheckpoint && !saveCheckpoint { log("Doom checkpoint requires a living player in an active level") }
+        if (menuStep.SaveCheckpoint || menuStep.LoadCheckpoint) && !checkpointHold { menuStep.Menu = campaignMenu }
         menuVisible := menuHold && menuStep.Menu.Stage != play.CampaignMenuClosed
+        if menuVisible && menuStep.Menu.IsSaveMenu() && !saveNavigation {
+            for slot := range play.CampaignSaveSlots { saveNames[slot] = checkpointSlots[slot].Name }
+        }
+        var recorded play.DoomDemoRead
+        playingDemo := attractActive && attract.Demo.Valid
+        if playingDemo && attract.Ready && stableCampaign && marker == attract.Marker { recorded = attract.Demo.Read() }
+        nextAttract := attract
+        returnToTitle := menuStep.EndGame || menuStep.Quit
+        stageChanged := bootTitle || returnToTitle
+        if stageChanged {
+            commercial := wad.LoadBspLevel(Archive, marker).MapName.Low & 0xffffff == 0x50414d
+            nextAttract = openAttract(archives, commercial)
+            if menuStep.Quit { soundCues = soundCues | previewQuitCue(commercial, gameTime) }
+        } else if menuStep.Start || (loadCheckpoint && checkpoint.Valid) {
+            nextAttract = PreviewAttract{}
+        } else if attractActive && stableCampaign {
+            if attract.PageTics > 0 {
+                nextAttract.PageTics = attract.PageTics - 1
+            } else if !playingDemo || !recorded.Valid || recorded.Done || levelHalted || !blockMap.Valid {
+                nextAttract = advanceAttract(archives, attract)
+                stageChanged = true
+            }
+        }
+        if stageChanged && nextAttract.Demo.Valid {
+            next newCampaignMarker = nextAttract.Marker
+            next newCampaignSkill = nextAttract.Demo.Skill
+        }
         menuBackdrop := campaignMenuBackdrop
         var menuBackgroundChanged bit
         hideStatus := statusHidden
         selectedBlocks := viewBlocks
-        if !checkpointHold && !menuHold && !screenWipe.Melt.Active && toggleStatus && !statusKeyDown && finale.Stage != play.FinaleCastStage {
+        if !attractActive && !checkpointHold && !menuHold && !screenWipe.Melt.Active && toggleStatus && !statusKeyDown && !castActive {
             hideStatus = !hideStatus
         }
-        if menuWasOpen && menuVisible && menuPressed[4] != menuPressed[5] {
-            if menuPressed[4] {
+        screenDelta, sensitivityDelta := menuStep.ScreenDelta, menuStep.SensitivityDelta
+        if menuWasOpen && menuVisible && !campaignMenu.FromMain && menuPressed[4] != menuPressed[5] {
+            screenDelta = 1
+            if menuPressed[4] { screenDelta = -1 }
+        }
+        if menuWasOpen && menuVisible {
+            if screenDelta < 0 {
                 if hideStatus { hideStatus = false
                 } else if selectedBlocks > 3 { selectedBlocks = selectedBlocks - 1 }
-            } else if !hideStatus {
+            } else if screenDelta > 0 && !hideStatus {
                 if selectedBlocks < 10 { selectedBlocks = selectedBlocks + 1
                 } else { hideStatus = true }
             }
         }
         viewChanged := selectedBlocks != viewBlocks
-        selectedDetail := lowDetail != (menuWasOpen && menuVisible && menuPressed[8])
+        selectedDetail := lowDetail != (menuStep.ToggleDetail || (menuWasOpen && menuVisible && mnemonicCursor == 0 && menuPressed[8]))
         detailChanged := selectedDetail != lowDetail
         selectedGamma := gammaLevel
-        if menuWasOpen && menuVisible && menuPressed[9] { selectedGamma = (gammaLevel + 1) % engine.DoomGammaCount }
+        gammaShortcut := settingsShortcut && namedPressed[19]
+        if gammaShortcut || (menuWasOpen && menuVisible && menuPressed[9]) { selectedGamma = (gammaLevel + 1) % engine.DoomGammaCount }
         gammaChanged := selectedGamma != gammaLevel
+        gammaMessage := ""
+        if gammaShortcut && userGame { gammaMessage = gammaHudMessages[selectedGamma] }
         menuBlocks := selectedBlocks
         if hideStatus { menuBlocks = 11 }
-        sensitivity := mouseSensitivity
-        if menuWasOpen && menuVisible && menuPressed[6] != menuPressed[7] {
-            if menuPressed[6] && sensitivity > 0 { sensitivity = sensitivity - 1 }
-            if menuPressed[7] && sensitivity < play.MaxMouseSensitivity { sensitivity = sensitivity + 1 }
+        if menuWasOpen && menuVisible && mnemonicCursor == 0 && menuPressed[6] != menuPressed[7] {
+            sensitivityDelta = 1
+            if menuPressed[6] { sensitivityDelta = -1 }
+        }
+        sensitivity := mouseSensitivity + sensitivityDelta
+        if sensitivity < 0 { sensitivity = 0 }
+        if sensitivity > play.MaxMouseSensitivity { sensitivity = play.MaxMouseSensitivity }
+        effectsEnabled, musicEnabled := soundEffectsEnabled, soundtrackEnabled
+        if menuStep.EffectsDelta != 0 { effectsEnabled = menuStep.EffectsDelta > 0 }
+        if menuStep.MusicDelta != 0 { musicEnabled = menuStep.MusicDelta > 0 }
+        next soundEffectsEnabled = effectsEnabled
+        next soundtrackEnabled = musicEnabled
+        menuSettings := CampaignMenuSettings{Blocks: menuBlocks, Sensitivity: sensitivity, LowDetail: selectedDetail,
+            Messages: hudMessagesEnabled != menuStep.ToggleMessages, Effects: effectsEnabled, Music: musicEnabled,
+            Gamma: selectedGamma, SaveNames: saveNames, SkullAlternate: campaignSkullAlternate != skullChanged}
+        if stageChanged && nextAttract.Music != 0 {
+            requestedTrack = nextAttract.Music
+            musicPaused = false
         }
         next mouseSensitivity = sensitivity
         next viewBlocks = selectedBlocks
@@ -740,12 +1012,20 @@ map "Original WAD BSP View" {
         next statusHidden = hideStatus
         next statusKeyDown = toggleStatus
         var hudKeys bits<8>
-        hudKeys[0], hudKeys[1], hudKeys[2] = toggleAutomap, toggleMapGrid, toggleMapFollow
-        hudKeys[3], hudKeys[4], hudKeys[5] = toggleMapFull, markAutomap, clearAutomapMarks
-        hudKeys[6], hudKeys[7] = refreshHudMessage, toggleHudMessages
+        if automapControlsActive {
+            hudKeys[0], hudKeys[1], hudKeys[2], hudKeys[3] = toggleAutomap, toggleMapGrid, toggleMapFollow, toggleMapFull
+        }
+        if hudControlsActive {
+            hudKeys[4], hudKeys[5], hudKeys[6], hudKeys[7] = markAutomap, clearAutomapMarks, refreshHudMessage, toggleHudMessages
+        }
         hudPressed := hudKeys & ~hudControlKeys
-        if menuHold || checkpointHold { hudPressed = 0 }
+        if menuHold || checkpointHold || attractActive { hudPressed = 0 }
         next hudControlKeys = hudKeys
+        if menuStep.ToggleMessages || gammaMessage != "" {
+            messages, enabled := updateSettingsMessages(hudMessages, hudMessagesEnabled, menuStep.ToggleMessages, gammaMessage)
+            next hudMessages = messages
+            next hudMessagesEnabled = enabled
+        }
         mapOpen := automapActive != hudPressed[0]
         mapFollowing := mapView.Follow || mapView.Window.Width == 0
         if hudPressed[2] { mapFollowing = !mapFollowing }
@@ -755,10 +1035,14 @@ map "Original WAD BSP View" {
             Down: mapPanning && reverse, ZoomIn: !menuHold && zoomMapIn, ZoomOut: !menuHold && zoomMapOut}
         // P_Ticker updates the translations using leveltime before incrementing it.
         levelTime := currentTick() - startTick - 1
-        repaint := (scrolls.Count > 0 && materialSource.Textures.Valid) || (animations.Count > 0 && levelTime % wad.AnimationTics == 0)
-        pauseCommand := stableCampaign && !levelHalted && !checkpointHold && (!menuHold || (levelExited && !menuStep.Start)) &&
+        repaint := (scrolls.Count > 0 && materialSource.Textures.Valid) || (animations.Active() && levelTime % wad.AnimationTics == 0)
+        pauseCommand := stableCampaign && !attractActive && !levelHalted && !checkpointHold && (!menuHold || (levelExited && !menuStep.Start)) &&
             !castActive && togglePause && !pauseKeyDown
-        pauseWorld := gamePaused != pauseCommand
+        if playingDemo && recorded.Valid && !recorded.Done && !stageChanged &&
+            (recorded.Buttons & (play.DemoSpecial | play.DemoSpecialMask)) == (play.DemoSpecial | play.DemoPause) {
+            pauseCommand = true
+        }
+        pauseWorld := !stageChanged && (gamePaused != pauseCommand)
         next gamePaused = pauseWorld
         next pauseKeyDown = togglePause
         resumed := !levelExited && gamePaused && pauseCommand
@@ -775,13 +1059,21 @@ map "Original WAD BSP View" {
             // down on entering the cast can remain in subsequent commands.
             if castActive { commandKeys = commandKeys & finaleCommandKeys
             } else if menuHold { commandKeys[1] = commandKeys[1] && finaleCommandKeys[1] }
+            if !castActive && classicNavigation && campaignMenu.Stage == play.CampaignMenuMain && !campaignMenu.Commercial && fireLetter {
+                // R is Read This here. Keep Ctrl as a separate attack key.
+                commandKeys[0] = controlFire
+            }
         }
         next finaleCommandKeys = commandKeys
         castLetters := freshLetters & ~castHostLetters
         if menuHold { castLetters = castLetters & ~menuNavigationLetters }
-        castPressed := castActive && !checkpointHold && (pendingCastPress || castLetters != 0 || freshDigits != 0)
+        if mnemonicCursor > 0 { castLetters = castLetters & ~mnemonicLetters }
+        castMovement := !menuHold && namedPressed & 0x40f0 != 0 // Alt and the four cursor keys.
+        castPressed := castActive && !playingDemo && !checkpointHold && (pendingCastPress || castLetters != 0 || freshDigits != 0 || castMovement)
         next pendingCastPress = castPressed && screenWipe.Melt.Active
         if saveCheckpoint {
+            checkpointFrame := captureScreen(true)
+            if menuStep.SaveCheckpoint { checkpointFrame = campaignMenuBackdrop }
             saved := PreviewCheckpoint{
                 Marker: marker, Skill: campaignSkill, DidSecret: campaignSecret, PreviousNextMap: previousNextMap,
                 IntermissionPointerOn: intermission.PointerOn,
@@ -791,7 +1083,7 @@ map "Original WAD BSP View" {
                 BlockMap: blockMap, Actors: actors, ActorLinks: actorLinks, PassiveActors: passiveActors,
                 MapActors: mapActors, FirstActive: firstActive, Hearing: hearing, Brain: brain,
                 Light: lightState, Doors: doors, Floors: floors, Ceilings: ceilings, Scrolls: scrolls, SoundBounds: soundBounds,
-                Materials: materialSource, Animations: animations, ActorSprites: actorSprites, Screen: captureScreen(true),
+                Materials: materialSource, Animations: animations, ActorSprites: actorSprites, Screen: checkpointFrame,
                 Shade: screenShade, FuzzPhase: screenFuzzPhase, FuzzVisible: screenFuzzVisible,
                 StatusAvailable: statusAvailable, StatusHidden: statusHidden, ViewBlocks: viewBlocks, LowDetail: lowDetail,
                 Gamma: gammaLevel,
@@ -800,9 +1092,14 @@ map "Original WAD BSP View" {
                 HudMessages: hudMessages, HudMessagesEnabled: hudMessagesEnabled,
                 Soundtrack: soundtrack, SoundtrackQueue: soundtrackQueue, SoundtrackId: soundtrackId,
             }
-            next checkpoint = CheckpointSlot{Valid: true, Value: saved}
+            name := "CHECKPOINT"
+            if menuStep.SaveCheckpoint { name = menuStep.Menu.SaveName }
+            savedSlots := checkpointSlots
+            savedSlots[checkpointIndex] = CheckpointSlot{Valid: true, Name: name, Value: saved}
+            next checkpointSlots = savedSlots
+            if quickSlot == -2 { next quickSlot = checkpointIndex }
             next startTick = startTick + 1
-            log("Doom checkpoint saved")
+            log("Doom checkpoint saved", checkpointIndex + 1, name)
         } else if checkpointHold {
             saved := checkpoint.Value.Recall()
             next marker = saved.Marker
@@ -876,14 +1173,29 @@ map "Original WAD BSP View" {
             next soundtrackRestoreId = saved.SoundtrackId
             next soundtrackRestoreRevision = soundtrackRestoreRevision + 1
             musicPaused = saved.Paused
-            log("Doom checkpoint loaded")
+            log("Doom checkpoint loaded", checkpointIndex + 1, checkpoint.Name)
         } else if screenWipe.Melt.Active {
             // D_Display finishes the screen wipe before the next game tic.
             next screenWipe = advancePreviewWipe(screenWipe)
-            if menuWasOpen { drawCampaignMenu(campaignMenu, menuBlocks, sensitivity, selectedDetail, selectedGamma) }
+            if menuWasOpen { drawCampaignMenu(archives, screenShade, campaignMenu, menuSettings) }
             if !levelExited { next startTick = startTick + 1 }
-        } else if menuStep.Start || (!levelExited && (menuHold || (stableCampaign && pauseWorld))) {
+        } else if stageChanged || (attractActive && attract.Page.Low != 0 && !menuStep.Start) {
+            if nextAttract.Page.Low != 0 && (stageChanged || gammaChanged) {
+                menuBackgroundChanged = drawAttractPage(archives, screenShade, nextAttract.Page, selectedGamma)
+                if !menuBackgroundChanged { nextAttract.PageTics = 0 }
+                if menuBackgroundChanged && menuVisible { menuBackdrop = captureScreen(false) }
+                if menuBackgroundChanged && stageChanged && (playingDemo || returnToTitle) {
+                    started := beginPreviewWipe(lightState.Random)
+                    lighting := lightState
+                    lighting.Random = started.Random
+                    next lightState = lighting
+                    next screenWipe = started.Wipe
+                }
+            }
             next startTick = startTick + 1
+        } else if menuStep.Start || (!levelExited && ((!attractActive && menuHold) || (stableCampaign && pauseWorld))) {
+            next startTick = startTick + 1
+            if playingDemo && recorded.Valid && !recorded.Done && !menuStep.Start { nextAttract.Demo = recorded.Demo }
             enteringPause := pauseWorld && !gamePaused
             backgroundChanged := enteringPause
             // G_Ticker still calls ST_Ticker, AM_Ticker and HU_Ticker when
@@ -895,7 +1207,8 @@ map "Original WAD BSP View" {
                     roll := play.MRandom(lighting.Random)
                     lighting.Random = roll.State
                     face := nextStatusFace(statusFace, inventory, actors, player, weaponView.AttackDown, int(roll.Value))
-                    messages, enabled := updateMessageToggle(hudMessages, hudMessagesEnabled, hudPressed[7])
+                    messages, enabled := updateSettingsMessages(hudMessages, hudMessagesEnabled,
+                        hudPressed[7] || menuStep.ToggleMessages, gammaMessage)
                     if mapOpen { messages = queuePreviewAutomapMessages(messages, mapView, mapMarks, mapFollowing, hudPressed) }
                     messages = play.TickHudMessages(messages, enabled, hudPressed[6])
                     next lightState = lighting
@@ -936,6 +1249,7 @@ map "Original WAD BSP View" {
                         (shade.Valid && displayed != visibleMessage(hudMessages))
                     redrawFace := showStatus && face.Index != statusFace.Index
                     backgroundChanged = redraw || redrawFace || enteringPause
+                    if backgroundChanged { useDisplayPalette(shade) }
                     if redraw {
                         if !base.Valid { base = wad.LoadBspLevel(Archive, marker) }
                         level := play.LevelSpecials{Doors: doors, Floors: floors, Ceilings: ceilings, Lighting: lightState}.ApplyTo(base)
@@ -954,8 +1268,8 @@ map "Original WAD BSP View" {
                             if painted.Valid {
                                 next screenFuzzPhase = painted.FuzzPhase
                                 next screenFuzzVisible = painted.FuzzVisible
-                                next textureColumns = painted.Columns
-                                next renderGeometry = painted.Geometry
+                                if painted.Columns.Revision != textureColumns.Revision { next textureColumns = painted.Columns }
+                                if painted.Geometry.Revision != renderGeometry.Revision { next renderGeometry = painted.Geometry }
                                 if painted.Border.Blocks != 0 { next viewBorder = painted.Border }
                             }
                         }
@@ -997,7 +1311,7 @@ map "Original WAD BSP View" {
                         materials = walls.LoadMaterials(mounts, wad.SkyTextureName(level.MapName))
                     }
                     materials.Shade = materials.Shade.WithGamma(selectedGamma)
-                    if DitherColors { materials.Shade = materials.Shade.WithDithering() }
+                    materials.Shade = prepareDisplayShade(materials.Shade)
                     materials.Textures = materials.Textures.BuildNameIndex(ResourceIndexBatch)
                     if (advancing || restartPending || startingNew) && materials.Textures.Valid {
                         materials.Sky = wad.FindWallTexture(materials.Textures, wad.SkyTextureName(level.MapName))
@@ -1018,6 +1332,10 @@ map "Original WAD BSP View" {
                             rules := wad.ThingRules{Commercial: commercial, Skill: campaignSkill}
                             if startingNew { rules.Skill = newCampaignSkill }
                             rules.Fast = previewFastMonsters || rules.Skill == 4
+                            if playingDemo {
+                                rules.Fast = attract.Demo.Fast || rules.Skill == 4
+                                rules.NoMonsters = attract.Demo.NoMonsters
+                            }
                             health := NewPlayerHealth
                             carry := play.NewPlayerInventory(health[0])
                             if advancing && !startingNew {
@@ -1051,14 +1369,14 @@ map "Original WAD BSP View" {
                                     useDown = intermission.UseDown
                                 }
                                 initialEye := initial.Body.Z + initial.ViewHeight
-                                spriteAssets := cachePreviewSprites(mounts, spawned, PreviewSprites{})
+                                spriteAssets, _ := cachePreviewSprites(mounts, spawned, PreviewSprites{})
                                 blocks := wad.LoadBlockMap(level)
                                 links := play.BuildActorLinks(spawned, blocks)
                                 armed := play.SetupWeaponSprites(carry, weaponStart, start.State, spawned.Random)
                                 shade := materials.Shade
                                 if !shade.Valid { shade = walls.LoadShading(mounts).WithGamma(selectedGamma) }
-                                if DitherColors { shade = shade.WithDithering() }
-                                shade = shade.WithPalette(play.StatusPalette(armed.Inventory))
+                                shade = prepareDisplayShade(shade)
+                                shade = shade.WithPalette(play.StatusPaletteWithBlink(armed.Inventory, sharedBytes("doomPowerBlink")))
                                 hasStatus := shade.Valid && StatusBarAvailable(mounts)
                                 face := play.StartStatusFace(statusFace, armed.Inventory)
                                 display := CameraDisplay{Shade: shade, Border: viewBorder, Inventory: armed.Inventory, StatusVisible: hasStatus && !hideStatus,
@@ -1066,10 +1384,16 @@ map "Original WAD BSP View" {
                                     FuzzPhase: screenFuzzPhase, Columns: textureColumns, Geometry: geometry}
                                 if mounts.Revision != archives.Revision { display.Columns = walls.ColumnCache{Enabled: true} }
                                 var rendered CameraDraw
-                                if !startingNew || blocks.Valid {
+                                bootingToTitle := !done && ClassicMenu && shade.Valid && wadMenuAvailable(mounts) &&
+                                    fullPageMenuPatch(readIntermissionPatch(mounts, titleMenuName()))
+                                if bootingToTitle {
+                                    // No columns were drawn. Keep the cache prepared for this archive.
+                                    rendered = CameraDraw{Valid: true, Columns: display.Columns}
+                                } else if !startingNew || blocks.Valid {
+                                    useDisplayPalette(shade)
                                     rendered = drawCamera(level, mounts, spawned, links, spriteAssets, initial.Body.X, initial.Body.Y,
                                         initialEye, initial.Angle,
-                                        previewMaterials(materials, wad.AnimationSet{}, -1), play.LineScrolls{}, play.LevelLights{},
+                                        previewMaterials(materials, wad.FrameAnimations{}, -1), play.LineScrolls{}, play.LevelLights{},
                                         armed.View, display)
                                 }
                                 if rendered.Valid {
@@ -1080,11 +1404,14 @@ map "Original WAD BSP View" {
                                         next campaignSkill = newCampaignSkill
                                         next marker = loadMarker
                                         next intermissionBackdrop = play.IntermissionBackdrop{}
-                                        log("Doom campaign started", rules.Skill, loadMarker)
+                                        if playingDemo {
+                                            nextAttract.Ready = true
+                                            log("Doom demo started", attract.Stage, rules.Skill, loadMarker)
+                                        } else { log("Doom campaign started", rules.Skill, loadMarker) }
                                     }
                                     next gamePaused = false
                                     musicPaused = false
-                                    requestedTrack = previewLevelMusic(level.MapName)
+                                    if !bootingToTitle { requestedTrack = previewLevelMusic(level.MapName) }
                                     next screenShade = shade
                                     next statusAvailable = hasStatus
                                     next screenStatusVisible = display.StatusVisible
@@ -1101,9 +1428,10 @@ map "Original WAD BSP View" {
                                     next hudMessages = play.HudMessages{}
                                     if advancing {
                                         next marker = loadMarker
+                                        if playingDemo { nextAttract.Marker = loadMarker }
                                         log("Doom next level rendered")
                                     } else if restartPending { log("Doom level restarted") } else if !startingNew {
-                                        log("Classic WAD BSP frame rendered")
+                                        if bootingToTitle { log("Doom title initialized") } else { log("Classic WAD BSP frame rendered") }
                                     }
                                     next blockMap = blocks
                                     spawnedLights := play.LoadLevelLights(level, armed.Random)
@@ -1114,7 +1442,7 @@ map "Original WAD BSP View" {
                                     }
                                     next lightState = spawnedLights
                                     if materials.Shade.Valid {
-                                        next animations = wad.LoadAnimations(materials.Flats, materials.Textures)
+                                        next animations = wad.IndexFrameAnimations(wad.LoadAnimations(materials.Flats, materials.Textures))
                                     }
                                     next scrolls = play.LoadLineScrolls(level)
                                     next soundBounds = loadSectorSoundBounds(level)
@@ -1185,6 +1513,13 @@ map "Original WAD BSP View" {
                 }
             }
         } else if levelExited {
+            anyCommand := commandKeys != 0 || pauseCommand
+            if playingDemo && recorded.Valid && !recorded.Done {
+                nextAttract.Demo = recorded.Demo
+                commandKeys = 0
+                commandKeys[0], commandKeys[1] = recorded.Buttons & play.DemoAttack != 0, recorded.Buttons & play.DemoUse != 0
+                anyCommand = recorded.Buttons != 0
+            }
             stageMaterials := materialSource
             if gammaChanged || (selectedGamma != engine.DefaultDoomGamma && !stageMaterials.Shade.Valid && screenShade.Valid) {
                 stageMaterials = previewStageGamma(stageMaterials, archives, selectedGamma)
@@ -1262,10 +1597,10 @@ map "Original WAD BSP View" {
                 }
             } else if finale.Stage != play.FinaleInactive {
                 next gameTime = gameTime + 1
-                ending := play.TickFinale(finale, commandKeys != 0 || pauseCommand, castPressed)
+                ending := play.TickFinale(finale, anyCommand, castPressed)
                 cue := previewSoundCue(ending.Sound)
                 soundCues = soundCues | cue
-                if cue == cueWeapon { weaponSound = ending.Sound }
+                if cue == cueWeapon { weaponRequests = weaponRequests | weaponCueRequest(ending.Sound) }
                 if ending.Music != 0 {
                     requestedTrack = ending.Music
                     if soundtrackId != requestedTrack { soundCues = soundCues | cueStage }
@@ -1298,9 +1633,19 @@ map "Original WAD BSP View" {
             next startTick = startTick + 1
         } else if blockMap.Valid || doors.Count > 0 || floors.Count > 0 || ceilings.Count > 0 ||
             doors.Switches.ButtonCount > 0 || lightState.Lights.ThinkerCount > 0 || passiveActors.Count > 0 || repaint ||
-            scrolls.Count > 0 || screenFuzzVisible || statusAvailable || mapOpen || automapActive || hudMessages.Tics > 0 || hudPressed[6] || hudPressed[7] {
+            scrolls.Count > 0 || screenFuzzVisible || statusAvailable || mapOpen || automapActive || hudMessages.Tics > 0 ||
+            hudPressed[6] || hudPressed[7] || menuStep.ToggleMessages || detailChanged || gammaChanged {
             // G_BuildTiccmd replaces the buttons with the pause special and keeps movement.
-            commandUse := use && !resumed
+            commandUse := actionActivity && use && !resumed
+            commandFire := actionActivity && fire && !resumed
+            if playingDemo {
+                // G_ReadDemoTiccmd replaces the local player's command.
+                buttons := recorded.Buttons
+                if buttons & play.DemoSpecial != 0 { buttons = 0 }
+                commandUse, commandFire = buttons & play.DemoUse != 0, buttons & play.DemoAttack != 0
+                requestedWeapon = play.WeaponNoChange
+                if buttons & play.DemoChangeWeapon != 0 { requestedWeapon = (buttons >> play.DemoWeaponShift) & play.DemoWeaponMask }
+            }
             base := wad.LoadBspLevel(Archive, marker)
             lighting := lightState
             lighting.Changed = false
@@ -1309,6 +1654,10 @@ map "Original WAD BSP View" {
             skill := campaignSkill
             combatRules := play.CombatRules{Skill: skill, Fast: previewFastMonsters || skill == 4}
             respawn := previewRespawnMonsters || skill == 4
+            if playingDemo {
+                combatRules.Fast = attract.Demo.Fast || skill == 4
+                respawn = attract.Demo.Respawn || skill == 4
+            }
             contacts := play.PlayerContacts{Handle: actors.PlayerActors[0], Actors: actors, Links: actorLinks,
                 Inventory: inventory, Rules: play.PickupRules{Skill: skill, Commercial: base.MapName.Low & 0xffffff == 0x50414d},
                 Telefrag: PreviewWalkoverTelefrag{Blocks: blockMap}, CustomTelefrag: true, AttackRange: lastAttackRange}
@@ -1321,7 +1670,8 @@ map "Original WAD BSP View" {
             restartLevel := false
             onGround := viewOnGround
             var gameplayCues bits<8>
-            messages, messagesEnabled := updateMessageToggle(hudMessages, hudMessagesEnabled, hudPressed[7])
+            messages, messagesEnabled := updateSettingsMessages(hudMessages, hudMessagesEnabled,
+                hudPressed[7] || menuStep.ToggleMessages, gammaMessage)
             if mapOpen { messages = queuePreviewAutomapMessages(messages, mapView, mapMarks, mapFollowing, hudPressed) }
             passiveChanged, passiveSpriteChanged, passiveLinksChanged := false, false, false
             if blockMap.Valid {
@@ -1331,10 +1681,17 @@ map "Original WAD BSP View" {
                     dx = play.ScalePlayerMouseDelta(cursorX - pointerX, sensitivity)
                     dy = play.ScalePlayerMouseDelta(pointerY - cursorY, sensitivity)
                 }
-                keys := play.PlayerMoveKeys{Forward: forward && !mapPanning, Reverse: reverse && !mapPanning,
-                    TurnLeft: turnLeft && !mapPanning, TurnRight: turnRight && !mapPanning,
-                    StrafeLeft: strafeLeft, StrafeRight: strafeRight, Run: run, Strafe: strafeModifier}
-                command, held := play.BuildPlayerMoveCommand(keys, turnHeld, dx, dy)
+                var command play.PlayerMoveCommand
+                held := 0
+                if playingDemo { command = recorded.Command
+                } else if ((forwardActivity || turnActivity) && !mapPanning) || sidestepActivity || dx != 0 || dy != 0 {
+                    keys := play.PlayerMoveKeys{Forward: forward && !mapPanning, Reverse: reverse && !mapPanning,
+                        TurnLeft: turnLeft && !mapPanning, TurnRight: turnRight && !mapPanning,
+                        StrafeLeft: strafeLeft, StrafeRight: strafeRight, Run: run, Strafe: strafeModifier}
+                    axes := play.PlayerMoveAxes{TurnHeld: turnActivity && !mapPanning, Turn: turnActivity && !mapPanning,
+                        Forward: forwardActivity && !mapPanning, Sidestep: sidestepActivity}
+                    command, held = play.BuildPlayerMoveCommandWithTable(keys, turnHeld, dx, dy, axes, sharedBytes("doomKeyboardDeltas"))
+                }
                 next turnHeld = held
                 actor := player
                 playerActor := actors.ActorAt(contacts.Handle - 1)
@@ -1386,14 +1743,16 @@ map "Original WAD BSP View" {
                     }
                 }
                 if !combat.Failed {
-                    cycle := cycleWeapon && !resumed && requestedWeapon == play.WeaponNoChange
-                    combat = tickPreviewWeapon(base, combat, blockMap, fire && !resumed, cycle,
+                    cycle := !playingDemo && cycleWeapon && !resumed && requestedWeapon == play.WeaponNoChange
+                    combat = tickPreviewWeapon(base, combat, blockMap, commandFire, cycle,
                         levelTime, view.Bob, contacts.Rules.Commercial, shareware)
                     if !combat.Failed {
                         if inventory.Dead {
                             death := play.TickPlayerDeath(combat.World, contacts.Handle, levelTime, commandUse)
                             combat.World, view, restartLevel, onGround = death.World, death.View, death.Reborn, death.OnGround
-                        } else { combat.World = play.TickLivePlayerCounters(combat.World, contacts.Handle) }
+                        } else {
+                            combat.World = play.TickLivePlayerCountersWithBlink(combat.World, contacts.Handle, sharedBytes("doomPowerBlink"))
+                        }
                     }
                 }
                 if !combat.Failed {
@@ -1409,7 +1768,7 @@ map "Original WAD BSP View" {
                 if combat.Specials.LimitExceeded() { frame.Specials = combat.Specials }
                 if frame.Valid {
                     gameplayCues = gameplayCues | combat.Cues
-                    if combat.WeaponSound != 0 { weaponSound = combat.WeaponSound }
+                    weaponRequests = weaponRequests | combat.WeaponRequests
                     frame.Actor = combat.World.Actors.ActorAt(contacts.Handle - 1).Physics
                     frame.Contacts.Actors, frame.Contacts.Links, frame.Contacts.Inventory =
                         combat.World.Actors, combat.World.Links, combat.World.Players[0]
@@ -1456,7 +1815,7 @@ map "Original WAD BSP View" {
                         if stepped.PickupMessage != 0 { frame.Contacts.PickupMessage = stepped.PickupMessage }
                         if stepped.PickupSound != 0 { frame.Contacts.PickupSound = stepped.PickupSound }
                         gameplayCues = gameplayCues | combat.Cues
-                        if combat.WeaponSound != 0 { weaponSound = combat.WeaponSound }
+                        weaponRequests = weaponRequests | combat.WeaponRequests
                         gameplayCues = gameplayCues | previewMoverCues(level, moved, soundBounds, stepped.Sounds)
                     }
                 } else {
@@ -1482,7 +1841,9 @@ map "Original WAD BSP View" {
                 levelHalted = true
             } else if valid {
                 cameraZ := frame.EyeZ
-                if moved.Body.Z != frame.Actor.Body.Z || moved.Body.Ceiling != frame.Actor.Body.Ceiling {
+                // P_CalcHeight has already run for valid maps. Sector thinkers
+                // move the body without rewriting that tic's recorded view Z.
+                if !blockMap.Valid && (moved.Body.Z != frame.Actor.Body.Z || moved.Body.Ceiling != frame.Actor.Body.Ceiling) {
                     cameraZ = cameraZ + moved.Body.Z - frame.Actor.Body.Z
                     limit := moved.Body.Ceiling - 4 * engine.FracUnit
                     if cameraZ > limit { cameraZ = limit }
@@ -1506,15 +1867,19 @@ map "Original WAD BSP View" {
                 invisibilityChanged := invisible != weaponUsesFuzz(inventory.Powers[play.PowerInvisibility])
                 fixedColormap := frame.Contacts.Inventory.FixedColormap
                 spriteAssets := actorSprites
-                if actorFrame.SpriteChanged || combatChanged { spriteAssets = cachePreviewSprites(archives, actorFrame.Actors, actorSprites) }
+                var spriteAssetsChanged bit
+                if actorFrame.SpriteChanged || combatChanged {
+                    spriteAssets, spriteAssetsChanged = cachePreviewSprites(archives, actorFrame.Actors, actorSprites)
+                }
                 menuRoll := play.MRandom(lighting.Random)
                 lighting.Random = menuRoll.State
                 face := nextStatusFace(statusFace, frame.Contacts.Inventory, actorFrame.Actors, moved, heldWeapon.AttackDown, int(menuRoll.Value))
-                palette := play.StatusPalette(frame.Contacts.Inventory)
+                palette := play.StatusPaletteWithBlink(frame.Contacts.Inventory, sharedBytes("doomPowerBlink"))
                 if palette >= screenShade.Palettes.Count { palette = 0 }
                 changedPalette := palette != screenShade.PaletteRow
                 shade := screenShade
                 if changedPalette { shade = screenShade.WithPalette(palette) }
+                if gammaChanged { shade = shade.WithGamma(selectedGamma) }
                 showStatus := statusAvailable && (!hideStatus || mapOpen)
                 changedStatus := showStatus != screenStatusVisible || (showStatus &&
                     (face.Index != statusFace.Index || statusValuesChanged(inventory, frame.Contacts.Inventory)))
@@ -1526,9 +1891,10 @@ map "Original WAD BSP View" {
                 redrawCamera := automapActive || changed || repaint || lighting.Changed || moverChanged || switchChanged ||
                     surfaceChanged || actorFrame.Changed || frame.Contacts.Removed || combatChanged || weaponChanged ||
                     fixedColormap != inventory.FixedColormap || invisibilityChanged || screenFuzzVisible || changedPalette || changedStatus ||
-                    viewChanged || gamePaused || (shade.Valid && previousMessage != displayedMessage)
+                    viewChanged || detailChanged || gammaChanged || gamePaused || (shade.Valid && previousMessage != displayedMessage)
                 rendered := CameraDraw{Valid: true, FuzzPhase: screenFuzzPhase, FuzzVisible: screenFuzzVisible, Mapped: mappedLines}
                 updatedMapView, updatedMapBounds, updatedMapMarks := mapView, mapBounds, mapMarks
+                if !actorFrame.Failed && (mapOpen || redrawCamera) { useDisplayPalette(shade) }
                 if !actorFrame.Failed && mapOpen {
                     updatedMapView, updatedMapBounds, updatedMapMarks =
                         updatePreviewAutomap(level, mapView, mapBounds, mapMarks, moved, automapActive, showStatus, hudPressed, mapCommand)
@@ -1538,6 +1904,7 @@ map "Original WAD BSP View" {
                     if showStatus { DrawStatusBar(archives, shade, frame.Contacts.Inventory, face.Index) }
                 } else if !actorFrame.Failed && redrawCamera {
                     display := CameraDisplay{Shade: shade, Border: viewBorder, Inventory: frame.Contacts.Inventory, StatusVisible: showStatus,
+                        ReuseStatus: !changedStatus && !changedPalette && !gammaChanged && !automapActive && !menuHold && !gamePaused,
                         ViewBlocks: selectedBlocks, LowDetail: selectedDetail, Face: face.Index,
                         Invisible: invisible, FuzzPhase: screenFuzzPhase,
                         Mapped: mappedLines, Columns: textureColumns,
@@ -1546,16 +1913,21 @@ map "Original WAD BSP View" {
                         moved.Body.X, moved.Body.Y, cameraZ, moved.Angle,
                         previewMaterials(materialSource, animations, levelTime), scrolled, lighting.Lights, heldWeapon, display)
                     if rendered.Valid {
-                        next textureColumns = rendered.Columns
-                        next renderGeometry = rendered.Geometry
+                        if rendered.Columns.Revision != textureColumns.Revision { next textureColumns = rendered.Columns }
+                        if rendered.Geometry.Revision != renderGeometry.Revision { next renderGeometry = rendered.Geometry }
                         if rendered.Border.Blocks != 0 { next viewBorder = rendered.Border }
                     }
                 }
                 if !actorFrame.Failed && rendered.Valid {
+                    if playingDemo { nextAttract.Demo = recorded.Demo }
                     if scrolls.Count > 0 { next scrolls = scrolled }
                     gameplayCues = gameplayCues | previewMoverCues(level, moved, soundBounds, used.Doors.Sounds)
                     soundCues = soundCues | gameplayCues | previewSoundCue(frame.Contacts.PickupSound)
                     if (mapOpen || redrawCamera) && displayedMessage != "" { drawHudMessage(archives, shade, displayedMessage) }
+                    if playingDemo && menuHold && (mapOpen || redrawCamera) {
+                        menuBackgroundChanged = true
+                        if menuVisible { menuBackdrop = captureScreen(false) }
+                    }
                     next hudMessages = messages
                     next hudMessagesEnabled = messagesEnabled
                     if mapOpen != automapActive {
@@ -1567,7 +1939,7 @@ map "Original WAD BSP View" {
                         next mapBounds = updatedMapBounds
                         next mapMarks = updatedMapMarks
                     } else { next mappedLines = rendered.Mapped }
-                    if changedPalette { next screenShade = shade }
+                    if changedPalette || gammaChanged { next screenShade = shade }
                     next screenStatusVisible = showStatus
                     next statusFace = face
                     next screenFuzzPhase = rendered.FuzzPhase
@@ -1587,7 +1959,7 @@ map "Original WAD BSP View" {
                     }
                     if passiveActors.Count > 0 || blockMap.Valid { next actors = actorFrame.Actors }
                     if actorFrame.LinksChanged || frame.Contacts.LinksChanged || combatChanged { next actorLinks = actorFrame.Links }
-                    if actorFrame.SpriteChanged || combatChanged { next actorSprites = spriteAssets }
+                    if spriteAssetsChanged { next actorSprites = spriteAssets }
                     if used.Doors.Count > 0 || used.Doors.UsedCount > 0 || used.Doors.NextMover != doors.NextMover ||
                         used.Floors.Count > 0 || used.Ceilings.Count > 0 ||
                         doors.Switches.ButtonCount > 0 || switchChanged { next doors = used.Doors.ClearSounds() }
@@ -1633,7 +2005,7 @@ map "Original WAD BSP View" {
                         log("WAD preview could not render the updated frame")
                     }
                     next blockMap = wad.BlockMapInfo{}
-                    next animations = wad.AnimationSet{}
+                    next animations = wad.FrameAnimations{}
                     next scrolls = play.LineScrolls{}
                     next lightState = play.LevelLightStep{}
                     next doors = play.LevelDoors{}
@@ -1650,9 +2022,10 @@ map "Original WAD BSP View" {
         }
         // D_Display draws the menu over the latest stage, including a melt.
         // Keep its clean target so dismissal never restores an earlier scene.
+        if attractActive || stageChanged { next attract = nextAttract }
         if menuHold && !screenWipe.Melt.Active {
             next campaignMenu = menuStep.Menu
-            if !levelExited { next useHeld = use }
+            if !levelExited && !playingDemo { next useHeld = use }
             if !menuWasOpen {
                 if !menuBackgroundChanged { menuBackdrop = captureScreen(true) }
                 log("Doom campaign menu opened")
@@ -1660,12 +2033,12 @@ map "Original WAD BSP View" {
             if menuVisible {
                 next campaignMenuBackdrop = menuBackdrop
                 if menuStep.Changed || menuBackgroundChanged || viewChanged || detailChanged || gammaChanged ||
-                    hideStatus != statusHidden || sensitivity != mouseSensitivity {
+                    hideStatus != statusHidden || sensitivity != mouseSensitivity || (skullChanged && !menuStep.Menu.IsConfirmPrompt()) {
                     if !menuBackgroundChanged { revealScreen(menuBackdrop, menuBackdrop, [1]int{0}, Width) }
-                    drawCampaignMenu(menuStep.Menu, menuBlocks, sensitivity, selectedDetail, selectedGamma)
+                    drawCampaignMenu(archives, screenShade, menuStep.Menu, menuSettings)
                 }
             } else {
-                if !menuBackgroundChanged { revealScreen(menuBackdrop, menuBackdrop, [1]int{0}, Width) }
+                if !menuBackgroundChanged && (!checkpointHold || saveCheckpoint) { revealScreen(menuBackdrop, menuBackdrop, [1]int{0}, Width) }
                 next campaignMenuBackdrop = ""
                 if menuStep.Start {
                     next advanceMarker = -1
@@ -1674,11 +2047,24 @@ map "Original WAD BSP View" {
                 } else { log("Doom campaign menu closed") }
             }
         }
-        if !muted && soundCues != 0 {
-            if soundCues & cueWeapon != 0 { next weaponCueNote = weaponCueTone(weaponSound) }
-            next musicCuePhase = musicCuePhase ^ soundCues
+        if returnToTitle {
+            next newCampaignMarker = -1
+            next advanceMarker = -1
+            next restartPending = false
+            next gamePaused = false
+            next levelExited = false
+            next intermission = play.IntermissionState{}
+            next finale = play.FinaleState{}
+            next pendingVictory = play.CampaignRoute{}
+            next attractWakePending = false
+            log("Doom returned to title")
         }
-        if requestedTrack >= 0 && requestedTrack != soundtrackId {
+        requests := bits<28>(soundCues >> 1) | (bits<28>(weaponRequests) << 7) | menuCueRequest(menuStep.Sound)
+        if !muted && effectsEnabled && requests != 0 {
+            next cueEpoch = bits<32>(currentTick() + 1)
+            next cueRequests = requests
+        }
+        if requestedTrack >= 0 && (requestedTrack != soundtrackId || returnToTitle) {
             // G_DoCompleted starts episode victory music before processing
             // BT_SPECIAL. The host applies a fresh request before advancing.
             musicPaused = pendingVictory.Valid && pauseCommand && pauseWorld && requestedTrack != 0
@@ -1686,7 +2072,8 @@ map "Original WAD BSP View" {
             next soundtrackRevision = soundtrackRevision + 1
         }
         next soundtrackPaused = musicPaused
-        next soundtrackPlaying = !levelHalted && !checkpointHold && !menuStep.Start && !startingNew && !musicPaused
+        next soundtrackPlaying = (!levelHalted || attractActive || returnToTitle) && !checkpointHold &&
+            !menuStep.Start && (!startingNew || returnToTitle) && !musicPaused
     }
 
     host tick {
@@ -1711,7 +2098,8 @@ map "Original WAD BSP View" {
             var started audio.MusPlayer
             if soundtrackId != 0 {
                 track := archives.Find(audio.MusicLumpName(soundtrackId))
-                started = audio.LoadMusPlayer(track, soundtrackId != musicBunny)
+                loop := soundtrackId != musicBunny && soundtrackId != audio.MusicEpisodeTitle && soundtrackId != audio.MusicCommercialTitle
+                started = audio.LoadMusPlayer(track, loop)
             }
             next soundtrack = started
             next soundtrackQueue = SoundtrackQueue{}
@@ -1721,7 +2109,7 @@ map "Original WAD BSP View" {
             next soundtrackTicDebt = 0
         } else if !soundtrackPlaying || soundtrackPaused || (!soundtrack.Active && soundtrackQueue.Notes.Count == 0) {
             // Paused and inactive time never becomes an audible catch-up burst.
-            if soundMuted && soundtrackQueue.Notes.Count > 0 { next soundtrackQueue = SoundtrackQueue{} }
+            if (soundMuted || !soundtrackEnabled) && soundtrackQueue.Notes.Count > 0 { next soundtrackQueue = SoundtrackQueue{} }
             next soundtrackLastMillis = now
             next soundtrackMillisRemainder = 0
             next soundtrackTicDebt = 0
@@ -1733,7 +2121,7 @@ map "Original WAD BSP View" {
             fraction := soundtrackMillisRemainder + milliseconds * 35
             debt := soundtrackTicDebt + wholeSeconds * 35 + fraction / 1000
             remainder := fraction % 1000
-            advanced := advanceHostMusic(soundtrack, soundtrackQueue, musicPackets, debt, soundMuted)
+            advanced := advanceHostMusic(soundtrack, soundtrackQueue, musicPackets, debt, soundMuted || !soundtrackEnabled)
             next soundtrack = advanced.Player
             next soundtrackQueue = advanced.Queue
             next soundtrackLastMillis = now

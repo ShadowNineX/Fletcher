@@ -216,12 +216,18 @@ map "Broken Doom texture column" {
         set := wad.LoadTextureSet(Archive)
         composite := wad.PrepareTextureColumns(wad.TextureAt(set, 1))
         log(wad.PrepareTextureColumn(wad.TextureAt(set, 0), 0).Valid, composite.ColumnAt(0).Valid)
+        log(wad.TextureColumnWidthMask(wad.TextureDef{Width: 64}))
+        for _, width := range [12]int{-1, 0, 1, 2, 3, 127, 128, 129, 8192, 16383, 16384, 32767} {
+            log(width, wad.TextureColumnWidthMask(wad.TextureDef{Valid: true, Width: width}))
+        }
     }
 }
 `);
     const invalid = build(source);
     invalid.step();
-    assert.deepEqual(JSON.parse(JSON.stringify(invalid.logs)), [[false, false]]);
+    assert.deepEqual(JSON.parse(JSON.stringify(invalid.logs)), [[false, false], [0],
+        [-1, 0], [0, 0], [1, 0], [2, 1], [3, 1], [127, 63], [128, 127], [129, 127],
+        [8192, 8191], [16383, 8191], [16384, 16383], [32767, 16383]], "texture widths round down to the original power-of-two mask");
 
     writeFileSync(source, `package main
 import "wad"

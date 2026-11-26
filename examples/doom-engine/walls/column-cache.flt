@@ -63,6 +63,7 @@ type columnCacheDirectory = columnCachePage<columnCacheLeaf>
 // when the patch search order or backing archives change.
 type ColumnCache struct {
     Enabled bit
+    Revision int
     populated bit
     directory columnCachePageRef<columnCacheLeaf>
 }
@@ -98,5 +99,6 @@ func (cache ColumnCache) Store(texture wad.TextureDef, column int, entry Texture
     leaf = leaf.WithSlot(index & 63, record)
     cache.directory = directory.WithSlot(index >> 6, leaf)
     cache.populated = true
+    cache.Revision = cache.Revision + 1
     return cache
 }

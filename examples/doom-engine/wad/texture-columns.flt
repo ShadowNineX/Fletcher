@@ -53,12 +53,14 @@ type TextureColumns struct {
 // TextureColumnWidthMask is the original largest lower power-of-two mask.
 func TextureColumnWidthMask(texture TextureDef) int {
     if !texture.Valid || texture.Width <= 0 { return 0 }
-    power := 1
-    for range 14 {
-        if power * 2 > texture.Width { return power - 1 }
-        power = power * 2
-    }
-    return power - 1
+    if texture.Width >= 0x4000 { return 0x3fff }
+    // Spread the highest set bit down, then shift to get the wrapping mask.
+    width := texture.Width
+    width = width | (width >> 1)
+    width = width | (width >> 2)
+    width = width | (width >> 4)
+    width = width | (width >> 8)
+    return width >> 1
 }
 
 // drawPatchColumn parses one patch column once and copies opaque posts. Its

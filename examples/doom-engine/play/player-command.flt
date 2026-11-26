@@ -15,6 +15,13 @@ type PlayerMoveKeys struct {
     Strafe bit
 }
 
+type PlayerMoveAxes struct {
+    TurnHeld bit
+    Turn bit
+    Forward bit
+    Sidestep bit
+}
+
 const slowTurnTics = 6
 const slowTurn = 320
 const walkTurn = 640
@@ -24,6 +31,7 @@ const runForward = 50
 const walkSide = 24
 const runSide = 40
 const maxPlayerMove = 50
+const keyboardDeltaBytes = 256 * 3
 const DefaultMouseSensitivity = 5
 const MaxMouseSensitivity = 9
 
@@ -33,31 +41,77 @@ func ScalePlayerMouseDelta(delta int, sensitivity int) int {
 
 // Mouse deltas are already Doom command units. Positive Y moves forward.
 func BuildPlayerMoveCommand(keys PlayerMoveKeys, turnHeld int, mouseDX int, mouseDY int) (PlayerMoveCommand, int) {
+    axes := PlayerMoveAxes{TurnHeld: keys.TurnLeft || keys.TurnRight, Turn: keys.TurnLeft != keys.TurnRight,
+        Forward: keys.Forward != keys.Reverse, Sidestep: keys.StrafeLeft != keys.StrafeRight}
+    return BuildPlayerMoveCommandWithAxes(keys, turnHeld, mouseDX, mouseDY, axes)
+}
+
+func BuildPlayerMoveCommandWithAxes(keys PlayerMoveKeys, turnHeld int, mouseDX int, mouseDY int,
+    axes PlayerMoveAxes) (PlayerMoveCommand, int) {
     forward, side, turn := 0, 0, 0
     forwardStep, sideStep, turnStep := walkForward, walkSide, walkTurn
     if keys.Run { forwardStep, sideStep, turnStep = runForward, runSide, runTurn }
 
-    if keys.TurnLeft || keys.TurnRight { turnHeld = turnHeld + 1 } else { turnHeld = 0 }
+    if axes.TurnHeld { turnHeld = turnHeld + 1 } else { turnHeld = 0 }
     if turnHeld < slowTurnTics { turnStep = slowTurn }
 
-    if keys.Strafe {
-        if keys.TurnRight { side = side + sideStep }
-        if keys.TurnLeft { side = side - sideStep }
-    } else {
-        if keys.TurnRight { turn = turn - turnStep }
-        if keys.TurnLeft { turn = turn + turnStep }
+    // Opposite keys can be buffered on separate host ticks. Those pulses
+    // still cancel when the controller consumes them in one Doom tic.
+    if axes.Turn && !(keys.TurnLeft && keys.TurnRight) {
+        if keys.Strafe {
+            side = sideStep
+            if keys.TurnLeft { side = -side }
+        } else {
+            turn = turnStep
+            if keys.TurnRight { turn = -turn }
+        }
     }
-    if keys.Forward { forward = forward + forwardStep }
-    if keys.Reverse { forward = forward - forwardStep }
-    if keys.StrafeRight { side = side + sideStep }
-    if keys.StrafeLeft { side = side - sideStep }
+    if axes.Forward && !(keys.Forward && keys.Reverse) {
+        forward = forwardStep
+        if keys.Reverse { forward = -forward }
+    }
+    if axes.Sidestep && !(keys.StrafeLeft && keys.StrafeRight) {
+        if keys.StrafeRight { side = side + sideStep } else { side = side - sideStep }
+    }
 
+    return finishPlayerMoveCommand(forward, side, turn, keys.Strafe, mouseDX, mouseDY), turnHeld
+}
+
+// The physical command circuit emits signed 7-bit forward, 8-bit side and
+// 4-bit turn coefficients. Only the turn hold count and pointer deltas vary
+// independently of the keyboard input represented by a table entry.
+func BuildPlayerMoveCommandWithTable(keys PlayerMoveKeys, turnHeld int, mouseDX int, mouseDY int,
+    axes PlayerMoveAxes, table bytes) (PlayerMoveCommand, int) {
+    // A caller can activate an axis without a direction. Keep its default
+    // direction, which the keyboard mask alone cannot express.
+    if len(table) != keyboardDeltaBytes ||
+        (axes.Forward && !keys.Forward && !keys.Reverse) ||
+        (axes.Turn && !keys.TurnLeft && !keys.TurnRight) ||
+        (axes.Sidestep && !keys.StrafeLeft && !keys.StrafeRight) {
+        return BuildPlayerMoveCommandWithAxes(keys, turnHeld, mouseDX, mouseDY, axes)
+    }
+    var address bits<8>
+    address[0], address[1] = axes.Forward && keys.Forward, axes.Forward && keys.Reverse
+    address[2], address[3] = axes.Turn && keys.TurnLeft, axes.Turn && keys.TurnRight
+    address[4], address[5] = axes.Sidestep && keys.StrafeLeft, axes.Sidestep && keys.StrafeRight
+    address[6], address[7] = keys.Run, keys.Strafe
+    offset := int(address) * 3
+    packed := int(table[offset]) | (int(table[offset + 1]) << 8) | (int(table[offset + 2]) << 16)
+    forward, side, turn := (packed << 25) >> 25, (packed << 17) >> 24, (packed << 13) >> 28
+    if axes.TurnHeld { turnHeld = turnHeld + 1 } else { turnHeld = 0 }
+    if turnHeld < slowTurnTics {
+        if turn < 0 { turn = -1 } else if turn > 0 { turn = 1 }
+    }
+    return finishPlayerMoveCommand(forward, side, turn * slowTurn, keys.Strafe, mouseDX, mouseDY), turnHeld
+}
+
+func finishPlayerMoveCommand(forward int, side int, turn int, strafe bit, mouseDX int, mouseDY int) PlayerMoveCommand {
     forward = forward + mouseDY
-    if keys.Strafe { side = side + mouseDX * 2 } else { turn = turn - mouseDX * 8 }
+    if strafe { side = side + mouseDX * 2 } else { turn = turn - mouseDX * 8 }
     if forward > maxPlayerMove { forward = maxPlayerMove }
     if forward < -maxPlayerMove { forward = -maxPlayerMove }
     if side > maxPlayerMove { side = maxPlayerMove }
     if side < -maxPlayerMove { side = -maxPlayerMove }
     // ticcmd_t stores angleturn as a signed short.
-    return PlayerMoveCommand{Forward: forward, Side: side, Turn: (turn << 16) >> 16}, turnHeld
+    return PlayerMoveCommand{Forward: forward, Side: side, Turn: (turn << 16) >> 16}
 }

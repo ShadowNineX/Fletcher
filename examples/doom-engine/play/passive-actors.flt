@@ -71,16 +71,22 @@ func (frame PassiveActorFrame) TickBefore(passive PassiveActors, before int) Pas
         frame.Cursor = frame.Cursor + 1
         actor := frame.Actors.ActorAt(handle - 1)
         if actor.Valid && !actor.Damaged && actor.Tics > 0 {
-            step := TickMobjState(actor, 0, false, RandomState{}).Step
-            if step.Failed || step.Action != 0 { frame.Failed = true; return frame }
-            nextActor := step.Actor
-            frame.Actors = frame.Actors.WithActor(handle, nextActor)
-            if step.Removed {
-                frame.Links = frame.Links.UnlinkActor(handle)
-                frame.LinksChanged = true
+            if actor.Tics > 1 {
+                // P_MobjThinker only decrements a positive timer before it expires.
+                actor.Tics = actor.Tics - 1
+                frame.Actors = frame.Actors.WithActor(handle, actor)
+            } else {
+                step := TickMobjState(actor, 0, false, RandomState{}).Step
+                if step.Failed || step.Action != 0 { frame.Failed = true; return frame }
+                nextActor := step.Actor
+                frame.Actors = frame.Actors.WithActor(handle, nextActor)
+                if step.Removed {
+                    frame.Links = frame.Links.UnlinkActor(handle)
+                    frame.LinksChanged = true
+                }
+                frame.SpriteChanged = frame.SpriteChanged || (nextActor.Valid && nextActor.Sprite != actor.Sprite)
+                frame.Changed = frame.Changed || !nextActor.Valid || nextActor.Frame != actor.Frame || nextActor.Sprite != actor.Sprite
             }
-            frame.SpriteChanged = frame.SpriteChanged || (nextActor.Valid && nextActor.Sprite != actor.Sprite)
-            frame.Changed = frame.Changed || !nextActor.Valid || nextActor.Frame != actor.Frame || nextActor.Sprite != actor.Sprite
         }
     }
     return frame

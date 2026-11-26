@@ -20,9 +20,6 @@ type ColumnCoverage struct {
     Words [CoverageWords]bits<32>
     Rows [MaxViewWidth]bits<32>
     Planes Visplanes
-    // Only planes touched by a visible wall range allocate column rows.
-    PlaneRows [InlineVisplaneCount]PlaneColumnBuffer
-    HasPlaneRows [InlineVisplaneCount]bit
     FloorPlane int
     CeilingPlane int
     TrackDrawSegments bit
@@ -45,20 +42,14 @@ func BeginSubsectorPlanes(coverage ColumnCoverage, eye int, floor PlaneKey, ceil
         key := normalizedPlaneKey(floor)
         bucket := planeKeyBucket(key)
         index := findPlaneIndex(coverage.Planes, key, bucket)
-        if index < 0 {
-            added := newVisplane(coverage.Planes, key, MaxViewWidth, 0, bucket)
-            coverage.Planes, index = added.State, added.Index
-        }
+        if index < 0 { coverage.Planes, index = newVisplane(coverage.Planes, key, MaxViewWidth, 0, bucket) }
         coverage.FloorPlane = index + 1
     }
     if drawCeiling {
         key := normalizedPlaneKey(ceiling)
         bucket := planeKeyBucket(key)
         index := findPlaneIndex(coverage.Planes, key, bucket)
-        if index < 0 {
-            added := newVisplane(coverage.Planes, key, MaxViewWidth, 0, bucket)
-            coverage.Planes, index = added.State, added.Index
-        }
+        if index < 0 { coverage.Planes, index = newVisplane(coverage.Planes, key, MaxViewWidth, 0, bucket) }
         coverage.CeilingPlane = index + 1
     }
     return coverage
@@ -90,6 +81,40 @@ func SpanOpen(coverage ColumnCoverage, span ColumnSpan) bit {
         if spanMask(span, word) & ~coverage.Words[word] != 0 { return true }
     }
     return false
+}
+
+// Find the next clear run without stepping through each pixel column.
+func NextOpenSpan(coverage ColumnCoverage, span ColumnSpan) ColumnSpan {
+    if !validSpan(span) { return ColumnSpan{} }
+    firstWord, lastWord := span.First / 32, (span.End - 1) / 32
+    begin := span.End
+    for offset := range lastWord - firstWord + 1 {
+        word := firstWord + offset
+        mask := spanMask(span, word)
+        covered := coverage.Words[word] & mask
+        if begin == span.End {
+            open := mask & ~covered
+            if open != 0 {
+                bitIndex := firstSetColumnBit(open)
+                begin = word * 32 + bitIndex
+                covered = covered & (0xffffffff << bitIndex)
+            }
+        }
+        if begin < span.End && covered != 0 {
+            return ColumnSpan{First: begin, End: word * 32 + firstSetColumnBit(covered)}
+        }
+    }
+    return ColumnSpan{First: begin, End: span.End}
+}
+
+func firstSetColumnBit(mask bits<32>) int {
+    index := 0
+    if mask & 0xffff == 0 { index = 16; mask = mask >> 16 }
+    if mask & 0xff == 0 { index = index + 8; mask = mask >> 8 }
+    if mask & 0xf == 0 { index = index + 4; mask = mask >> 4 }
+    if mask & 3 == 0 { index = index + 2; mask = mask >> 2 }
+    if mask & 1 == 0 { index = index + 1 }
+    return index
 }
 
 // Mark an opaque wall after drawing its visible columns. Open portals leave

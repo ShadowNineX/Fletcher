@@ -1,16 +1,43 @@
 // SPDX-License-Identifier: GPL-2.0-only
-// A compact, asset-independent campaign picker for the playable preview.
-// Its 3x5 bitmap alphabet deliberately avoids relying on WAD HUD patches.
+// Menu patches come from the active WAD. The compact picker is the fallback.
 
 package main
 
 import "engine"
 import "play"
+import "wad"
+import "walls"
 
 const campaignGlyphWidth = 3
 const campaignGlyphHeight = 5
 const campaignGlyphAdvance = 4
 const gammaLabels = [engine.DoomGammaCount]string{"J GAMMA 0", "J GAMMA 1", "J GAMMA 2", "J GAMMA 3", "J GAMMA 4"}
+// M_NGAME, M_OPTION, M_LOADG, M_SAVEG, M_RDTHIS, M_QUITG.
+const mainMenuLow = [6]int{0x474e5f4d, 0x504f5f4d, 0x4f4c5f4d, 0x41535f4d, 0x44525f4d, 0x55515f4d}
+const mainMenuHigh = [6]int{0x454d41, 0x4e4f4954, 0x474441, 0x474556, 0x53494854, 0x475449}
+// M_JKILL, M_ROUGH, M_HURT, M_ULTRA, M_NMARE.
+const skillMenuLow = [5]int{0x4b4a5f4d, 0x4f525f4d, 0x55485f4d, 0x4c555f4d, 0x4d4e5f4d}
+const skillMenuHigh = [5]int{0x4c4c49, 0x484755, 0x5452, 0x415254, 0x455241}
+const mainMenuLabels = [6]string{"NEW GAME", "OPTIONS", "LOAD GAME", "SAVE GAME", "READ THIS", "QUIT GAME"}
+// M_ENDGAM, M_MESSG, M_DETAIL, M_SCRNSZ, spacer, M_MSENS, spacer, M_SVOL.
+const optionsMenuLow = [8]int{0x4e455f4d, 0x454d5f4d, 0x45445f4d, 0x43535f4d, 0, 0x534d5f4d, 0, 0x56535f4d}
+const optionsMenuHigh = [8]int{0x4d414744, 0x475353, 0x4c494154, 0x5a534e52, 0, 0x534e45, 0, 0x4c4f}
+const optionsMenuLabels = [8]string{"END GAME", "MESSAGES", "DETAIL", "SCREEN SIZE", "", "MOUSE SENSITIVITY", "", "SOUND VOLUME"}
+
+type CampaignMenuSettings struct {
+    Blocks int
+    Sensitivity int
+    LowDetail bit
+    Messages bit
+    Effects bit
+    Music bit
+    Gamma int
+    SaveNames [play.CampaignSaveSlots]string
+    SkullAlternate bit
+}
+
+func titleMenuName() wad.LumpName { return wad.LumpName{Low: 0x4c544954, High: 0x43495045} } // TITLEPIC
+func logoMenuName() wad.LumpName { return wad.LumpName{Low: 0x4f445f4d, High: 0x4d4f} } // M_DOOM
 
 func campaignGlyph(character string) bits<16> {
     switch character {
@@ -37,13 +64,25 @@ func campaignGlyph(character string) bits<16> {
     case "U": return 31597
     case "V": return 11117
     case "W": return 24557
+    case "X": return 23213
     case "Y": return 9389
+    case "Z": return 29351
     case "0": return 31599
     case "1": return 29850
     case "2": return 29347
     case "3": return 14499
     case "4": return 18925
     case "5": return 14543
+    case "6": return 31695
+    case "7": return 9383
+    case "8": return 31727
+    case "9": return 31215
+    case "_": return 28672
+    case "?": return 8359
+    case ".": return 8192
+    case "'": return 18
+    case "-": return 448
+    case "!": return 8338
     }
     return 0
 }
@@ -98,11 +137,20 @@ func campaignSkillLabel(index int) string {
     return ""
 }
 
+func mainMenuItem(commercial bit, row int) int {
+    if commercial && row == 4 { return 5 }
+    return row
+}
+
 func campaignMenuRows(menu play.CampaignMenu) int {
     switch menu.Stage {
     case play.CampaignMenuEpisode: return menu.Count
     case play.CampaignMenuSkill: return 5
     case play.CampaignMenuNightmare: return 2
+    case play.CampaignMenuMain: return menu.MainRows()
+    case play.CampaignMenuOptions: return 8
+    case play.CampaignMenuEndGame: return 2
+    case play.CampaignMenuSound: return 4
     }
     return 0
 }
@@ -112,6 +160,13 @@ func campaignMenuTitle(menu play.CampaignMenu) string {
     case play.CampaignMenuEpisode: return "SELECT EPISODE"
     case play.CampaignMenuSkill: return "SELECT SKILL"
     case play.CampaignMenuNightmare: return "NIGHTMARE"
+    case play.CampaignMenuOptions: return "OPTIONS"
+    case play.CampaignMenuHelp: return "READ THIS"
+    case play.CampaignMenuHelpSecond:
+        if menu.Retail || menu.Commercial { return "CREDITS" }
+        return "READ THIS"
+    case play.CampaignMenuEndGame: return "END CURRENT GAME?"
+    case play.CampaignMenuSound: return "SOUND VOLUME"
     }
     return "CAMPAIGN"
 }
@@ -124,6 +179,14 @@ func campaignMenuLabel(menu play.CampaignMenu, index int) string {
     case play.CampaignMenuNightmare:
         if index == 0 { return "CANCEL" }
         if index == 1 { return "START" }
+    case play.CampaignMenuMain: return mainMenuLabels[mainMenuItem(menu.Commercial, index)]
+    case play.CampaignMenuOptions: return optionsMenuLabels[index]
+    case play.CampaignMenuEndGame:
+        if index == 0 { return "NO" }
+        return "YES"
+    case play.CampaignMenuSound:
+        if index == 0 { return "SOUND EFFECTS" }
+        if index == 2 { return "MUSIC" }
     }
     return ""
 }
@@ -141,9 +204,198 @@ func drawCampaignSlider(label string, left int, y int, slots int, selected int) 
     }
 }
 
-// The modal keeps a fixed footprint so changing stages clears every old row.
-func drawCampaignMenu(menu play.CampaignMenu, blocks int, sensitivity int, lowDetail bit, gamma int) {
+func wadMenuAvailable(mounts wad.Archives) bit {
+    return readIntermissionPatch(mounts, logoMenuName()).Width > 0
+}
+
+func fullPageMenuPatch(patch IntermissionPatch) bit {
+    return patch.Width == intermissionWidth && patch.Height == intermissionHeight && patch.Left == 0 && patch.Top == 0
+}
+
+func campaignMenuSkull(mounts wad.Archives, alternate bit) IntermissionPatch {
+    if alternate {
+        skull := readIntermissionPatch(mounts, wad.LumpName{Low: 0x4b535f4d, High: 0x324c4c55}) // M_SKULL2
+        if skull.Width > 0 { return skull }
+    }
+    return readIntermissionPatch(mounts, wad.LumpName{Low: 0x4b535f4d, High: 0x314c4c55}) // M_SKULL1
+}
+
+func drawCampaignHelp(mounts wad.Archives, shade walls.WadShading, menu play.CampaignMenu, alternate bit) bit {
+    help := wad.LumpName{Low: 0x504c4548}
+    help1 := wad.LumpName{Low: 0x504c4548, High: 49}
+    help2 := wad.LumpName{Low: 0x504c4548, High: 50}
+    credit := wad.LumpName{Low: 0x44455243, High: 0x5449}
+    pages := [4]wad.LumpName{help1, help, credit, help2}
+    skullX, skullY := 248, 180
+    if menu.Stage == play.CampaignMenuHelpSecond {
+        pages = [4]wad.LumpName{help2, credit, help1, help}
+        if menu.Retail || menu.Commercial { pages[0], pages[1] = credit, help2 }
+        skullX, skullY = 298, 170
+    } else if menu.Commercial {
+        pages[0], pages[1] = help, help1
+        skullX, skullY = 298, 160
+    }
+    for _, name := range pages {
+        page := readIntermissionPatch(mounts, name)
+        if fullPageMenuPatch(page) {
+            drawIntermissionPatch(page, shade, 0, 0)
+            drawIntermissionPatch(campaignMenuSkull(mounts, alternate), shade, skullX, skullY)
+            return true
+        }
+    }
+    return false
+}
+
+// M_Drawer centers each message line using the width and height of the WAD font.
+func drawCampaignConfirmation(mounts wad.Archives, shade walls.WadShading, stage int) {
+    lines := [4]string{"QUIT DOOM?", "", "PRESS Y OR N.", ""}
+    compact, count := lines[0], 3
+    if stage == play.CampaignMenuNightmare {
+        lines = [4]string{"ARE YOU SURE? THIS SKILL LEVEL", "ISN'T EVEN REMOTELY FAIR.", "", "PRESS Y OR N."}
+        compact, count = "START NIGHTMARE?", 4
+    } else if stage == play.CampaignMenuEndGame {
+        lines[0] = "ARE YOU SURE YOU WANT TO END THE GAME?"
+        compact = "END CURRENT GAME?"
+    }
+    if shade.Valid {
+        height := finaleGlyph(mounts, 33).Height
+        available := height > 0
+        var widths [4]int
+        for row := range count {
+            width, complete := measureSaveMenuText(mounts, lines[row])
+            widths[row] = width
+            available = available && complete
+        }
+        if available {
+            y := 100 - count * height / 2
+            for row := range count { drawSaveMenuText(mounts, shade, 160 - widths[row] / 2, y + row * height, lines[row]) }
+            return
+        }
+    }
+    instruction := "PRESS Y OR N."
+    boxWidth := campaignTextWidth(compact)
+    if campaignTextWidth(instruction) > boxWidth { boxWidth = campaignTextWidth(instruction) }
+    boxWidth = boxWidth + 6
+    top := (Height - 21) / 2
+    for y := range 21 {
+        for x := range boxWidth { pixel((Width - boxWidth) / 2 + x, top + y, true, color.Black) }
+    }
+    drawCampaignText(compact, (Width - campaignTextWidth(compact)) / 2, top + 3, color.White)
+    drawCampaignText(instruction, (Width - campaignTextWidth(instruction)) / 2, top + 13, color.Yellow)
+}
+
+// M_DrawThermo uses eight-unit segments in Doom's 320x200 menu space.
+func drawMenuThermometer(mounts wad.Archives, shade walls.WadShading, x int, y int, slots int, value int) {
+    middle := readIntermissionPatch(mounts, wad.LumpName{Low: 0x48545f4d, High: 0x4d4d5245})
+    drawIntermissionPatch(readIntermissionPatch(mounts, wad.LumpName{Low: 0x48545f4d, High: 0x4c4d5245}), shade, x, y)
+    for i := range slots { drawIntermissionPatch(middle, shade, x + (i + 1) * 8, y) }
+    drawIntermissionPatch(readIntermissionPatch(mounts, wad.LumpName{Low: 0x48545f4d, High: 0x524d5245}), shade, x + (slots + 1) * 8, y)
+    drawIntermissionPatch(readIntermissionPatch(mounts, wad.LumpName{Low: 0x48545f4d, High: 0x4f4d5245}), shade, x + (value + 1) * 8, y)
+}
+
+func drawWadCampaignMenu(mounts wad.Archives, shade walls.WadShading, menu play.CampaignMenu,
+    settings CampaignMenuSettings) bit {
+    if !shade.Valid { return false }
+    if menu.Stage == play.CampaignMenuHelp || menu.Stage == play.CampaignMenuHelpSecond {
+        return drawCampaignHelp(mounts, shade, menu, settings.SkullAlternate)
+    }
+    var heading IntermissionPatch
+    var labelNames [8]wad.LumpName
+    x, y := 48, 63
+    headingX, headingY := 54, 38
+    switch menu.Stage {
+    case play.CampaignMenuMain:
+        heading = readIntermissionPatch(mounts, logoMenuName())
+        for row := range menu.MainRows() {
+            item := mainMenuItem(menu.Commercial, row)
+            labelNames[row] = wad.LumpName{Low: mainMenuLow[item], High: mainMenuHigh[item]}
+        }
+        x, y = 97, 64
+        if menu.Commercial { y = y + 8 }
+        headingX, headingY = 94, 2
+    case play.CampaignMenuEpisode:
+        heading = readIntermissionPatch(mounts, wad.LumpName{Low: 0x50455f4d, High: 0x444f5349}) // M_EPISOD
+        for row := range menu.Count { labelNames[row] = wad.LumpName{Low: 0x50455f4d, High: 0x3049 + (menu.Episodes[row] << 8)} }
+    case play.CampaignMenuSkill:
+        heading = readIntermissionPatch(mounts, wad.LumpName{Low: 0x4b535f4d, High: 0x4c4c49}) // M_SKILL
+        for row := range 5 { labelNames[row] = wad.LumpName{Low: skillMenuLow[row], High: skillMenuHigh[row]} }
+    case play.CampaignMenuOptions:
+        heading = readIntermissionPatch(mounts, wad.LumpName{Low: 0x504f5f4d, High: 0x4c545454}) // M_OPTTTL
+        for row := range 8 { labelNames[row] = wad.LumpName{Low: optionsMenuLow[row], High: optionsMenuHigh[row]} }
+        x, y = 60, 37
+        headingX, headingY = 108, 15
+    case play.CampaignMenuSound:
+        heading = readIntermissionPatch(mounts, wad.LumpName{Low: 0x56535f4d, High: 0x00004c4f}) // M_SVOL
+        labelNames[0] = wad.LumpName{Low: 0x46535f4d, High: 0x4c4f5658} // M_SFXVOL
+        labelNames[2] = wad.LumpName{Low: 0x554d5f4d, High: 0x4c4f5653} // M_MUSVOL
+        x, y = 80, 64
+        headingX, headingY = 60, 38
+    default: return false
+    }
+    if heading.Width <= 0 { return false }
+    skull := campaignMenuSkull(mounts, settings.SkullAlternate)
+    if skull.Width <= 0 { return false }
+    rows := campaignMenuRows(menu)
+    var labels [8]IntermissionPatch
+    for row := range rows {
+        if labelNames[row].Low != 0 {
+            labels[row] = readIntermissionPatch(mounts, labelNames[row])
+            if labels[row].Width <= 0 { return false }
+        }
+    }
+    drawIntermissionPatch(heading, shade, headingX, headingY)
+    if menu.Stage == play.CampaignMenuSkill {
+        drawIntermissionPatch(readIntermissionPatch(mounts, wad.LumpName{Low: 0x454e5f4d, High: 0x4757}), shade, 96, 14) // M_NEWG
+    } else if menu.Stage == play.CampaignMenuOptions {
+        detail := wad.LumpName{Low: 0x44475f4d, High: 0x48474948} // M_GDHIGH
+        if settings.LowDetail { detail = wad.LumpName{Low: 0x44475f4d, High: 0x00574f4c} } // M_GDLOW
+        messages := wad.LumpName{Low: 0x534d5f4d, High: 0x46464f47} // M_MSGOFF
+        if settings.Messages { messages = wad.LumpName{Low: 0x534d5f4d, High: 0x004e4f47} } // M_MSGON
+        drawIntermissionPatch(readIntermissionPatch(mounts, detail), shade, x + 175, y + 16 * play.CampaignOptionDetail)
+        drawIntermissionPatch(readIntermissionPatch(mounts, messages), shade, x + 120, y + 16 * play.CampaignOptionMessages)
+        drawMenuThermometer(mounts, shade, x, y + 16 * (play.CampaignOptionScreen + 1), 9, settings.Blocks - 3)
+        drawMenuThermometer(mounts, shade, x, y + 16 * (play.CampaignOptionMouse + 1), 10, settings.Sensitivity)
+    } else if menu.Stage == play.CampaignMenuSound {
+        // Music Arrows expose a trigger and tone, so these controls enable each bus.
+        effects, music := 0, 0
+        if settings.Effects { effects = 1 }
+        if settings.Music { music = 1 }
+        drawMenuThermometer(mounts, shade, x, y + 16, 2, effects)
+        drawMenuThermometer(mounts, shade, x, y + 48, 2, music)
+    }
+    for row := range rows {
+        if labels[row].Width > 0 { drawIntermissionPatch(labels[row], shade, x, y + row * 16) }
+    }
+    drawIntermissionPatch(skull, shade, x - 32, y - 5 + menu.Cursor * 16)
+    return true
+}
+
+// The compact fallback keeps a fixed footprint when changing stages.
+func drawCampaignMenu(mounts wad.Archives, shade walls.WadShading, menu play.CampaignMenu,
+    settings CampaignMenuSettings) {
     if menu.Stage == play.CampaignMenuClosed { return }
+    if menu.Stage == play.CampaignMenuLoad || menu.Stage == play.CampaignMenuSave || menu.Stage == play.CampaignMenuSaveName ||
+        menu.Stage == play.CampaignMenuQuickSave || menu.Stage == play.CampaignMenuQuickLoad || menu.Stage == play.CampaignMenuSaveUnavailable {
+        if shade.Valid {
+            menuShade := shade.WithPalette(0).WithGamma(settings.Gamma)
+            useDisplayPalette(menuShade)
+            if drawWadSaveMenu(mounts, menuShade, menu, settings.SaveNames, settings.SkullAlternate) { return }
+        }
+        drawCompactSaveMenu(menu, settings.SaveNames)
+        return
+    }
+    if menu.FromMain || menu.Stage == play.CampaignMenuQuit {
+        menuShade := shade
+        if shade.Valid {
+            menuShade = shade.WithPalette(0).WithGamma(settings.Gamma)
+            useDisplayPalette(menuShade)
+        }
+        if menu.IsConfirmPrompt() {
+            drawCampaignConfirmation(mounts, menuShade, menu.Stage)
+            return
+        }
+        if drawWadCampaignMenu(mounts, menuShade, menu, settings) { return }
+    }
     rows := campaignMenuRows(menu)
     panelWidth := Width * 3 / 4
     if panelWidth > 160 { panelWidth = 160 }
@@ -160,7 +412,9 @@ func drawCampaignMenu(menu play.CampaignMenu, blocks int, sensitivity int, lowDe
     title := campaignMenuTitle(menu)
     drawCampaignText(title, left + (panelWidth - campaignTextWidth(title)) / 2, top + 6, color.White)
     for index := range rows {
-        y := top + 17 + index * 9
+        spacing := 9
+        if menu.Stage == play.CampaignMenuOptions || (menu.Stage == play.CampaignMenuMain && rows == 6) { spacing = 7 }
+        y := top + 17 + index * spacing
         shade := color.White
         if index == menu.Cursor {
             shade = color.Yellow
@@ -170,11 +424,16 @@ func drawCampaignMenu(menu play.CampaignMenu, blocks int, sensitivity int, lowDe
         drawCampaignText(label, left + 16, y, shade)
     }
     drawCampaignText("W S MOVE", left + 8, top + panelHeight - 12, color.Orange)
+    if menu.Stage == play.CampaignMenuOptions || menu.Stage == play.CampaignMenuSound {
+        drawCampaignText("A D ADJUST", left + 47, top + panelHeight - 12, color.Orange)
+        drawCampaignText("F OK T BACK", left + 8, top + panelHeight - 7, color.Orange)
+        return
+    }
     detail := "G HIGH DETAIL"
-    if lowDetail { detail = "G LOW DETAIL" }
+    if settings.LowDetail { detail = "G LOW DETAIL" }
     drawCampaignText(detail, left + 39, top + panelHeight - 12, color.Orange)
     drawCampaignText("F OK T BACK", left + 8, top + panelHeight - 7, color.Orange)
-    drawCampaignText(gammaLabels[gamma], left + 51, top + panelHeight - 7, color.Orange)
-    drawCampaignSlider("A D SCREEN", left, top + panelHeight - 24, 9, blocks - 3)
-    drawCampaignSlider("Q E MOUSE", left, top + panelHeight - 18, play.MaxMouseSensitivity + 1, sensitivity)
+    drawCampaignText(gammaLabels[settings.Gamma], left + 51, top + panelHeight - 7, color.Orange)
+    drawCampaignSlider("A D SCREEN", left, top + panelHeight - 24, 9, settings.Blocks - 3)
+    drawCampaignSlider("Q E MOUSE", left, top + panelHeight - 18, play.MaxMouseSensitivity + 1, settings.Sensitivity)
 }

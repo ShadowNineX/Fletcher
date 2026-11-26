@@ -28,8 +28,10 @@ function wad(lumps) {
 
 try {
     const palette = Buffer.alloc(2 * 256 * 3);
-    // A neutral grey, a common warm Doom brown, and an exact saturated red.
-    [[1, 128, 128, 128], [2, 120, 70, 30], [3, 255, 0, 0]].forEach(([index, red, green, blue]) => {
+    // Include common lit and shadow texels alongside true colored trim.
+    [[1, 128, 128, 128], [2, 120, 70, 30], [3, 255, 0, 0],
+        [5, 27, 27, 27], [6, 35, 35, 35], [7, 23, 15, 7], [8, 31, 23, 11],
+        [9, 0, 0, 59], [10, 11, 23, 7], [11, 20, 0, 20], [12, 55, 51, 55]].forEach(([index, red, green, blue]) => {
         palette[index * 3] = red; palette[index * 3 + 1] = green; palette[index * 3 + 2] = blue;
     });
     palette[(256 + 3) * 3 + 2] = 255;
@@ -70,6 +72,16 @@ map "Doom palette dither" {
         log(shifted.ColorAt(3, 0, 0) == color.Blue, shifted.ColorAt(3, 3, 3) == color.Blue,
             shade.ColorAt(3, 0, 0) == color.Red, shifted.WithPalette(0).ColorAt(3, 3, 3) == color.Red)
 
+        direct := walls.LoadShading(base).WithContrast()
+        for level := range engine.DoomGammaCount {
+            solid := direct.WithGamma(level)
+            log("solid", solid.ColorAt(5, 0, 0), solid.ColorAt(6, 0, 0),
+                solid.ColorAt(7, 0, 0), solid.ColorAt(8, 0, 0), solid.ColorAt(9, 0, 0),
+                solid.ColorAt(10, 0, 0), solid.ColorAt(11, 0, 0), solid.ColorAt(12, 0, 0),
+                solid.ColorAt(5, 3, 3), solid.WithPalette(1).ColorAt(3, 0, 0))
+        }
+        log(direct.ColorAt(4, 0, 0) == color.Black, direct.WithGamma(4).ColorAt(4, 0, 0) == color.White)
+
         layered := wad.AddArchive(base, Overlay)
         replacement := shade
         replacement.ColorMaps = wad.LoadColorMaps(layered).Data
@@ -104,17 +116,22 @@ map "Doom palette dither" {
     const sim = simulator(decode(JSON.parse(readFileSync(output, "utf8")).data)); sim.step();
     const from = (table, row) => sources.map(index => table[row * 256 + index]);
     const logs = JSON.parse(JSON.stringify(sim.logs));
-    assert.deepEqual(logs.filter(([tag]) => tag !== "gamma-byte"), [
+    assert.deepEqual(logs.filter(([tag]) => tag !== "gamma-byte" && tag !== "solid"), [
         [true, true, true, true], [false, false], [true, true], [true, true, true, true],
+        [true, true],
         from(maps, 32), from(maps, 34), from(overlay, 32), from(overlay, 32), from(maps, 32),
         [true, true, true, true, true],
     ]);
+    const solid = logs.filter(([tag]) => tag === "solid");
+    // Stock wall tile IDs for black, white, black, orange, blue, green, purple,
+    // white, the same shadow at another coordinate, and the tinted blue swatch.
+    assert.deepEqual(solid, Array.from({ length: 5 }, () => ["solid", 7, 0, 7, 5, 2, 4, 6, 0, 7, 2]));
     const gamma = logs.filter(([tag]) => tag === "gamma-byte").map(([, value]) => value);
     assert.equal(gamma.length, 5 * 256);
     // SHA-256 of id Software's gammatable in pinned linuxdoom-1.10/v_video.c.
     assert.equal(createHash("sha256").update(Buffer.from(gamma)).digest("hex"),
         "e14a1da57838e65bcb7a5bdc3f866eea41361b9e067d1539b08557f0577de63a");
-    console.log("Doom palette projection passed all five upstream gamma tables, tint changes, and layered COLORMAP sampling.");
+    console.log("Doom palette projection passed solid shadows and hues, ordered dithering, all five gamma tables, palette tints, and layered COLORMAP sampling.");
 } finally {
     rmSync(scratch, { recursive: true, force: true });
 }

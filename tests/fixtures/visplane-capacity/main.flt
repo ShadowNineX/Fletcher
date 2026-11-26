@@ -15,7 +15,8 @@ func sharedSky(planes engine.Visplanes) engine.ColumnCoverage {
     coverage.Rows[4], coverage.Rows[12] = (1 << 16) | 3, (14 << 16) | 16
     return walls.DrawWall(camera, coverage, engine.Vertex{X: 16 * unit, Y: 32 * unit},
         engine.Vertex{X: 16 * unit, Y: -32 * unit}, 0xc0000000,
-        walls.Surface{Front: engine.SectorHeights{Ceiling: 8 * unit}, Solid: true, FrontSky: true, Shade: color.White}, 16)
+        walls.Surface{Front: engine.SectorHeights{Ceiling: 8 * unit}, Solid: true, FrontSky: true, Shade: color.White},
+        walls.WallView{Height: 16}, walls.WadShading{})
 }
 
 map "Doom visplane capacity" {

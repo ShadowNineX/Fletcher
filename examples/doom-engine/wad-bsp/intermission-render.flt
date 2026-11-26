@@ -47,7 +47,7 @@ func intermissionPixelEdge(value int, original int, displayed int) int {
     return (value * displayed + original - 1) / original
 }
 
-func drawIntermissionColumn(post wad.PostSource, shade walls.WadShading, x int, top int) {
+func drawIntermissionColumn(post wad.PostSource, shade walls.WadShading, x int, top int, solid bit, ink color) {
     if !post.Valid { return }
     cursor, file := post.Offset, post.Patch.File
     for range post.Patch.Size / 4 + 1 {
@@ -61,16 +61,21 @@ func drawIntermissionColumn(post wad.PostSource, shade walls.WadShading, x int, 
         patternColumn := x & 3
         for row := range lastRow - firstRow {
             py := firstRow + row
-            sourceY := py
-            if Height != intermissionHeight { sourceY = py * intermissionHeight / Height }
-            index := int(file[sourceBase + sourceY])
-            var swatch color
-            if shade.Dithered {
-                if walls.Bayer4[((py & 3) << 2) | patternColumn] < shade.Patterns.Coverage[index] {
-                    swatch = shade.Patterns.Second[index]
-                } else { swatch = shade.Patterns.First[index] }
-            } else { swatch = shade.Palette[index] }
-            pixel(x, py, true, swatch)
+            if solid {
+                pixel(x, py, true, ink)
+            } else {
+                sourceY := py
+                if Height != intermissionHeight { sourceY = py * intermissionHeight / Height }
+                index := int(file[sourceBase + sourceY])
+                var swatch color
+                if shade.Dithered {
+                    if walls.Bayer4[((py & 3) << 2) | patternColumn] < shade.Patterns.Coverage[index] {
+                        swatch = shade.Patterns.Second[index]
+                    } else { swatch = shade.Patterns.First[index] }
+                } else { swatch = shade.Palette[index] }
+                if DisplayUsesRgb { pixel(x, py, true, swatch, index)
+                } else { pixel(x, py, true, swatch) }
+            }
         }
         cursor = cursor + length + 4
     }
@@ -88,6 +93,10 @@ func drawPause(mounts wad.Archives, shade walls.WadShading) {
 }
 
 func drawPatchFrame(patch IntermissionPatch, shade walls.WadShading, x int, y int, flip bit) {
+    drawPatchWithInk(patch, shade, x, y, flip, false, color.Black)
+}
+
+func drawPatchWithInk(patch IntermissionPatch, shade walls.WadShading, x int, y int, flip bit, solid bit, ink color) {
     if patch.Width == 0 { return }
     left, top := x - patch.Left, y - patch.Top
     firstColumn := intermissionPixelEdge(left, intermissionWidth, Width)
@@ -98,7 +107,7 @@ func drawPatchFrame(patch IntermissionPatch, shade walls.WadShading, x int, y in
         if Width != intermissionWidth { source = px * intermissionWidth / Width - left }
         if flip { source = patch.Width - 1 - source }
         post := wad.PatchPostSource(patch.Lump, source)
-        drawIntermissionColumn(post, shade, px, top)
+        drawIntermissionColumn(post, shade, px, top, solid, ink)
     }
 }
 
@@ -214,6 +223,7 @@ func drawIntermission(mounts wad.Archives, shade walls.WadShading, state play.In
     if background.Width == 0 { return false }
     if !shade.Valid { shade = walls.LoadShading(mounts) }
     if !shade.Valid { return false }
+    useDisplayPalette(shade)
     drawIntermissionPatch(background, shade, 0, 0)
     for index := range backdrop.Count {
         frame := backdrop.Frame[index]

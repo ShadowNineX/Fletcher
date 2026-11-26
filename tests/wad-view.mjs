@@ -13,12 +13,13 @@ const { values } = parseArgs({ options: {
     mergedOutput: { type: "string" }, texturedOutput: { type: "string" }, wallOutput: { type: "string" },
     skyOutput: { type: "string" }, walkingOutput: { type: "string" }, spriteOutput: { type: "string" },
     spriteOracle: { type: "string" }, maskedOutput: { type: "string" }, maskedOracle: { type: "string" },
-    animatedOutput: { type: "string" }, animationOracle: { type: "string" },
+    animatedOutput: { type: "string" }, animationOracle: { type: "string" }, animatedMaterials: { type: "boolean" },
     scrollOutput: { type: "string" }, scrollOracle: { type: "string" }, lightOutput: { type: "string" }, doorOutput: { type: "string" },
     taggedDoorOutput: { type: "string" }, switchOutput: { type: "string" }, taggedLightOutput: { type: "string" },
     stairsOutput: { type: "string" }, donutOutput: { type: "string" },
     floorOutput: { type: "string" }, ceilingOutput: { type: "string" }, platformOutput: { type: "string" },
     cli: { type: "string" }, drawSegmentCapacity: { type: "boolean" }, bspDepth: { type: "boolean" },
+    maskedRaster: { type: "boolean" },
     spriteCapacity: { type: "boolean" }, visplaneCapacity: { type: "boolean" }, bspBoundary: { type: "boolean" },
     resourceIndex: { type: "boolean" }, resourceIndexOutput: { type: "string" },
 } });
@@ -105,11 +106,11 @@ function spriteResources(color, shaded = false, name = "BAR1A0", frames = []) {
         postPatch(spriteColor ?? ((x, y, post) => post === 0 ? x * 3 + y * 5 + 2 : x * 5 + y * 3 + 1))]), ["S_END", empty]];
 }
 
-function maskedWallResources(color) {
+function maskedWallResources(color, overlapping = false) {
     const names = Buffer.alloc(12);
     names.writeInt32LE(1);
     names.write("FCPATCH", 4);
-    const textures = Buffer.alloc(12 + 22 + 32);
+    const textures = Buffer.alloc(12 + 22 + (overlapping ? 42 : 32));
     textures.writeInt32LE(2);
     textures.writeInt32LE(12, 4);
     textures.writeInt32LE(34, 8);
@@ -118,7 +119,12 @@ function maskedWallResources(color) {
         textures.writeInt16LE(8, offset + 12);
         textures.writeInt16LE(31, offset + 14);
     }
-    textures.writeInt16LE(1, 34 + 20);
+    textures.writeInt16LE(overlapping ? 2 : 1, 34 + 20);
+    if (overlapping) {
+        // The second placement overlaps the first in the right half of FENCE.
+        textures.writeInt16LE(4, 34 + 32);
+        textures.writeInt16LE(5, 34 + 34);
+    }
     return [["PNAMES", names], ["TEXTURE1", textures], ["FCPATCH", postPatch(color)]];
 }
 
@@ -395,7 +401,8 @@ function build(wad, output, demo = "wad-view") {
             for (const file of readdirSync(sample).filter(file => file.endsWith(".flt"))) {
                 const source = readFileSync(path.join(sample, file), "utf8");
                 // The pixel oracles project the WAD palette to the nearest native color.
-                const fixture = file === "display.flt" ? source.replace("const DitherColors = true", "const DitherColors = false") : source;
+                const fixture = file === "display.flt" ? source.replace("const ContrastColors = true", "const ContrastColors = false")
+                    .replace("const DitherColors = true", "const DitherColors = false") : source;
                 writeFileSync(path.join(flatPalettePreview, file), fixture);
             }
         }
@@ -906,12 +913,13 @@ map "Draw segment pages" {
         surface := walls.Surface{Front: engine.SectorHeights{Ceiling: 64 * unit}, Solid: true, Shade: color.Green}
         angle := engine.PointToAngle(0, 0, first.X, first.Y)
         projection := walls.ProjectedWall{Span: engine.ColumnSpan{First: 0, End: 3}, FirstAngle: angle}
-        coverage = walls.DrawProjectedWall(camera, coverage, first, last, 0xc0000000, surface, 8, projection)
+        view := walls.WallView{Height: 8}
+        coverage = walls.DrawProjectedWall(camera, coverage, first, last, 0xc0000000, surface, view, projection, walls.WadShading{})
         lastStored := coverage.DrawSegments.At(1027)
         log(coverage.DrawSegments.Count, coverage.StoredWallRange, coverage.Failed, lastStored.Span.First, lastStored.Span.End,
             engine.ColumnOpen(coverage, 0), engine.ColumnOpen(coverage, 2))
         projection.Span = engine.ColumnSpan{First: 3, End: 4}
-        coverage = walls.DrawProjectedWall(camera, coverage, first, last, 0xc0000000, surface, 8, projection)
+        coverage = walls.DrawProjectedWall(camera, coverage, first, last, 0xc0000000, surface, view, projection, walls.WadShading{})
         log(coverage.DrawSegments.Count, coverage.StoredWallRange, coverage.Failed, engine.ColumnOpen(coverage, 3))
         visible := sprites.AddVisibleSprite(sprites.VisibleSprites{}, sprites.ProjectedSprite{
             Valid: true, Span: engine.ColumnSpan{First: 4, End: 5}, Scale: unit})
@@ -971,7 +979,7 @@ map "Masked wall raster" {
         clips[58] = (36 << 16) | 62
         clips[59] = (31 << 16) | 70
         clips[61] = (46 << 16) | 66
-        mask := walls.MaskedWall{Run: run, Tier: tier.Masked, Shade: tier.Shade,
+        mask := walls.MaskedWall{Run: run, Tier: tier.Masked, Shade: materials.Shade,
             Light: tier.Light, ExtraLight: tier.ExtraLight, Clips: clips}
         drawn := mask.DrawMask(58, 60, [engine.CoverageWords]bits<32>{})
         complete := mask.DrawMask(58, 62, drawn)
@@ -990,6 +998,51 @@ map "Masked wall raster" {
                 `native Doom mask pixels with ${peg} pegging`);
         }
     }
+}
+
+function verifyWideMaskRaster() {
+    const palette = planeResources().find(([name]) => name === "PLAYPAL");
+    const rows = Buffer.from(Array.from({ length: 32 * 256 }, (_, i) => ((i & 255) + (i >> 8) * 3) & 255));
+    const textures = maskedWallResources((x, y, post) => x * 29 + y * 17 + post * 11, true);
+    const wad = encodeWad([palette, ["COLORMAP", rows], ...textures]);
+    const source = path.join(mkdtempSync(path.join(scratch, "wide-mask-")), "main.flt");
+    writeFileSync(source, `package main
+import "engine"
+import "wad"
+import "walls"
+const Archive = readFile("LEVEL.WAD")
+map "Wide masked wall raster" {
+    screen at (-64, -48) size (128, 96) with { style = "solid", hold = true, slice = true }
+    tick {
+        materials := walls.LoadMaterials(wad.OpenArchive(Archive), wad.LumpName{})
+        materials.Shade = materials.Shade.WithDithering()
+        materials.Shade.DetailShift, materials.Shade.ScreenX, materials.Shade.ScreenY = 1, 3, 2
+        wall := wad.WallSegment{TwoSided: true, First: engine.Vertex{Y: 65536}, Light: 80,
+            Front: engine.SectorHeights{Ceiling: 64 << 16}, Back: engine.SectorHeights{Ceiling: 64 << 16}}
+        side := wad.SideMaterial{Middle: wad.LumpName{Low: 0x434e4546, High: 0x45}}
+        tier := walls.ResolveWallMaterials(materials, wall, side, 48 << 16)
+        run := walls.WallTextureRun{Bounds: engine.ColumnSpan{End: 62}, Width: 62, Height: 92,
+            Scale: engine.WallScale{First: 3 << 16, Last: 3 << 16}}
+        var clips [engine.MaxViewWidth]bits<32>
+        for x := range 62 {
+            run.Columns[x] = (x >> 2) - 3
+            clips[x] = (bits<32>(5 + x % 3) << 16) | bits<32>(82 - x % 5)
+        }
+        mask := walls.MaskedWall{Run: run, Tier: tier.Masked, Shade: materials.Shade, Light: tier.Light, Clips: clips}
+        var drawn [engine.CoverageWords]bits<32>
+        for range 12 { drawn = mask.DrawMask(0, 62, [engine.CoverageWords]bits<32>{}) }
+        log(drawn[0], drawn[1])
+    }
+}
+`);
+    const sim = buildSource(wad, path.join(scratch, "wide-mask-raster.json"), source);
+    let hosts = 0;
+    for (; hosts < 7 && !sim.logs.length; hosts++) sim.step();
+    assert.deepEqual(JSON.parse(JSON.stringify(sim.logs)), [[0xffffffff, 0x3fffffff]],
+        "the sliced mask draws both wrapped source types within seven host ticks");
+    assert.equal(frameDigest(sim), "61c81fa551f694715c657da861e86e464b8575e69fa1391694db0b53c6aceea1",
+        "direct posts and overlapping patches match the pre-optimization frame");
+    console.log(`Wide masked wall raster matched the reference frame in ${hosts} host ticks.`);
 }
 
 function verifyAnimatedMaterials() {
@@ -1053,7 +1106,7 @@ map "Animated peg heights" {
     screen at (-64, -48) size (128, 96) with { style = "solid" }
     tick {
         materials := walls.LoadMaterials(wad.OpenArchive(Archive), wad.LumpName{})
-        materials.Animations = wad.LoadAnimations(materials.Flats, materials.Textures)
+        materials.Animations = wad.IndexFrameAnimations(wad.LoadAnimations(materials.Flats, materials.Textures))
         name := wad.LumpName{Low: 0x44414c53, High: 0x31504952}
         side := wad.SideMaterial{Middle: name, Upper: name, Lower: name, PegBottom: true}
         wall := wad.WallSegment{Front: engine.SectorHeights{Ceiling: 80 << 16},
@@ -1341,7 +1394,10 @@ function verifyTaggedAndTimedDoors() {
     timer.stepTic();
     assert.equal(frameDigest(timer), frameDigest(nextHeight), "timed door advances without camera input");
     assert.notEqual(frameDigest(timer), initiallyOpen);
-    assert.deepEqual(JSON.parse(JSON.stringify(timer.logs)), [["Classic WAD BSP frame rendered"]]);
+    assert.deepEqual(JSON.parse(JSON.stringify(timer.logs)), [
+        ["Classic WAD BSP frame rendered"],
+        ["Doom native player command ready"],
+    ]);
 }
 
 function verifySwitchFixtures() {
@@ -2138,12 +2194,13 @@ function verifySharedSectorSprites() {
         level := wad.LoadBspLevel(Archive, ${marker})
         actors := play.SpawnMapActors(level, wad.ThingRules{Skill: 2, Commercial: true}, NewPlayerHealth, play.ClearRandom())
         mounts := wad.OpenArchive(Archive)
+        actorSprites, _ := cachePreviewSprites(mounts, actors, PreviewSprites{})
         scene := Scene{Level: level, Actors: actors, ActorLinks: play.BuildActorLinks(actors, wad.BlockMapInfo{}),
-            ActorSprites: cachePreviewSprites(mounts, actors, PreviewSprites{}), ViewHeight: Height,
+            ActorSprites: actorSprites, ViewHeight: Height,
             Camera: engine.Camera{Z: 41 * engine.FracUnit, View: engine.NewViewProjection(Width)}}
         near := scene.DrawBspSubsector(0, engine.BspFrame<SpritePass>{})
         far := scene.DrawBspSubsector(1, near)
-        log(near.Data.Visible.Count, far.Data.Visible.Count, far.Coverage.Failed)
+        log(near.Data.Sprites.Visible.Count, far.Data.Sprites.Visible.Count, far.Coverage.Failed)
     }
 }
 `);
@@ -2160,7 +2217,6 @@ function verifyViews() {
     verifySectorLinkedSprites();
     verifySharedSectorSprites();
     verifyLargeBsp();
-    verifyMaskRaster();
     verifyAnimatedPegging();
     verifyAnimatedMaterials();
     verifyLineScrolling();
@@ -2403,7 +2459,12 @@ function verifyViews() {
 
 try {
     const resourceIndex = values.resourceIndex || values.resourceIndexOutput;
-    const focused = values.drawSegmentCapacity || values.bspDepth || values.spriteCapacity || values.visplaneCapacity || values.bspBoundary || resourceIndex;
+    const focused = values.drawSegmentCapacity || values.bspDepth || values.spriteCapacity || values.visplaneCapacity ||
+        values.bspBoundary || values.maskedRaster || resourceIndex || values.animatedMaterials;
+    if (!focused || values.maskedRaster) {
+        verifyMaskRaster();
+        verifyWideMaskRaster();
+    }
     if (!focused || values.drawSegmentCapacity) {
         verifyDrawSegmentCapacity();
         console.log("WAD view passed 1,056 masked ranges, disjoint-page pruning, continued movement, solid clipping beyond the inline pages, and reverse mask order across pages.");
@@ -2411,6 +2472,11 @@ try {
     if (!focused || values.bspDepth) verifyDeepBsp(values.bspDepth);
     if (values.bspBoundary) verifyClassicSegBoundary();
     if (resourceIndex) verifyLargeResourceIndex();
+    if (values.animatedMaterials) {
+        verifyAnimatedPegging();
+        verifyAnimatedMaterials();
+        console.log("WAD view passed animated wall and flat pixels, idle hold, movement, and masked and opaque pegging.");
+    }
     if (!focused || values.visplaneCapacity) {
         verifyVisplaneCapacity();
         console.log("WAD view passed 280 floor and ceiling planes with exact opening and movement frames.");

@@ -1,0 +1,75 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 1993-1996 id Software, Inc.
+// Demo reading follows G_DoPlayDemo and G_ReadDemoTiccmd in linuxdoom-1.10/g_game.c.
+
+package play
+
+import "wad"
+
+const doomDemoVersion = 109
+const doomDemoHeaderBytes = 13
+const doomDemoCommandBytes = 4
+const doomDemoEndMarker = 0x80
+const DemoAttack = 1
+const DemoUse = 2
+const DemoChangeWeapon = 4
+const DemoWeaponShift = 3
+const DemoWeaponMask = 7
+const DemoSpecial = 0x80
+const DemoSpecialMask = 3
+const DemoPause = 1
+
+type DoomDemo struct {
+    Valid bit
+    Episode int
+    Map int
+    Skill int
+    Respawn bit
+    Fast bit
+    NoMonsters bit
+    file bytes
+    position int
+    end int
+}
+
+type DoomDemoRead struct {
+    Demo DoomDemo
+    Command PlayerMoveCommand
+    Buttons int
+    Valid bit
+    Done bit
+}
+
+// Open only a Doom 1.9 demo recorded for player one. Read validates each
+// command within this lump and stops at the first end marker.
+func OpenDoomDemo(lump wad.LumpRef) DoomDemo {
+    if !lump.Valid || lump.Offset < 0 || lump.Offset > len(lump.File) ||
+        lump.Size <= doomDemoHeaderBytes || lump.Size > len(lump.File) - lump.Offset { return DoomDemo{} }
+    file, start := lump.File, lump.Offset
+    if file[start] != doomDemoVersion || file[start + 4] != 0 || file[start + 8] != 0 ||
+        file[start + 9] != 1 || file[start + 10] != 0 || file[start + 11] != 0 || file[start + 12] != 0 { return DoomDemo{} }
+    skill, episode, mapNumber := int(file[start + 1]), int(file[start + 2]), int(file[start + 3])
+    if skill > 4 || episode < 1 || episode > 4 || mapNumber < 1 || mapNumber > 32 { return DoomDemo{} }
+    return DoomDemo{Valid: true, Episode: episode, Map: mapNumber, Skill: skill, Respawn: file[start + 5] != 0,
+        Fast: file[start + 6] != 0, NoMonsters: file[start + 7] != 0, file: file,
+        position: start + doomDemoHeaderBytes, end: start + lump.Size}
+}
+
+func doomDemoSignedByte(value bits<8>) int { return (int(value) << 24) >> 24 }
+
+func (demo DoomDemo) Read() DoomDemoRead {
+    result := DoomDemoRead{Demo: demo}
+    if !demo.Valid || demo.position >= demo.end { return result }
+    file, position := demo.file, demo.position
+    if file[position] == doomDemoEndMarker {
+        result.Valid, result.Done = true, true
+        return result
+    }
+    if demo.end - position < doomDemoCommandBytes { return result }
+    result.Command = PlayerMoveCommand{Forward: doomDemoSignedByte(file[position]),
+        Side: doomDemoSignedByte(file[position + 1]), Turn: doomDemoSignedByte(file[position + 2]) << 8}
+    result.Buttons = int(file[position + 3])
+    result.Demo.position = position + doomDemoCommandBytes
+    result.Valid = true
+    return result
+}

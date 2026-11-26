@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
+import vm from "node:vm";
 import { extractFunction } from "./doom-native-actor-oracle.mjs";
 import { decode, destinations, keyOf, simulator } from "./logic-arrows-simulator.mjs";
 
@@ -21,15 +22,35 @@ const fire = [18]; // R
 const forward = [23]; // W
 const use = [6]; // F
 const toggleAudio = [15]; // O
+const cueVoices = (x, y) => [{ x, y }, { x: x - 4, y }];
+const cueTrigger = voice => ({ x: voice.x, y: voice.y - 1 });
+const cueAccent = (voice, index) => ({ x: voice.x + (index === 0 ? -1 : 1), y: voice.y - 1 });
+const cueAccents = ({ tones, voices }) => voices.flatMap(voice => tones.map((tone, index) => ({
+    ...cueAccent(voice, index), tone,
+})));
+const commonLanes = [
+    ["pickup", 0x0857, 0x0847], ["damage", 0x1334, 0x0342], ["monster", 0x0131, 0x1531],
+    ["mechanism", 0x1237, 0x0337], ["impact", 0x153a, 0x1235, 0x0340], ["stage", 0x0747, 0x0757],
+    ["blockedUse", 0x0346, 0x1246],
+].map(([name, tone, ...tones], index) => ({ name, tone, tones, voices: cueVoices(-41 + 8 * index, 63) }));
+const weaponTones = [0x0340, 0x0337, 0x032b, 0x1251, 0x1249, 0x124b, 0x1250, 0x1357,
+    0x1534, 0x1539, 0x1527, 0x1537, 0x152b, 0x1227, 0x0330, 0x0341];
+const weaponLanes = new Map(weaponTones.map((tone, index) => [tone, cueVoices(-57 + 8 * index, 76)]));
+const weaponAccents = new Map([
+    [0, [0x1230, 0x0342]], [1, [0x1225, 0x0340]], [2, [0x1220, 0x0344]], [7, [0x0347]],
+    [8, [0x0330, 0x1224]], [9, [0x0349]], [12, [0x034b]], [13, [0x0330, 0x0347]],
+    [14, [0x0340]], [15, [0x1232, 0x0343]],
+]);
+const weapons = weaponTones.map((tone, lane) => ({
+    name: `weapon lane ${lane}`, tone, tones: weaponAccents.get(lane) ?? [], voices: weaponLanes.get(tone),
+}));
+const menuLanes = [
+    ["cursor", 0x1253, 0x0353], ["slider", 0x1243, 0x0343], ["back", 0x1246, 0x0346],
+    ["dismiss", 0x1240, 0x0330], ["select", 0x0340, 0x1230],
+].map(([name, tone, ...tones], index) => ({ name, tone, tones, voices: cueVoices(71 + 8 * index, 76) }));
 const lanes = {
-    fire: { x: -55, y: 62 },
-    pickup: { x: -41, y: 63 },
-    damage: { x: -33, y: 63 },
-    monster: { x: -25, y: 63 },
-    mechanism: { x: -17, y: 63 },
-    impact: { x: -9, y: 63 },
-    stage: { x: -1, y: 63 },
-    blockedUse: { x: 7, y: 63 },
+    fire: weaponLanes.get(0x0340),
+    ...Object.fromEntries(commonLanes.map(({ name, voices }) => [name, voices])),
 };
 
 function words(values) {
@@ -128,84 +149,166 @@ map "Doom use trace" {
     ]);
 }
 
-function assertMusicLanes(sim) {
-    const extras = [0x0340, 0x0857, 0x1334, 0x0131, 0x1237, 0x153a, 0x0747, 0x0346];
-    for (const [lane, [name, tile]] of Object.entries(lanes).entries()) {
-        const music = sim.tileAt(tile);
-        assert.equal(music?.type, 29, `${name} is a native Music Arrow`);
-        assert.equal(music.rotation, 1);
-        assert.equal(music.extra, extras[lane], `${name} has its configured instrument, octave and note`);
-        const source = lane === 0 ? sim.tileAt({ x: tile.x - 1, y: tile.y }) : sim.tileAt({ x: tile.x, y: tile.y - 1 });
-        assert.equal(source?.type, lane === 0 ? 22 : 16, `${name} uses its dynamic tone source or fixed pulse gate`);
-        assert.equal(source.rotation, lane === 0 ? 1 : 2, `${name} source feeds its Music Arrow`);
-    }
+function assertMusicArrow(sim, name, tile, tone) {
+    const music = sim.tileAt(tile);
+    assert.equal(music?.type, 29, `${name} is a native Music Arrow`);
+    assert.equal(music.rotation, 1);
+    assert.equal(music.extra, tone, `${name} has its configured instrument, octave and note`);
 }
 
-function checkFixedCuePulses(campaign) {
-    // Exercise the placed gates from the compiled campaign without running a
-    // whole WAD frame for each phase pattern. Drive the real forwarding lamp.
-    const music = lanes.pickup;
-    const phase = { x: music.x - 7, y: music.y - 3 };
-    const lamp = campaign.tileAt(phase);
-    assert.equal(lamp.type, 28);
-    assert.equal(lamp.rotation, 2);
-    const phaseKey = keyOf(phase);
-    const tiles = [campaign.tileAt(music)];
-    const included = new Set([keyOf(music)]);
-    // Walk the actual incoming connections. A generated data block can use
-    // an empty cell in this circuit's footprint without sending a signal.
-    for (let index = 0; index < tiles.length; index++) {
-        const target = tiles[index];
-        const targetKey = keyOf(target);
-        if (targetKey === phaseKey) continue;
-        for (let y = target.y - 2; y <= target.y + 2; y++) {
-            for (let x = target.x - 2; x <= target.x + 2; x++) {
-                const tile = campaign.tileAt({ x, y });
-                if (!tile || included.has(keyOf(tile)) || !destinations(tile).includes(targetKey)) continue;
-                included.add(keyOf(tile));
-                tiles.push(tile);
+function assertCueVoice(sim, name, voice, tone) {
+    assertMusicArrow(sim, name, voice, tone);
+    const trigger = sim.tileAt(cueTrigger(voice));
+    assert.equal(trigger?.type, 8, `${name} uses a physical T splitter`);
+    assert.equal(trigger.rotation, 2);
+    const outputs = destinations(trigger);
+    assert.ok(outputs.includes(keyOf(voice)), `${name} drives its tone in one hop`);
+    return outputs;
+}
+
+function assertMusicLanes(sim) {
+    for (const { name, tone, tones, voices } of [...commonLanes, ...weapons, ...menuLanes]) {
+        for (const [bank, voice] of voices.entries()) {
+            const label = `${name} bank ${bank}`;
+            const outputs = assertCueVoice(sim, label, voice, tone);
+            for (const accent of cueAccents({ tones, voices: [voice] })) {
+                assertMusicArrow(sim, `${label} accent`, accent, accent.tone);
+                assert.ok(outputs.includes(keyOf(accent)), `${label} drives its accent in the same hop`);
+            }
+            for (let index = tones.length; index < 2; index++) {
+                assert.notEqual(sim.tileAt(cueAccent(voice, index))?.type, 29, `${label} has no unconfigured accent`);
             }
         }
     }
-    assert.equal(tiles.length, 13, "one phase lamp, eleven gates and one Music Arrow");
-    assert.ok(included.has(phaseKey), "the phase lamp drives the pulse circuit");
+}
+
+function checkCommonCuePulses(campaign) {
+    // Run the compiled conductor and physical voices with synthetic publications.
+    const stepConductor = cueConductor(campaign);
+    const voices = commonLanes.flatMap(lane => [...lane.voices, ...cueAccents(lane)]);
+    const triggers = commonLanes.flatMap(lane => lane.voices.map(cueTrigger));
+    const sim = simulator([...voices, ...triggers].map(tile => campaign.tileAt(tile)));
+    let hostTick = 1;
     for (let pattern = 0; pattern < 1024; pattern++) {
-        const sim = simulator(tiles);
-        let previousPhase = 0, pending = false, previousPulse = false;
-        const expected = [];
-        for (let tick = 0; tick < 22; tick++) {
-            const current = (pattern >>> Math.min(tick, 9)) & 1;
-            if (current !== previousPhase) pending = true;
-            const pulse = pending && !previousPulse;
-            if (pulse) pending = false;
-            expected.push(pulse);
-            previousPulse = pulse;
-            previousPhase = current;
-            sim.step([], new Map([[phaseKey, current]]));
-            assert.equal(sim.value(music) > 0, expected[tick - 7] ?? false,
-                `fixed cue pulse for pattern ${pattern} at host tick ${tick}`);
+        const lastPrimary = commonLanes.map(() => -1);
+        let previousNotes = [];
+        for (let tick = 0; tick < 12; tick++, hostTick++) {
+            let requests = 0;
+            const notes = new Set();
+            const writesExpected = [];
+            for (const [lane, { tones, voices }] of commonLanes.entries()) {
+                // Offset each lane's ten-bit sequence to expose cross-lane interference.
+                if (tick >= 10 || (pattern & (1 << ((tick + lane) % 10))) === 0) continue;
+                requests |= 1 << lane;
+                const bank = lastPrimary[lane] === hostTick - 1 ? 1 : 0;
+                if (bank === 0) lastPrimary[lane] = hostTick;
+                const voice = voices[bank];
+                const { x, y } = cueTrigger(voice);
+                writesExpected.push([x, y, 1]);
+                notes.add(keyOf(voice));
+                for (const accent of cueAccents({ tones, voices: [voice] })) notes.add(keyOf(accent));
+            }
+            const writes = stepConductor(hostTick, hostTick, requests);
+            assert.deepEqual(writes, writesExpected, `common trigger writes for pattern ${pattern} at offset ${tick}`);
+            sim.step([], new Map(writes.map(([x, y, value]) => [keyOf({ x, y }), value])));
+            assert.deepEqual(voices.filter(voice => sim.value(voice) > 0), previousNotes,
+                `every common request sounds in one hop for pattern ${pattern} at offset ${tick}`);
+            previousNotes = voices.filter(voice => notes.has(keyOf(voice)));
         }
     }
+}
+
+function checkFastWeaponAndMenuPulses(campaign) {
+    for (const { name, voices, tones } of [...weapons, ...menuLanes]) {
+        const triggers = voices.map(cueTrigger);
+        const layers = voices.map(voice => [voice, ...cueAccents({ tones, voices: [voice] })]);
+        const sim = simulator([...triggers, ...layers.flat()].map(tile => campaign.tileAt(tile)));
+        const schedule = [0, 1, 0];
+        for (let tick = 0; tick <= schedule.length + 1; tick++) {
+            const bank = schedule[tick];
+            sim.step([], bank === undefined ? new Map() : new Map([[keyOf(triggers[bank]), 1]]));
+            const expected = [schedule[tick - 1] === 0, schedule[tick - 1] === 1];
+            for (const [index, layer] of layers.entries()) {
+                assert.deepEqual(layer.map(voice => sim.value(voice) > 0), layer.map(() => expected[index]),
+                    `${name} bank ${index} tones rise together one hop after the request at tick ${tick}`);
+            }
+        }
+    }
+}
+
+function cueConductor(campaign) {
+    const driver = campaign.tileAt({ x: 16, y: 64 });
+    assert.equal(driver?.type, 22);
+    const frames = {};
+    const writes = [];
+    let hostTick = 0, callback;
+    vm.runInNewContext(driver.payload.toString("utf8"), {
+        getPosition: () => driver,
+        globalState: frames,
+        state: {},
+        world: {
+            getTick: () => hostTick,
+            setSignal: (...args) => writes.push(args),
+            setArrow: () => assert.fail("cues must reuse their configured Music Arrows"),
+        },
+        always: handler => { callback = handler; },
+    }, { timeout: 1000 });
+
+    return (tick, epoch, requests, publishedTick = tick - 1) => {
+        hostTick = tick;
+        const slot = tick % 2 === 0 ? "__fletcherOdd" : "__fletcherEven";
+        frames[slot] = { t: publishedTick, p: { soundCueEpoch: epoch, soundCueRequests: requests } };
+        callback();
+        return writes.splice(0);
+    };
+}
+
+function checkCueConductor(campaign) {
+    const step = cueConductor(campaign);
+    const menuRequests = 0x1f << 23;
+    const requests = (1 << 0) | (1 << 6) | (1 << 7) | (1 << 22) | menuRequests;
+    assert.deepEqual(step(0), [], "idle before the first published frame");
+    assert.deepEqual(step(1, 0, requests), [], "the zero epoch sentinel publishes no signal writes");
+    assert.deepEqual(step(2, 1, requests), [[-41, 62, 1], [7, 62, 1], [-57, 75, 1], [63, 75, 1],
+        [71, 75, 1], [79, 75, 1], [87, 75, 1], [95, 75, 1], [103, 75, 1]],
+        "every requested common, weapon, and menu lane receives exactly one trigger pulse");
+    const repeated = (1 << 0) | (1 << 7) | (1 << 23);
+    assert.deepEqual(step(3, 2, repeated), [[-45, 62, 1], [-61, 75, 1], [67, 75, 1]],
+        "adjacent requests use the alternate physical voices");
+    assert.deepEqual(step(4, 2, repeated), [], "a render slice can repeat an epoch without retransmitting");
+    assert.deepEqual(step(5, 3, 1, 3), [], "stale host publication is ignored");
+    assert.deepEqual(step(6, 3, 1 | (1 << 24)), [[-41, 62, 1], [75, 75, 1]],
+        "common cues return to primary after idle while menu cues keep alternating");
+    assert.deepEqual(step(12), [], "a clock jump before any valid frame is silent");
+    assert.deepEqual(step(13, 3, requests), [], "the first valid frame after a jump is the baseline");
+    assert.deepEqual(step(14, 3, requests), [], "the retained epoch stays silent after resync");
+    assert.deepEqual(step(15, 4, 1 << 8), [[-49, 75, 1]], "a new post-resync cue is delivered");
+    assert.deepEqual(step(6, 2, requests), [], "rewinding even to a valid older frame is silent");
+    assert.deepEqual(step(7, 0x80000000, 1 << 7), [[-57, 75, 1]], "a full-width unsigned epoch after rewind is delivered");
 }
 
 function risingEdges(sim, tile, keys, ticks) {
     const edges = [];
-    let previous = sim.value(tile) ?? 0;
+    const tiles = Array.isArray(tile) ? tile : [tile];
+    const previous = tiles.map(tile => sim.value(tile) ?? 0);
     for (let tick = 0; tick < ticks; tick++) {
         sim.step([], new Map(), keys);
-        const current = sim.value(tile) ?? 0;
-        if (previous <= 0 && current > 0) edges.push(tick);
-        previous = current;
+        for (const [index, tile] of tiles.entries()) {
+            const current = sim.value(tile) ?? 0;
+            if (previous[index] <= 0 && current > 0) edges.push(tick);
+            previous[index] = current;
+        }
     }
     return edges;
 }
 
 function untilRises(sim, tile, keys, description, limit = 260) {
-    let previous = sim.value(tile) ?? 0;
+    const tiles = Array.isArray(tile) ? tile : [tile];
+    let previous = tiles.map(tile => sim.value(tile) > 0);
     for (let tick = 0; tick < limit; tick++) {
         sim.step([], new Map(), keys);
-        const current = sim.value(tile) ?? 0;
-        if (previous <= 0 && current > 0) return tick;
+        const current = tiles.map(tile => sim.value(tile) > 0);
+        if (current.some((active, index) => active && !previous[index])) return tick;
         previous = current;
     }
     assert.fail(`${description}; recent logs: ${JSON.stringify(sim.logs.slice(-8))}`);
@@ -218,17 +321,21 @@ function checkWeaponTimbres() {
     writeFileSync(path.join(scratch, "LEVEL.WAD"), wad(lumps));
     const sim = build();
     assertMusicLanes(sim);
-    checkFixedCuePulses(sim);
     function expectTone(keys, extra, name) {
-        untilRises(sim, lanes.fire, keys, name + " emits a fresh pulse");
-        assert.equal(sim.tileAt(lanes.fire).extra, extra, name + " note and instrument at its rising edge");
+        const voices = weaponLanes.get(extra);
+        if (keys.length > 0) sim.step([], new Map(), keys);
+        untilRises(sim, voices, [], name + " emits a fresh pulse");
+        const sounded = voices.filter(voice => sim.value(voice) > 0);
+        assert.equal(sounded.length, 1, `${name} sounds in one bank`);
+        assert.equal(sim.tileAt(sounded[0]).extra, extra, `${name} note and instrument at its rising edge`);
     }
     function settle() {
         // Allow the current psprite to finish firing, lowering or raising.
-        assert.deepEqual(risingEdges(sim, lanes.fire, [], 125), [], "no extra weapon cues during settling");
+        assert.deepEqual(risingEdges(sim, [...weaponLanes.values()].flat(), [], 125), [], "no extra weapon cues during settling");
     }
 
-    expectTone(fire, 0x0340, "pistol");
+    settle();
+    expectTone([53], 0x0340, "pistol from the native Ctrl alias");
     untilRises(sim, lanes.pickup, forward, "the player walks over the shotgun");
     settle();
     expectTone(fire, 0x0337, "shotgun");
@@ -364,11 +471,49 @@ function checkActorSoundCues() {
     assert.ok(sim.logs.some(([event, sound]) => event === "actor sound" && sound >= 59 && sound <= 61));
 }
 
+function checkSimultaneousCues() {
+    const preview = path.join(scratch, "simultaneous-cue-preview");
+    cpSync(path.join(port, "wad-bsp"), preview, { recursive: true });
+    const entry = path.join(preview, "main.flt");
+    const source = readFileSync(entry, "utf8");
+    const combat = "                combat.GameTic, combat.World.AttackRange = gameTime, attackRange";
+    assert.ok(source.includes(combat), "simultaneous sound fixture anchor");
+    writeFileSync(entry, source.replace(combat, `${combat}
+                if levelTime == 2 {
+                    combat = cuePreviewActorSound(combat, 1, contacts.Handle)
+                    combat = cuePreviewActorSound(combat, 2, 0)
+                    soundCues = soundCues | cueMechanism
+                    menuStep.Sound = play.CampaignMenuSoundAdjust
+                }`));
+    writeFileSync(path.join(scratch, "LEVEL.WAD"), wad(level()));
+
+    const sim = build(entry);
+    const requested = [weapons[0], weapons[1], commonLanes[3], menuLanes[1]];
+    for (let host = 0; host < 260; host++) {
+        sim.step();
+        const active = requested.map(({ voices }) => voices.find(voice => sim.value(voice) > 0));
+        if (active.some(Boolean)) {
+            for (const [index, { name, tones }] of requested.entries()) {
+                const voice = active[index];
+                assert.ok(voice, `${name} fires with the other cues`);
+                for (const accent of cueAccents({ tones, voices: [voice] })) {
+                    assert.ok(sim.value(accent) > 0, `${name} accent fires with the other cues`);
+                }
+            }
+            return;
+        }
+    }
+    assert.fail(`simultaneous cues never arrived; recent logs: ${JSON.stringify(sim.logs.slice(-8))}`);
+}
+
 try {
     writeFileSync(path.join(scratch, "LEVEL.WAD"), wad(level()));
     checkUseTrace();
     const sim = build();
     assertMusicLanes(sim);
+    checkCueConductor(sim);
+    checkCommonCuePulses(sim);
+    checkFastWeaponAndMenuPulses(sim);
     risingEdges(sim, lanes.fire, [], 24); // let initialization settle before observing player input
 
     untilRises(sim, lanes.blockedUse, use, "locked use emits the blocked-use Music Arrow cue");
@@ -382,7 +527,8 @@ try {
     // R would normally produce several pistol sound requests in this interval.
     risingEdges(sim, lanes.fire, toggleAudio, 3);
     risingEdges(sim, lanes.fire, [], 8);
-    assert.deepEqual(risingEdges(sim, lanes.fire, fire, 140), [], "muted Music Arrow lane stays silent while firing");
+    const pistolOutputs = [...lanes.fire, ...cueAccents(weapons[0])];
+    assert.deepEqual(risingEdges(sim, pistolOutputs, fire, 140), [], "both weapon banks and their accents stay silent while muted");
     risingEdges(sim, lanes.fire, [], 8);
     risingEdges(sim, lanes.fire, toggleAudio, 3);
     risingEdges(sim, lanes.fire, [], 8);
@@ -397,10 +543,13 @@ try {
     if (values.upstream) checkNativeSoundActions(path.resolve(root, values.upstream));
     checkActorSoundCues();
     checkWeaponTimbres();
-    console.log("Seven fixed Music Arrows retained their tones. The compiled pulse circuit matched 1,024 phase sequences at seven host ticks of latency.");
+    checkSimultaneousCues();
+    console.log("Seven common cue lanes delivered every request in one host tick across 1,024 sequences per lane.");
+    console.log("Sixteen weapon and five menu lanes fired in one host tick, with same-tick accents and alternating banks for consecutive requests.");
+    console.log("Cue dispatch wrote no idle or repeated signals and resynchronized without replaying cues on clock jumps.");
     console.log("Six use traces matched Doom wall/portal behavior. The preview routed blocked-use, locked-use, fire, and pickup cues through Music Arrows.");
     console.log(`Actor sounds matched ${soundCases.length} sound, origin, and random-index traces. The preview emitted landing, pain, and death cues through Music Arrows.`);
-    console.log("The weapon Music Arrow emitted pistol, shotgun, super shotgun, open, load, close and reselected pistol tones.");
+    console.log("The preview emitted distinct weapon and reload tones, and simultaneous pistol, shotgun, mechanism, and menu cues.");
 } finally {
     assert.match(path.relative(temp, realpathSync(scratch)), /^fletcher-preview-music-arrows-[^/\\]+$/);
     rmSync(scratch, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });

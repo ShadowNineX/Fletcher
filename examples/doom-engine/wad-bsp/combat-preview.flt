@@ -29,7 +29,7 @@ type PreviewCombat struct {
     RespawnMonsters bit
     Cues bits<8>
     LastSound int
-    WeaponSound int
+    WeaponRequests bits<16>
     Changed bit
     Failed bit
 }
@@ -76,7 +76,7 @@ func cuePreviewActorSound(scene PreviewCombat, sound int, origin int) PreviewCom
     cue := previewActorCue(scene.Level, scene.World.Actors, sound, origin)
     if cue != 0 {
         scene.LastSound = sound
-        if cue == cueWeapon { scene.WeaponSound = sound }
+        if cue == cueWeapon { scene.WeaponRequests = scene.WeaponRequests | weaponCueRequest(sound) }
         scene.Cues = scene.Cues | cue
     }
     return scene
@@ -196,20 +196,24 @@ func tickPreviewWeapon(base wad.BspLevel, scene PreviewCombat, blocks wad.BlockM
     return scene
 }
 
-func tickPreviewActor(scene PreviewCombat, blocks wad.BlockMapInfo, handle int, levelTime int) PreviewCombat {
-    before := scene.World.Actors.ActorAt(handle - 1)
+func canTickPreviewActorTimer(before play.LevelActor) bit {
     // With neither XY nor Z movement, P_MobjThinker only decrements this
     // positive timer. At one tic the state can run an action or remove the actor.
-    if before.Valid && before.Tics > 1 && !before.Physics.Body.Player &&
+    return before.Valid && before.Tics > 1 && !before.Physics.Body.Player &&
         before.Physics.Body.Flags & (play.ActorPickup | play.MoveSkullFly) == 0 &&
         before.Physics.MomentumX == 0 && before.Physics.MomentumY == 0 && before.Physics.MomentumZ == 0 &&
-        before.Physics.Body.Z == before.Physics.Body.Floor {
-        before.Tics = before.Tics - 1
-        scene.World.Actors = scene.World.Actors.WithActor(handle, before)
-        scene.Changed, scene.Failed = true, false
-        scene.FirstActive = firstObservedMapActor(scene.World.Actors, handle, scene.MapActors, scene.FirstActive)
-        return scene
-    }
+        before.Physics.Body.Z == before.Physics.Body.Floor
+}
+
+func tickPreviewActorTimer(actors play.MapActors, actor play.LevelActor, handle int, mapActors int, firstActive int) (play.MapActors, int) {
+    // A countdown preserves the current sprite and links. The roster still
+    // commits, and the expiring state takes the full thinker path next tic.
+    actor.Tics = actor.Tics - 1
+    updated := actors.WithActor(handle, actor)
+    return updated, firstObservedMapActor(updated, handle, mapActors, firstActive)
+}
+
+func tickPreviewActor(scene PreviewCombat, blocks wad.BlockMapInfo, handle int, levelTime int, before play.LevelActor) PreviewCombat {
     rules := scene.Rules
     step := play.BeginMobjTick(scene.Level, blocks, scene.World, handle, levelTime, scene.RespawnMonsters, rules)
     for range actorinfo.ActorStateCount {
@@ -273,9 +277,13 @@ func tickPreviewMapActors(step PreviewMapActorStep, blocks wad.BlockMapInfo, lev
                     frame = frame.TickBefore(passive, handle)
                     if frame.Failed { scene.Failed = true; return PreviewMapActorStep{Combat: scene} }
                     scene.World.Actors, scene.World.Links = frame.Actors, frame.Links
+                    actor = scene.World.Actors.ActorAt(handle - 1)
                 }
                 if frame.Cursor < passive.Count && passive.HandleAt(frame.Cursor) == handle { frame.Cursor = frame.Cursor + 1 }
-                scene = tickPreviewActor(scene, blocks, handle, levelTime)
+                if canTickPreviewActorTimer(actor) {
+                    scene.World.Actors, scene.FirstActive = tickPreviewActorTimer(scene.World.Actors, actor, handle, scene.MapActors, scene.FirstActive)
+                    scene.Failed = false
+                } else { scene = tickPreviewActor(scene, blocks, handle, levelTime, actor) }
                 if scene.Failed { return PreviewMapActorStep{Combat: scene} }
             }
         }
@@ -320,9 +328,13 @@ func tickPreviewDynamicThinkers(scene PreviewCombat, blocks wad.BlockMapInfo, le
                 PickupSound: moverFrame.PickupSound, PickupMessage: moverFrame.PickupMessage, Sounds: moverFrame.Sounds}
         }
         if handle > 0 && (!sector.Valid || scene.World.Actors.TransientOrder(handle) < sector.Order) {
-            if scene.World.Actors.ActorAt(handle - 1).Valid {
+            actor := scene.World.Actors.ActorAt(handle - 1)
+            if actor.Valid {
                 scene.World.Actors = scene.World.Actors.WithSectorOrder(scene.Specials)
-                scene = tickPreviewActor(scene, blocks, handle, levelTime)
+                if canTickPreviewActorTimer(actor) {
+                    scene.World.Actors, scene.FirstActive = tickPreviewActorTimer(scene.World.Actors, actor, handle, scene.MapActors, scene.FirstActive)
+                    scene.Failed = false
+                } else { scene = tickPreviewActor(scene, blocks, handle, levelTime, actor) }
                 scene.Specials = scene.Specials.WithActorOrder(scene.World.Actors)
                 previous = handle
             } else {

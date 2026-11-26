@@ -2,6 +2,35 @@ package main
 
 import "engine"
 
+type PreviewProjection struct {
+    Width int
+    LowDetail bit
+    AnglesReady bit
+    View engine.ViewProjection
+    Angles [engine.MaxViewWidth]bits<32>
+    PlaneDistanceScales [engine.MaxViewWidth]int
+}
+
+// Box the table so the BSP walker can share it while copying its geometry.
+type PreviewProjectionRef interface {
+    Read() PreviewProjection
+}
+
+func (projection PreviewProjection) Read() PreviewProjection { return projection }
+
+func buildPreviewProjection(width int, lowDetail bit, textured bit) PreviewProjection {
+    var view engine.ViewProjection
+    if lowDetail {
+        view = engine.NewLowDetailProjection(width)
+    } else { view = engine.NewViewProjection(width) }
+    projection := PreviewProjection{Width: width, LowDetail: lowDetail, View: view, AnglesReady: textured}
+    if textured {
+        projection.Angles = previewAnglesForView(view)
+        projection.PlaneDistanceScales = engine.PlaneDistanceScales(view.Width, projection.Angles)
+    }
+    return projection
+}
+
 // The preview projection stays fixed at 128 columns. These are the first
 // 128 results of engine.ViewColumnAngles(engine.NewViewProjection(128)).
 // Sharing the immutable table leaves room for player movement in a frame tick.

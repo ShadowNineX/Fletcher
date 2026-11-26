@@ -32,13 +32,23 @@ function run(exe, args) {
 
 function fletcherRows() {
     const main = path.join(scratch, "main.flt"), map = path.join(scratch, "map.json");
+    writeFileSync(path.join(scratch, "zero-deltas.bin"), Buffer.alloc(maskCount * 3));
     writeFileSync(main, `package main
 import "play"
 const Tests = [${conditions.length}][3]int{${conditions.map(row => `[3]int{${row.join(", ")}}`).join(", ")}}
+const ZeroDeltas = readFile("zero-deltas.bin")
 map "Player command" {
     screen at (0, 0) size (1, 1) with { style = "solid", hold = true, slice = true }
     tick {
         row := currentTick()
+        if row == 0 {
+            var noKeys play.PlayerMoveKeys
+            for axis := range 3 {
+                axes := play.PlayerMoveAxes{Forward: axis == 0, Turn: axis == 1, Sidestep: axis == 2}
+                command, held := play.BuildPlayerMoveCommandWithTable(noKeys, 0, 0, 0, axes, ZeroDeltas)
+                log("axis-default", command.Forward, command.Side, command.Turn, held)
+            }
+        }
         sample := Tests[row / ${maskCount}]
         keys := bits<${inputs.length}>(row)
         move := play.PlayerMoveKeys{${inputs.map((field, index) => `${field}: keys[${index}]`).join(", ")}}
@@ -48,9 +58,13 @@ map "Player command" {
 }`);
     run("dotnet", [cli, "build", main, "--package-root", port, "-o", map]);
     const sim = simulator(decode(JSON.parse(readFileSync(map, "utf8")).data), true);
-    for (let host = 0; host < 3 * caseCount && sim.logs.length < caseCount; host++) sim.step();
-    assert.equal(sim.logs.length, caseCount);
-    return sim.logs.map(row => Array.from(row, Number));
+    for (let host = 0; host < 3 * caseCount && sim.logs.length < caseCount + 3; host++) sim.step();
+    const [forward, turn, side, ...rows] = sim.logs.map(row => Array.from(row));
+    assert.deepEqual([forward, turn, side], [
+        ["axis-default", 25, 0, 0, 0], ["axis-default", 0, 0, 320, 0], ["axis-default", 0, -24, 0, 0],
+    ]);
+    assert.equal(rows.length, caseCount);
+    return rows.map(row => row.map(Number));
 }
 
 function nativeRows(upstream) {

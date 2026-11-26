@@ -91,9 +91,17 @@ func ScaleFromAngle(camera Camera, wall WallDistance, visibleAngle bits<32>) int
 
 func ScaleWallSpan(camera Camera, wall WallDistance, span ColumnSpan) WallScale {
     if !validSpan(span) || span.End > camera.View.Width { return WallScale{} }
-    start := ScaleFromAngle(camera, wall, camera.Heading + AngleForColumn(camera.View, span.First))
+    first := AngleForColumn(camera.View, span.First)
+    if span.End - span.First == 1 { return ScaleWallSpanFromAngles(camera, wall, span, first, first) }
+    return ScaleWallSpanFromAngles(camera, wall, span, first, AngleForColumn(camera.View, span.End - 1))
+}
+
+// The renderer already has the inverse projection table for wall texturing.
+// Read the two endpoints from that table instead of inverting them per span.
+func ScaleWallSpanFromAngles(camera Camera, wall WallDistance, span ColumnSpan, first bits<32>, last bits<32>) WallScale {
+    start := ScaleFromAngle(camera, wall, camera.Heading + first)
     width := span.End - span.First - 1
     if width == 0 { return WallScale{First: start, Last: start} }
-    stop := ScaleFromAngle(camera, wall, camera.Heading + AngleForColumn(camera.View, span.End - 1))
+    stop := ScaleFromAngle(camera, wall, camera.Heading + last)
     return WallScale{First: start, Last: stop, Step: (stop - start) / width}
 }
