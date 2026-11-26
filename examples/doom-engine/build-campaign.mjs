@@ -4,11 +4,13 @@ import { cpSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, sta
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
+import { benchmarkEdits } from "./campaign-benchmark.mjs";
 import { nativeColormap } from "./native-colormap.mjs";
 
 const { values } = parseArgs({ options: {
     wad: { type: "string" }, output: { type: "string" }, cli: { type: "string" }, muted: { type: "boolean" },
     resolution: { type: "string", default: "160x120" }, "arrow-colormap": { type: "boolean" },
+    benchmark: { type: "boolean" },
 } });
 assert.ok(values.wad, "Pass --wad PATH to the supplied Doom IWAD");
 assert.ok(["160x120", "320x200"].includes(values.resolution), "--resolution must be 160x120 or 320x200");
@@ -20,7 +22,8 @@ const engine = import.meta.dirname;
 const repo = resolve(engine, "../..");
 const cli = resolve(values.cli ?? join(repo, "src/Fletcher.Cli/bin/Debug/net11.0/fletcher.dll"));
 const highResolution = width === 320;
-const mapName = `Doom Campaign${highResolution ? " 320x200" : ""}${values["arrow-colormap"] ? " Arrow COLORMAP" : ""}`;
+const mapName = "Doom Campaign" + (highResolution ? " 320x200" : "") +
+    (values["arrow-colormap"] ? " Arrow COLORMAP" : "") + (values.benchmark ? " FPS Benchmark" : "");
 const filename = mapName.toLowerCase().replaceAll(" ", "-") + ".json";
 const output = resolve(values.output ?? join(repo, "artifacts/doom-engine", filename));
 const scratch = mkdtempSync(join(tmpdir(), "fletcher-doom-campaign-"));
@@ -48,8 +51,9 @@ try {
     edit(main, [
         [/^const Archive = readFile\("LEVEL\.WAD"\)\r?$/gm, `const Archive = readFile(${JSON.stringify(basename(wad))})`],
         [/^map "Original WAD BSP View" \{\r?$/gm, `map ${JSON.stringify(mapName)} {`],
-        [/^    register soundMuted bit = false\r?$/gm, `    register soundMuted bit = ${Boolean(values.muted)}`],
+        [/^    register soundMuted bit = false\r?$/gm, `    register soundMuted bit = ${Boolean(values.muted || values.benchmark)}`],
     ]);
+    if (values.benchmark) edit(main, benchmarkEdits);
     if (values["arrow-colormap"]) {
         const { layout, offset, size } = nativeColormap(readFileSync(wad));
         edit(main, [

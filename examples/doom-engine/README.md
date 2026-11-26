@@ -102,6 +102,14 @@ Use `--resolution 320x200` to build **Doom Campaign 320x200** at Doom's original
 
 Add `--arrow-colormap` to build a separate campaign with the supplied WAD's lighting translation table stored in physical arrows. Find the board labeled **COLORMAP** to the left of the screen. The renderer uses the WAD directly during startup, then switches to the table read from the arrows. This option adds about 168,000 tiles for the supplied Doom WAD. It has no established desktop frame-rate gain.
 
+### Measure E1M1 gameplay
+
+```powershell
+node examples/doom-engine/build-campaign.mjs --wad 'C:\path\to\DOOM.WAD' --benchmark
+```
+
+Open **Doom Campaign FPS Benchmark** in windowed Logic Arrows. Set the tick rate to **Unlimited**, enable **Key mode**, and start **Knee-Deep in the Dead** on **Hurt Me Plenty**. Leave the default zoom and graphics settings in place and release the controls after starting the level. The muted map waits until level tic 320, then runs a fixed sequence of walking, reversing, and turning. It displays the elapsed time, host ticks, and FPS for 120 completed gameplay frames. Reopen the map to repeat the run.
+
 ## Preview an original level
 
 The wireframe sample reads the first classic Doom-format level in an original `LEVEL.WAD` PWAD. It uses `LINEDEFS` and `VERTEXES` to draw a top-down view. White lines are one-sided and blue lines are two-sided. The archive stays at `--asset-root` and the generated Level file embeds it in the zlib-compressed map data. The preview has a 256-linedef limit and checks the raster work before drawing a frame.
