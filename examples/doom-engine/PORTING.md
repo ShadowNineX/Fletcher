@@ -452,7 +452,9 @@ A local CPU capture covered the 120-frame E1M1 run in the installed x64 Logic Ar
 
 ## Arrow and script performance review
 
-`node tests/doom-native-wall-stream.mjs` builds a separate pure-arrow wall-phase board. The phase and step live in physical T flip-flops. After one seed and start pulse, a physical clock and carry circuit advance the 23-bit phase and emit seven row bits. The 873-tile board contains zero Script Blocks. It matched six signed and wraparound cases and the two-button route. With `--packets PATH`, it also matched 2,048 captured E1M1 phases over 216 seeded streams. The current feedback layout emits one row per 216 host ticks. The in-game check is pending.
+`node tests/doom-native-wall-stream.mjs` builds two pure-arrow wall-phase boards. On the 821-tile board, physical T flip-flops hold the phase and step. After one seed and start pulse, a physical clock and carry circuit advance the 23-bit phase and emit seven row bits with a valid pulse. The first sample takes 125 host ticks, then the circuit emits one row every eight ticks. The first design took 216 ticks per row. The simulator matched six signed and wraparound cases and the two-button route. With `--packets PATH`, it also matched 2,048 captured E1M1 phases over 216 seeded streams.
+
+The 7,289-tile board staggers eight copies using a physical launch bus. The simulator seeds each lane once, presses the shared start button, and observes separate row and valid outputs for each lane. After all lanes start, exactly one lane produced the correct row on each of 120 consecutive host ticks. Both boards contain zero Script Blocks. These tests cover texture row selection. The campaign has no arrow-based phase seeding or texture sampling path for these boards yet, and in-game performance is unmeasured.
 
 A separate combinational trial used Fletcher's circuit backend to emit four rows from two held input words. It matched 70 batches in settled evaluation and used 282,323 tiles with an explained route delay of 3,403 host ticks.
 
