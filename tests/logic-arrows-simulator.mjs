@@ -108,16 +108,20 @@ export function simulator(tiles, controllerLast = false, onSharedRead, hostMilli
                 setSignal: (x, y, value) => signals.set(x + "," + y, value),
                 setArrow(x, y, type, rotation, flip, extra) {
                     const key = keyOf({ x, y });
-                    assert.ok(type === 25 || type === 29, "the model supports repainting walls and configuring music");
+                    assert.ok(type === 25 || type === 28 || type === 29, "the model supports walls, lamp brightness, and music");
                     const original = tilesByPosition.get(key);
                     assert.equal(original?.type, type, "rewriting must stay on the reserved tile");
                     if (type === 29) assert.equal(original.rotation, rotation, "music voice direction stays fixed");
+                    if (type === 28) {
+                        assert.equal(original.rotation, rotation, "lamp feedback direction stays fixed");
+                        assert.equal(original.extra & 15, extra & 15, "lamp hue stays fixed");
+                    }
                     tilesByPosition.set(key, { x, y, type, rotation, flip, extra });
                     tileWrites++;
                 },
             },
             getPosition: () => ({ x: tile.x, y: tile.y }),
-            game: { focusCamera: (...bounds) => cameraFrames.push(bounds) },
+            game: { focusCamera: (...bounds) => cameraFrames.push(bounds), zoomCamera: () => {} },
             onStart: callback => startup.push(callback),
             onPlayerMouseMove: callback => mouse.push(callback),
             always: callback => callbacks.push(callback),
@@ -134,12 +138,13 @@ export function simulator(tiles, controllerLast = false, onSharedRead, hostMilli
             for (const callback of mouse) callback(x, y);
         },
         setTick(value) { tick = value; },
-        roundTripScriptState() {
-            for (const state of scriptStates) {
-                const restored = JSON.parse(JSON.stringify(state));
+        roundTripScriptState(snapshot = JSON.stringify(scriptStates)) {
+            const restored = JSON.parse(snapshot);
+            for (const [index, state] of scriptStates.entries()) {
                 for (const key of Object.keys(state)) delete state[key];
-                Object.assign(state, restored);
+                Object.assign(state, restored[index]);
             }
+            return snapshot;
         },
         get tileWrites() { return tileWrites; },
         drive(tile, value) {

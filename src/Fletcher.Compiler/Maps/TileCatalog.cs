@@ -10,6 +10,23 @@ public static class TileCatalog
 {
     // The Level key IDs are one-based, with digits following the letters.
     internal const string KeyboardKeys = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    private static readonly string[] ExtendedKeyboardKeys =
+    [
+        "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12",
+        "Space", "Enter", "Tab", "Shift", "Ctrl", "Alt", "Backspace",
+        "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"
+    ];
+
+    internal static int KeyboardKeyId(string name)
+    {
+        if (name.Length == 1)
+            return KeyboardKeys.IndexOf(char.ToUpperInvariant(name[0]));
+        var index = Array.FindIndex(ExtendedKeyboardKeys, key => key.Equals(name, StringComparison.OrdinalIgnoreCase));
+        return index < 0 ? -1 : KeyboardKeys.Length + index;
+    }
+
+    internal static string KeyboardKeyName(ushort id) => id < KeyboardKeys.Length
+        ? KeyboardKeys[id].ToString() : ExtendedKeyboardKeys[id - KeyboardKeys.Length];
 
     private static readonly string[] Colors = Enum.GetNames<TileColor>();
 

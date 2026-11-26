@@ -215,6 +215,8 @@ Use `x := expr` to introduce a local. Use `var x Type` for a zero-initialized lo
 
 Use a constant array for a lookup table. Its elements must be compile-time values. Fletcher stores a table once per script controller, packs large integer tables when packing makes the script smaller, folds indexing with a constant offset, and makes a value copy when you assign it to a mutable local. When a controller exceeds the per-tile payload limit, Fletcher retries with its packed table data on automatically placed Script Blocks.
 
+Script controllers check dynamic array and bit indices at runtime when their bounds are unknown. Fletcher can omit a check when every possible index fits. For example, an unsigned byte fits a 256-element array, and the index from `for i := range 16` fits a 16-element array if the loop leaves `i` unchanged.
+
 ```fletcher
 const intensities = [4]int{0, 25, 75, 100}
 
@@ -257,6 +259,9 @@ Integer ranges go from zero up to the bound. A nonpositive bound runs zero times
 ## Map logic
 
 - `input name bit` creates a button that toggles a held signal. Add `with { key = "W" }` or `with { key = "1" }` to a `bit` input to receive a one-tick pulse from a letter or top-row digit in the game's Key mode. `output name bit = expr` creates a lamp. Both ports accept vector types for ordinary signals and optional `at (x, y)` anchors.
+- `input name bit at (x, y) with { tap = true }` reads a tile you placed at that coordinate. For a `bits<N>` tap, place one tile per lane, starting at `(x, y)` and advancing eight rows per bit from least significant to most significant. Set `tapPitch` to match a different row spacing in a manual circuit. On a sliced map, add `buffer = true` to a single-bit tap to keep positive signals that arrive between logical ticks.
+- `input moving bit at (x, y) with { keys = "WS", combine = "xor", buffer = true }` emits two physical keys and an XOR at the anchor. Use `keys = "WASD"` with the default OR to connect up to four keys to a Blue Arrow. The compiler samples the gate on the same host tick as individual key inputs. With buffering enabled, the result is true if the gate fired on any host tick since the previous logical sample.
+- A buffered OR group with `gateReads = true` lets the compiler skip signal reads while the group's physical Blue Arrow is idle. On sliced screens it can guard buffered individual keys and buffered OR or XOR groups whose keys all belong to that OR group. The guard must be read by a script tick.
 - `wire name Type = expr` defines a value shared by expressions and tick code. A wire can be referenced before its declaration. Combinational cycles are errors.
 - `register name Type = constant` declares storage for `bit`, `bits<N>`, `int`, `string`, `bytes`, `color`, interfaces, and fixed arrays or structs built from those types. A `bytes` value retains a read-only reference to the imported file. An interface retains the concrete value as it was at conversion. In `tick { ... }`, use `next name = expr` to stage a whole register value. To update a field, copy the register to a local, edit the local, then stage it. Each `next` captures the value when it runs. Reads see the old value throughout the tick. Unwritten registers keep their value. If a register receives multiple updates, its last executed `next` wins.
 - The compiler tries native routing for ordinary bindings. `circuit { ... }` requires native lowering for its outputs and wires. `script { ... }` forces those bindings to become JavaScript. Both blocks contain Fletcher expressions.
@@ -267,17 +272,26 @@ Integer ranges go from zero up to the bound. A nonpositive bound runs zero times
 
 - `screen at (x, y) size (width, height)` reserves a rectangular pixel grid. The default `style = "lamp"` uses bright green lamps. Choose red, blue, yellow, green, orange, or purple with `color`, and set `bright` with a bit. A `style = "solid"` screen supports white foreground pixels. Both styles use the [Logic Arrows Level limits](./logic-arrows.md#map-files).
 
+Solid screens accept `scale`, a positive integer that defaults to 1. For example, `size (32, 24)` with `scale = 4` reserves 128×96 tiles and paints each logical pixel as a 4×4 square. Drawing, palette indices, and captured frames use the logical pixel dimensions.
+
+Use `style = "arrows"` for a screen built from physical circuits. Each logical pixel occupies a 4×4 tile square with red, blue, green, and yellow lamp columns. Fletcher emits a pulse only when a column changes. A native T flip-flop holds each bit, and the last lamp sees the update three game ticks after the pulse. White, orange, and purple use combinations of lamp colors. Arrow screens share the solid screen’s drawing, palette-index, capture, `hold`, and `slice` APIs.
+
 `pixel(x, y, on)` draws with the screen's configured foreground at screen-local `int` coordinates. On solid screens, use `pixel(x, y, on, shade)` to choose a `color` per pixel. For example, `pixel(4, 2, true, color.Blue)` paints a blue pixel. Draw each frame from `tick` or a script function it calls. Out-of-bounds writes are clipped, and omitted or off pixels return to the background. In the Hello Screen example, click the button to alternate between text and a moving shape that changes color.
 
 On a solid screen, `pixel(x, y, on, shade, index)` can store a source index between 0 and 255 for the current frame. A write clears the earlier index if it omits the index, turns the pixel off, or supplies an out-of-range index. `pixelIndexAt(x, y)` returns the most recent index written there in the current frame, or `-1` for an unindexed or out-of-bounds position. The indices stay in a transient buffer across slices of a logical tick and reset when the next logical tick starts.
 
 Call `preserveScreen()` before drawing an overlay on a solid screen to start from the last committed tile colors. This clears the transient source indices. Paint the overlay with `pixel()` in the same tick.
+Use `preserveScreen(firstRow, rowCount)` to copy only a row range from the previous frame. Fletcher clips the range to the screen and clears the transient source indices in those rows.
 
 `captureScreen(true)` returns the last committed solid-screen frame as a packed string. `captureScreen(false)` captures the current staged frame. To display a transition, pass two captures to `revealScreen(start, end, rows, columnsPerOffset)`. Each entry in the integer array `rows` sets how many rows of the end frame are visible from the top of its column group. The old frame shifts down by that amount in the same group. The result commits with the rest of the logical tick.
 
 Add `hold = true` to a solid screen to keep its previous frame on ticks with no in-bounds pixel calls. The next draw still starts from the background. A call such as `pixel(0, 0, false)` presents an empty frame if no other pixels are drawn that tick.
 
 Add `slice = true` to a solid screen to let a logical Fletcher tick suspend and resume across game ticks. Function calls and loop iterations provide points where a long tick can yield. `currentTick()` counts completed logical ticks from zero. Inputs and mouse coordinates are sampled when a logical tick starts. The screen, registers, logs, and scripted outputs become visible on completion. Scripted output drivers keep publishing the last committed values during a pause. A discontinuity in game ticks discards any unfinished tick.
+
+With slicing enabled, `sliceWork` sets how many work checkpoints may run in one host tick. A larger value can finish a frame in fewer game ticks and spends more time inside each callback. `sliceWork = 0` selects the automatic budget.
+
+When a statically resolved call replaces an exclusively owned local value with its result, a sliced controller can reuse that value's storage. For example, `frame = draw(frame)` can avoid a defensive copy. A return such as `return draw(frame)` can also reuse the storage when the local is finished. Other arguments, assignment destinations, and sibling return values must be independent of the transferred value. The same checkpoints still govern the call.
 
 Use `publish notes [8]bits<13> = packets` to share a named signal or a fixed array of signals with other script tiles on the map. `publish` runs as a script binding and consumes no lamp or driver tiles. It evaluates from the same tick snapshot as an ordinary output. Its value enters the shared frame when that tick commits. See the [script frame reader](./logic-arrows.md#published-script-bindings).
 
@@ -286,6 +300,8 @@ On a sliced screen, `host tick { ... }` runs after each host slice, including sl
 Use `publish host notes [8]bits<13> = packets` for named signals sampled at the start of each host block. `currentTick()` returns the game host tick while that block and its functions run. The script builtin `hostTimeMillis()` exposes the low 32 bits of the host wall clock in milliseconds. Integer subtraction gives elapsed milliseconds across wraparound for intervals shorter than about 24 days.
 
 Set `with { key = "P", buffer = true }` on a keyboard `bit` input to remember short presses between logical ticks on a sliced screen. The next logical tick sees whether the key was pressed since the previous sample. Multiple presses in that interval share one sample. A discontinuity in game ticks clears pending presses.
+
+Named keys include `F1` through `F12`, `Space`, `Enter`, `Tab`, `Shift`, `Ctrl`, `Alt`, `Backspace`, and the four names `ArrowUp`, `ArrowDown`, `ArrowLeft`, and `ArrowRight`. Use spaces between names in a group such as `keys = "R Ctrl"`. The compact spelling `keys = "AD"` still selects individual letter keys.
 
 The [Raycaster example](../examples/raycaster/main.flt) frames its 192×108 view and starts with an automatic camera pan. Click the orange button below **M** to switch to manual view, **L** or **R** to turn, and **F** to walk. Click **P** to toggle mouse-look. With **M** and the game's **Key mode** enabled, tap **W/S** to step forward or back and **A/D** to turn. The bottom-right speed bar sets the simulation rate. The renderer uses 256 headings and keeps the last frame until the camera moves or turns.
 

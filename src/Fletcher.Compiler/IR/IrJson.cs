@@ -32,7 +32,8 @@ internal static class IrJson
             var functions = program.Functions.OrderBy(function => function.Id).Select(DescribeFunction).ToArray();
             var ports = program.Ports.Select(port => new
             {
-                symbol = SymbolId(port.Symbol), port.Anchor, port.Key, port.Buffer, port.Forward, port.LampStyle
+                symbol = SymbolId(port.Symbol), port.Anchor, port.Key, port.Buffer, port.Forward, port.LampStyle, port.Tap, port.Keys,
+                port.TapPitch, port.OutputPitch
             }).ToArray();
             var bindings = program.Bindings.Select(binding => new
             {
@@ -79,7 +80,8 @@ internal static class IrJson
                 screen = program.Screen is { } screen ? new
                 {
                     background = DescribeTile(screen.Background), screen.Width, screen.Height,
-                    screen.Foreground, screen.Hold, screen.Slice
+                    screen.Foreground, screen.Hold, screen.Slice, screen.Scale, screen.ArrowDisplay, screen.SliceWork, screen.RgbDisplay,
+                    screen.RgbLamps
                 } : null,
                 tick,
                 hostTick,

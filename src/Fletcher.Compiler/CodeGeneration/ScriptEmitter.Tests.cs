@@ -17,6 +17,7 @@ internal sealed partial class ScriptEmitter
             const world = { getTick: () => __noGame("currentTick()") };
             function __pixel() { __noGame("pixel()"); }
             function __pixelIndexAt() { return __noGame("pixelIndexAt()"); }
+            function __screenPalette() { __noGame("screenPalette()"); }
             function __noGame(name) { throw new Error(name + " requires a running map"); }
             let __passed = 0, __failed = 0;
             function __runTest(name, location, run) {
@@ -63,6 +64,9 @@ internal sealed partial class ScriptEmitter
             }
             """);
         Function[] reachable = [.. ReachableFunctions([])];
+        AnalyzeIndexBounds(reachable.Select(function => function.Body).Concat(program.Tests.Select(test => test.Body)));
+        TrackStructFieldOrder(reachable.SelectMany(function => BoundTree.StructLiterals(function.Body))
+            .Concat(program.Tests.SelectMany(test => BoundTree.StructLiterals(test.Body))));
         AnalyzeOwnedResults(reachable);
         foreach (var function in reachable)
             EmitFunction(function);

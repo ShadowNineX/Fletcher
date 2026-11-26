@@ -58,14 +58,33 @@ internal sealed class Function(int id, string name, Variable[] parameters, DataT
 internal enum Backend { Auto, Circuit, Script }
 
 internal sealed record Binding(Variable Symbol, BoundExpression Value, Backend Backend, bool Published = false, bool HostPublished = false);
+internal sealed record KeyboardGroup(ImmutableArray<ushort> KeyIds, bool Exclusive, bool GateReads);
 internal sealed record Port(Variable Symbol, Position? Anchor, ushort? Key = null, bool Buffer = false,
-    byte? Forward = null, ushort? LampStyle = null);
+    byte? Forward = null, ushort? LampStyle = null, bool Tap = false, KeyboardGroup? Keys = null, int? TapPitch = null,
+    int? OutputPitch = null);
 internal sealed record Register(Variable Symbol, BoundExpression Initial);
-internal sealed record Screen(Tile Background, int Width, int Height, ushort Foreground, bool Hold = false, bool Slice = false)
+internal readonly record struct RgbLampPair(Position First, byte Facing, Position Second, byte Opposite, ushort Signal);
+internal sealed record Screen(Tile Background, int Width, int Height, ushort Foreground, bool Hold = false, bool Slice = false,
+    int Scale = 1, bool ArrowDisplay = false, int SliceWork = 0, bool RgbDisplay = false, bool RgbLamps = false)
 {
+    public const int ArrowDisplayScale = 4;
+    public const int RgbDisplayScale = 2;
+    public const int RgbLampScale = 3;
+    public const byte ForwardingLampType = 28;
+    public const ushort BrightLampFlag = 16;
+    public static IReadOnlyList<RgbLampPair> LampPairs { get; } =
+    [
+        new(new Position(0, 0), 1, new Position(1, 0), 3, (ushort)TileColor.Red),
+        new(new Position(2, 0), 2, new Position(2, 1), 0, (ushort)TileColor.Green),
+        new(new Position(0, 1), 2, new Position(0, 2), 0, (ushort)TileColor.Blue),
+        new(new Position(1, 2), 1, new Position(2, 2), 3, (ushort)TileColor.Green),
+    ];
+    public bool UsesRgbPalette => RgbDisplay || RgbLamps;
     public bool IsSolid => Background.Type == 25;
     public bool IsSliced => IsSolid && Slice;
     public int PixelCount => Width * Height;
+    public int TileWidth => Width * Scale;
+    public int TileHeight => Height * Scale;
 }
 
 internal sealed record IrProgram(
@@ -160,6 +179,10 @@ internal static class BoundTree
 
     public static bool UsesMouse(BoundStatement? statement) => RootExpressions(statement).Any(UsesMouse);
     public static bool UsesMouse(BoundExpression expression) => Descendants(expression).Any(item => item is BoundMousePosition);
+    public static IEnumerable<BoundStruct> StructLiterals(BoundStatement? statement) =>
+        RootExpressions(statement).SelectMany(StructLiterals);
+    public static IEnumerable<BoundStruct> StructLiterals(BoundExpression expression) =>
+        Descendants(expression).OfType<BoundStruct>();
     public static bool UsesPixelIndices(BoundStatement? statement) => RootExpressions(statement).Any(UsesPixelIndices);
     public static bool UsesPixelIndices(BoundExpression expression) => Descendants(expression).Any(item => item is BoundPixelIndexAt);
 
@@ -167,7 +190,8 @@ internal static class BoundTree
         Statements(statement).OfType<BoundNext>().Select(next => next.Register);
 
     public static bool UsesScreenOrMouse(BoundStatement? statement) =>
-        Statements(statement).OfType<BoundEffect>().Any(effect => effect.Kind is EffectKind.Pixel or EffectKind.PreserveScreen or EffectKind.RevealScreen) ||
+        Statements(statement).OfType<BoundEffect>().Any(effect =>
+            effect.Kind is EffectKind.Pixel or EffectKind.ScreenPalette or EffectKind.PreserveScreen or EffectKind.RevealScreen) ||
         RootExpressions(statement).Any(UsesScreenOrMouse);
 
     public static bool UsesScreenOrMouse(BoundExpression expression) =>

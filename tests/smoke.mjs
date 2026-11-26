@@ -451,6 +451,12 @@ func firstOf(pairs [1]Pair) Pair {
 }
 func values(pair Pair) [2]int { local := pair; return local.Values }
 func twice(pair Pair) (Pair, Pair) { local := pair; return local, local }
+func mixed(pair Pair, replace bit) (Pair, Pair) {
+    if replace { return fresh(39), pair }
+    local := pair
+    local.Values[0] = 38
+    return local, pair
+}
 
 map "Returned snapshots" {
     tick {
@@ -468,20 +474,135 @@ map "Returned snapshots" {
         nested[0] = 31
         left, right := twice(original)
         left.Values[1] = 32
+        owned, sourceCopy := mixed(original, false)
+        owned.Values[1] = 40
+        sourceCopy.Values[0] = 41
         log(original.Values[0], original.Values[1], modified.Values[0], modified.Values[1],
             borrowed.Values[0], slots.Left.Values[1], slots.Right.Values[1], element.Values[1], pairs[0].Values[1],
             nested[0], left.Values[1], right.Values[1])
+        log(owned.Values[0], owned.Values[1], sourceCopy.Values[0], sourceCopy.Values[1])
+        owned, sourceCopy = mixed(original, true)
+        sourceCopy.Values[1] = 42
+        log(owned.Values[0], owned.Values[1], sourceCopy.Values[1], original.Values[1])
     }
 }
 `;
     const resultCopies = build("returned-snapshots", writeSource("returned-snapshots", resultProgram));
     const resultScript = resultCopies.data.find(tile => tile.payload?.includes("function __f"))?.payload.toString() ?? "";
-    assert.match(resultScript, /const __t\d+ = __f\d+\(2\);/, "a freshly allocated result enters its caller without a copy");
+    assert.match(resultScript, /let v\d+ = __f\d+\(2\);/, "a freshly allocated result enters its caller without a copy");
+    assert.match(resultScript, /const (v\d+) = __f\d+\(v\d+, false\);\s+const __t\d+ = \(\1\)\["item0"\];\s+const __t\d+ = __copy\d+\(\(\1\)\["item1"\]\);/,
+        "a multi-result call copies only its borrowed result");
     const copiedResults = simulator(resultCopies.data);
     copiedResults.step();
-    const snapshots = [[2, 4, 7, 19, 21, 23, 4, 26, 4, 31, 32, 4]];
+    const snapshots = [[2, 4, 7, 19, 21, 23, 4, 26, 4, 31, 32, 4], [38, 40, 41, 4], [39, 4, 42, 4]];
     assert.deepEqual(copiedResults.logs, snapshots,
         "owned results transfer, while borrowed branches, shared fields, and array elements preserve snapshots");
+
+    const ownFields = build("struct-own-fields", writeSource("struct-own-fields", `
+type Fields struct { __proto__ [1]int; constructor int; toJSON int }
+func increment(value Fields) Fields {
+    value.__proto__[0] = value.__proto__[0] + 1
+    return value
+}
+map "Struct own fields" {
+    screen at (0, 0) size (1, 1) with { style = "solid", slice = true }
+    register saved Fields = Fields{toJSON: 9, constructor: 5, __proto__: [1]int{2}}
+    register clock int = 0
+    host tick { next clock = clock + 1 }
+    tick {
+        updated := increment(saved)
+        log(saved.__proto__[0], updated.__proto__[0], updated.constructor, updated.toJSON)
+        next saved = updated
+    }
+}
+`));
+    const ownFieldState = simulator(ownFields.data);
+    ownFieldState.step();
+    const checkpoint = ownFieldState.roundTripScriptState();
+    const savedState = JSON.parse(checkpoint);
+    const serialized = savedState.find(state => typeof state.reg === "string").reg;
+    assert.ok(serialized.split("\n").includes('{"toJSON":9,"constructor":5,"__proto__":[3]}'),
+        "struct copies preserve keyed field order and serialize special property names as own fields");
+    ownFieldState.step();
+    ownFieldState.roundTripScriptState(checkpoint);
+    ownFieldState.setTick(1);
+    ownFieldState.step();
+    assert.deepEqual(ownFieldState.logs, [[2, 3, 5, 9], [3, 4, 5, 9], [3, 4, 5, 9]],
+        "a special field stays independently mutable before and after restoring an older snapshot");
+
+    const largeText = "x".repeat(33_000);
+    const registerStorage = build("large-register-storage", writeSource("large-register-storage", `
+const Big = "${largeText}"
+map "Large register storage" {
+    screen at (0, 0) size (1, 1) with { style = "solid", slice = true }
+    register value string = Big
+    register frame int = 0
+    register hostCounter int = 0
+    host tick { next hostCounter = hostCounter + 1 }
+    tick {
+        log(frame, hostCounter, value == Big, value == Big + "!", value == "")
+        if frame == 2 { next value = Big + "!" }
+        if frame == 3 { next value = "" }
+        if frame == 4 { next value = Big }
+        next frame = frame + 1
+    }
+}
+`));
+    const originalStorage = simulator(registerStorage.data);
+    const controller = snapshot => JSON.parse(snapshot).find(state => typeof state.reg === "string");
+    const firstKey = state => "fletcherRegister0" + state.reg[1];
+    originalStorage.step();
+    const firstSave = originalStorage.roundTripScriptState();
+    const firstStored = controller(firstSave);
+    assert.match(firstStored.reg, /^~0:/, "large values use a separate host key");
+    assert.equal(JSON.parse(firstStored[firstKey(firstStored)]), largeText);
+    originalStorage.step();
+    const bankedSave = originalStorage.roundTripScriptState();
+    const bankedState = controller(bankedSave);
+    assert.equal(bankedState.reg.split("\n")[0], firstStored.reg.split("\n")[0], "unchanged large values keep their existing key");
+    originalStorage.step();
+    const changed = controller(originalStorage.roundTripScriptState());
+    assert.match(changed.reg, /^~1:/, "new data goes to the inactive bank");
+    assert.equal(JSON.parse(changed[firstKey(changed)]), largeText + "!");
+    assert.equal(changed[firstKey(firstStored)], firstStored[firstKey(firstStored)], "committing a new bank preserves the previous value");
+    originalStorage.step();
+    const inline = controller(originalStorage.roundTripScriptState());
+    assert.equal(inline.reg.split("\n")[0], '""', "small values go back inline");
+    originalStorage.step();
+    const reused = controller(originalStorage.roundTripScriptState());
+    assert.match(reused.reg, /^~0:/);
+    assert.notEqual(reused.reg.split("\n")[0], firstStored.reg.split("\n")[0], "reusing a bank changes the snapshot token");
+    originalStorage.step();
+    const expected = originalStorage.logs.slice(2);
+    assert.deepEqual(expected, [
+        [2, 2, true, false, false], [3, 3, false, true, false],
+        [4, 4, false, false, true], [5, 5, true, false, false],
+    ]);
+    const inlineSaves = [false, true].map(asArray => {
+        const states = JSON.parse(firstSave);
+        const state = states.find(item => typeof item.reg === "string");
+        const entries = state.reg.split("\n");
+        const key = firstKey(state);
+        entries[0] = state[key];
+        delete state[key];
+        state.reg = asArray ? entries.map(value => JSON.parse(value)) : entries.join("\n");
+        return JSON.stringify(states);
+    });
+    for (const [i, saved] of [bankedSave, ...inlineSaves].entries()) {
+        const resumed = i === 0 ? originalStorage : simulator(registerStorage.data);
+        resumed.logs.length = 0;
+        resumed.roundTripScriptState(saved);
+        if (i !== 0) {
+            resumed.setTick(1);
+            resumed.step();
+            assert.match(controller(resumed.roundTripScriptState()).reg, /^~0:/, "an unchanged legacy value moves out of line");
+            resumed.logs.length = 0;
+        }
+        resumed.setTick(2);
+        for (let tick = 2; tick < 6; tick++) resumed.step();
+        assert.deepEqual(resumed.logs, expected, "rewind and legacy snapshots restore the same register values");
+        assert.match(controller(resumed.roundTripScriptState()).reg, /^~0:/, "restored maps use the current layout");
+    }
 
     const slicedResults = resultProgram
         .replace('map "Returned snapshots" {', 'map "Sliced returned snapshots" {\n    screen at (0, 0) size (1, 1) with { style = "solid", slice = true }')
@@ -492,10 +613,215 @@ map "Returned snapshots" {
     slicedSnapshots.step();
     assert.deepEqual(slicedSnapshots.logs, snapshots, "resuming a composite return preserves snapshot semantics");
 
+    const replacedValues = build("sliced-owned-arguments", writeSource("sliced-owned-arguments", `
+type Buffer struct { Data [2]int }
+type Pair struct { Left Buffer; Right Buffer }
+type Incrementer interface { Increment(amount int) Buffer }
+
+func (buffer Buffer) Increment(amount int) Buffer {
+    buffer.Data[0] = buffer.Data[0] + amount
+    return buffer
+}
+func changeBoth(left Buffer, right Buffer) (Buffer, Buffer) {
+    left.Data[0] = left.Data[0] + 3
+    for range 5100 {}
+    right.Data[0] = right.Data[0] + 6
+    return left, right
+}
+func sharedArguments(target Buffer, previous Buffer) Buffer {
+    target.Data[0] = 90
+    target.Data[1] = previous.Data[0]
+    return target
+}
+func overlappingTarget(value Buffer) (Buffer, int) {
+    value.Data[0] = 50
+    return value, 54
+}
+map "Replace owned values" {
+    screen at (0, 0) size (1, 1) with { style = "solid", slice = true, sliceWork = 5000 }
+    register saved Pair = Pair{Left: Buffer{Data: [2]int{2, 5}}, Right: Buffer{Data: [2]int{7, 3}}}
+    tick {
+        values := saved
+        snapshot := values
+        var boxed Incrementer = values.Left
+        values.Left = values.Left.Increment(1)
+        values.Right = sharedArguments(values.Right, values.Right)
+        values.Left, values.Right = changeBoth(values.Left, values.Right)
+        log(values.Left.Data[0], values.Right.Data[0], values.Right.Data[1])
+        values.Left, values.Left.Data[0] = overlappingTarget(values.Left)
+        log(values.Left.Data[0], saved.Left.Data[0], snapshot.Left.Data[0], saved.Right.Data[0], snapshot.Right.Data[0])
+        boxFirst, boxSecond := boxed.Increment(10), boxed.Increment(20)
+        log(boxFirst.Data[0], boxSecond.Data[0])
+        next saved = values
+    }
+}
+`));
+    const replacementScript = replacedValues.data.find(tile => tile.payload?.includes("function* __tick"))?.payload.toString() ?? "";
+    assert.match(replacementScript, /__ownedArguments & 1/, "the callee can reuse an owned parameter");
+    assert.match(replacementScript, /yield\* __f\d+\(\(v\d+\)\["Left"\], \(v\d+\)\["Right"\], 3\)/,
+        "a parallel assignment transfers both nonoverlapping fields");
+    const replaced = simulator(replacedValues.data);
+    replaced.step();
+    assert.deepEqual(replaced.logs, [], "the moved values belong to the suspended tick");
+    replaced.step();
+    assert.deepEqual(replaced.logs, [[6, 96, 7], [50, 2, 2, 7, 7], [12, 22]],
+        "copied arguments, overlapping destinations, and boxed receivers keep their value semantics");
+
+    const indexBounds = build("script-index-bounds", writeSource("script-index-bounds", `
+func paletteIndex(entry bits<8>) int {
+    values := [256]int{42}
+    return values[int(entry)]
+}
+func readBeforeAssignment(index int) int {
+    array := [2]int{1, 2}
+    value := array[index]
+    index = 0
+    return value
+}
+func changedLoopIndex(index int) int {
+    array := [3]int{1, 2, 3}
+    result := 0
+    for position := range array {
+        position = index
+        result = result + array[position]
+    }
+    return result
+}
+map "Proven indices" {
+    tick {
+        var rows [16]int
+        for index := range 16 { rows[index] = index + 1 }
+        for index := range rows { rows[index] = rows[index] + 1 }
+        raw := currentTick()
+        wrapped := ((raw & 3) << 2) | 3
+        if raw == 1 { log(readBeforeAssignment(raw - 2)) }
+        if raw == 2 { log(changedLoopIndex(raw + 1)) }
+        if raw == 3 {
+            var writeCheck [7]int
+            writeCheck[int(bits<32>(0xfffffffc) + bits<32>(raw))] = 7
+        }
+        var lanes bits<16>
+        lanes[wrapped] = true
+        log(rows[wrapped], lanes[wrapped], paletteIndex(bits<8>(raw)))
+    }
+}
+`));
+    const boundsScript = indexBounds.data.find(tile => tile.payload?.includes("function __index"))?.payload.toString() ?? "";
+    assert.doesNotMatch(boundsScript, /__index\([^\n]+, (?:16|256)\)/, "masked, loop, and byte indices fit their arrays");
+    assert.match(boundsScript, /__index\(v\d+, 2\)/, "a later assignment does not narrow an incoming parameter");
+    assert.match(boundsScript, /__index\(v\d+, 3\)/, "a mutated loop index still requires a check");
+    const indexed = simulator(indexBounds.data);
+    indexed.step();
+    assert.deepEqual(indexed.logs, [[5, true, 42]]);
+    assert.throws(() => indexed.step(), /index out of bounds: -1/);
+    const changedIndex = simulator(indexBounds.data);
+    changedIndex.setTick(2);
+    assert.throws(() => changedIndex.step(), /index out of bounds: 3/);
+    const signedIndex = simulator(indexBounds.data);
+    signedIndex.setTick(3);
+    assert.throws(() => signedIndex.step(), /index out of bounds: -1/);
+
+    const arrays = build("uniform-script-arrays", writeSource("uniform-script-arrays", `
+const Row = [1]int{4}
+func row() [32]int { return [32]int{} }
+map "Uniform script arrays" {
+    tick {
+        first, second := row(), row()
+        first[0] = 7
+        var matrix [16][32]int
+        matrix[0][0] = 9
+        rows := [16][1]int{Row, Row, Row, Row, Row, Row, Row, Row,
+            Row, Row, Row, Row, Row, Row, Row, Row}
+        rows[0][0] = 11
+        log(first[0], second[0], matrix[0][0], matrix[1][0], rows[0][0], rows[1][0])
+    }
+}
+`));
+    const arrayScript = arrays.data.find(tile => tile.payload?.includes("function __index"))?.payload.toString() ?? "";
+    assert.match(arrayScript, /new Array\(32\)\.fill\(0\)/, "identical scalar literals use a compact initializer");
+    const initialized = simulator(arrays.data);
+    initialized.step();
+    assert.deepEqual(initialized.logs, [[7, 0, 9, 0, 11, 4]], "each initialized array has independent storage");
+
+    const tailCalls = build("script-tail-ownership", writeSource("script-tail-ownership", `
+type Frame struct { Rows [32]int }
+func change(frame Frame) Frame {
+    for range 4100 {}
+    frame.Rows[0] = frame.Rows[0] + 7
+    return frame
+}
+func relay(seed int) Frame {
+    var frame Frame
+    frame.Rows[0] = seed
+    return change(frame)
+}
+func paired(seed int) (Frame, int) {
+    var frame Frame
+    frame.Rows[0] = seed
+    return change(frame), frame.Rows[0]
+}
+map "Tail argument storage" {
+    screen at (0, 0) size (4, 4) with { style = "solid", slice = true, sliceWork = 4096 }
+    tick {
+        result := relay(2)
+        other, prior := paired(3)
+        log(result.Rows[0], other.Rows[0], prior)
+    }
+}
+`));
+    const tailScript = tailCalls.data.find(tile => tile.payload?.includes("function* __tick"))?.payload.toString() ?? "";
+    assert.match(tailScript, /return \(yield\* __f\d+\(v\d+, 1\)\);/, "a direct return transfers its dead local argument");
+    const transferred = simulator(tailCalls.data);
+    transferred.step();
+    transferred.step();
+    assert.deepEqual(transferred.logs, []);
+    transferred.step();
+    assert.deepEqual(transferred.logs, [[9, 10, 3]], "a sibling result still reads the pre-call value");
+
+    const directWrites = build("sliced-direct-writes", writeSource("sliced-direct-writes", `
+type Row struct { Values [2]int }
+func indexForWrite() int {
+    for range 4100 {}
+    pixel(0, 0, true, color.Blue)
+    return 1
+}
+func writeValue() int {
+    for range 4100 {}
+    pixel(0, 0, true, color.Red)
+    return 19
+}
+map "Direct sliced writes" {
+    screen at (0, 0) size (2, 1) with { style = "solid", slice = true, sliceWork = 4096 }
+    tick {
+        var row Row
+        row.Values[indexForWrite()] = writeValue()
+        mutable, fixed := 0, 0
+        for i := range 3 {
+            i, previous := 9, i
+            mutable = mutable + previous
+        }
+        for i := range 3 { fixed = fixed + 2 * i }
+        log(row.Values[0], row.Values[1], mutable, fixed)
+    }
+}
+`));
+    const written = simulator(directWrites.data);
+    written.step();
+    written.step();
+    assert.deepEqual(written.logs, []);
+    written.step();
+    assert.deepEqual(written.logs, [[0, 19, 3, 6]]);
+    assert.equal(written.tileAt({ x: 0, y: 0 }).extra, 1, "the index runs before the RHS when both suspend");
+
     const slicedCalls = build("sliced-call-entry", writeSource("sliced-call-entry", `
-type Source interface { Value() int }
+type Source interface { Value(stamp int) int }
 type Reading struct { Number int }
-func (reading Reading) Value() int { return reading.Number }
+type DelayedReading struct { Number int; Steps int }
+func (reading Reading) Value(stamp int) int { return reading.Number + stamp + hostTimeMillis() }
+func (reading DelayedReading) Value(stamp int) int {
+    for range reading.Steps {}
+    return reading.Number + stamp + hostTimeMillis()
+}
 func readClock() int { return hostTimeMillis() }
 func collect(first int, second int) (int, int, int) { return first, second, hostTimeMillis() }
 
@@ -503,22 +829,43 @@ map "Sliced call entry" {
     screen at (0, 0) size (1, 1) with { style = "solid", slice = true }
     tick {
         var source Source = Reading{Number: 7}
-        for range 4095 {}
-        first, second, body := collect(hostTimeMillis(), readClock())
-        log(first, second, body, source.Value(), Reading{Number: 9}.Value())
+        if currentTick() == 0 {
+            for range 4095 {}
+            first, second, body := collect(hostTimeMillis(), readClock())
+            var delayed Source = DelayedReading{Number: 10, Steps: 2}
+            log(first, second, body, source.Value(0), Reading{Number: 9}.Value(0), delayed.Value(0))
+        } else if currentTick() == 1 {
+            for range 4095 {}
+            log(source.Value(readClock()))
+        } else {
+            source = DelayedReading{Number: 10, Steps: 4096}
+            log(source.Value(hostTimeMillis()))
+        }
     }
     host tick { log("host", readClock()) }
 }
 `));
     const callController = slicedCalls.data.find(tile => tile.payload?.includes("function* __tick()"));
-    assert.match(callController?.payload.toString() ?? "", /function __f\d+\([^)]*\) \{\s*--__budget;/,
+    const callScript = callController?.payload.toString() ?? "";
+    assert.match(callScript, /function __f\d+\([^)]*\) \{\s*--__budget;/,
         "a straight-line function uses the direct sliced path");
+    assert.match(callScript, /\["Value"\]: __f\d+/, "a leaf interface implementation uses direct dispatch");
+    assert.match(callScript, /\["Value"\]: \{ generator: __f\d+ \}/, "a looping implementation of the same interface stays resumable");
     const calls = simulator(slicedCalls.data, false, undefined, tick => 1000 + tick * 100);
     calls.step();
     assert.deepEqual(calls.logs, [["host", 1000]], "the nested argument spends the last slot before the outer body runs");
     calls.step();
-    assert.deepEqual(calls.logs, [["host", 1000], [1000, 1000, 1100, 7, 9], ["host", 1100]],
-        "resumption retains evaluated arguments and both interface and concrete calls work");
+    assert.deepEqual(calls.logs, [["host", 1000], [1000, 1000, 1100, 1107, 1109, 1110], ["host", 1100]],
+        "resumption retains evaluated arguments and both interface implementations work");
+    calls.step();
+    assert.deepEqual(calls.logs.at(-1), ["host", 1200], "direct dispatch suspends after its argument spends the final slot");
+    assert.equal(calls.logs.length, 4);
+    calls.step();
+    assert.deepEqual(calls.logs.slice(-2), [[2507], ["host", 1300]], "the leaf receives the argument evaluated before resumption");
+    calls.step();
+    assert.deepEqual(calls.logs.slice(-2), [["host", 1300], ["host", 1400]], "the looping implementation can still suspend mid-body");
+    calls.step();
+    assert.deepEqual(calls.logs.slice(-2), [[2910], ["host", 1500]], "mixed interface dispatch resumes the looping implementation");
 
     const bufferedMap = build("buffered-sliced-work", writeSource("buffered-sliced-work",
         slicedProgram.replace('key = "F" }', 'key = "F", buffer = true }')));
@@ -621,11 +968,18 @@ map "Mixed output drivers" {
 
     const preservedMap = build("sliced-preserve-screen", writeSource("sliced-preserve-screen", `
 map "Sliced preserve screen" {
-    screen at (0, 0) size (2, 1) with { style = "solid", hold = true, slice = true }
+    screen at (0, 0) size (2, 2) with { style = "solid", hold = true, slice = true }
     tick {
-        if currentTick() == 0 { pixel(0, 0, true, color.Blue) }
+        if currentTick() == 0 {
+            pixel(0, 0, true, color.Blue)
+            pixel(0, 1, true, color.Red)
+        }
         if currentTick() == 1 {
             preserveScreen()
+            pixel(1, 0, true, color.Green)
+        }
+        if currentTick() == 2 {
+            preserveScreen(1, 1)
             pixel(1, 0, true, color.Green)
         }
     }
@@ -637,6 +991,9 @@ map "Sliced preserve screen" {
     preserved.step();
     assert.equal(preserved.tileAt({ x: 0, y: 0 }).extra, 2, "preserveScreen retains the prior committed color");
     assert.equal(preserved.tileAt({ x: 1, y: 0 }).extra, 4, "the overlay is added to the preserved sliced frame");
+    preserved.step();
+    assert.equal(preserved.tileAt({ x: 0, y: 0 }).extra, 7, "unselected rows keep the current frame's background");
+    assert.equal(preserved.tileAt({ x: 0, y: 1 }).extra, 1, "the selected row reuses the previously committed colors");
     const meltMap = build("sliced-screen-reveal", writeSource("sliced-screen-reveal", `
 map "Sliced screen reveal" {
     screen at (0, 0) size (2, 2) with { style = "solid", hold = true, slice = true }
@@ -707,6 +1064,357 @@ map "In-place repaint" {
         assert.equal(paint.tileAt({ x: 1, y: 0 }).extra, 7, "the last pixel call in a frame wins");
         assert.equal(paint.tileWrites, writes);
     }
+
+    const scaled = simulator(build("scaled-solid-screen", writeSource("scaled-solid-screen", `
+map "Scaled solid screen" {
+    screen at (-3, 4) size (2, 2) with { style = "solid", scale = 3, slice = true, hold = true }
+    place wall at (3, 4) with { color = "green" }
+    tick {
+        if currentTick() < 2 {
+            pixel(1, 0, true, color.Red, 23)
+            pixel(2, 0, true, color.White)
+            log(captureScreen(false), pixelIndexAt(1, 0), pixelIndexAt(2, 0))
+        }
+        if currentTick() == 2 { pixel(1, 0, false) }
+    }
+}
+`)).data);
+    for (const [color, writes] of [[1, 9], [1, 9], [7, 18]]) {
+        scaled.step();
+        scaled.roundTripScriptState();
+        for (let y = 4; y < 10; y++)
+            for (let x = -3; x < 3; x++)
+                assert.equal(scaled.tileAt({ x, y }).extra, x >= 0 && y < 7 ? color : 7);
+        assert.equal(scaled.tileAt({ x: 3, y: 4 }).extra, 4, "scaling keeps the neighboring tile outside the screen");
+        assert.equal(scaled.tileWrites, writes, "repaints only when the logical pixel changes");
+    }
+    assert.deepEqual(scaled.logs, [["7177", 23, -1], ["7177", 23, -1]], "capture and indices use logical coordinates");
+    diagnostic("lamp-screen-scale", 'map "Lamp scale" { screen at (0, 0) size (1, 1) with { scale = 2 } }', /screen scale requires/);
+    diagnostic("zero-screen-scale", 'map "Zero scale" { screen at (0, 0) size (1, 1) with { style = "solid", scale = 0 } }', /screen scale requires/);
+    diagnostic("oversize-screen-scale", 'map "Big scale" { screen at (0, 0) size (1, 1) with { style = "solid", scale = 524288 } }', /screen alone exceeds/);
+
+    const arrowDisplay = simulator(build("arrow-screen", writeSource("arrow-screen", `
+map "Native arrow screen" {
+    screen at (-3, 4) size (2, 2) with { style = "arrows", slice = true, hold = true }
+    tick {
+        if currentTick() == 0 { pixel(1, 0, true, color.Red) }
+        if currentTick() == 1 { pixel(1, 0, true, color.Blue) }
+        if currentTick() == 2 { pixel(1, 0, true, color.White) }
+        if currentTick() == 7 { pixel(1, 0, false) }
+        log(captureScreen(false))
+    }
+}
+`)).data);
+    const lane = (x, y) => Array.from({ length: 4 }, (_, offset) => ({ x: x + offset, y }));
+    for (const [y, type] of [[4, 1], [5, 19], [6, 28], [7, 27]])
+        assert.deepEqual(lane(1, y).map(point => arrowDisplay.tileAt(point).type), Array(4).fill(type));
+    assert.deepEqual(lane(1, 7).map(point => arrowDisplay.tileAt(point).extra), [1, 2, 4, 3]);
+    for (const mask of [0, 0, 0, 1, 2, 15, 15, 15, 15, 15, 0, 0]) {
+        arrowDisplay.step();
+        arrowDisplay.roundTripScriptState();
+        assert.deepEqual(lane(1, 7).map((point, index) => arrowDisplay.value(point)),
+            [0, 1, 2, 3].map(index => (mask >> index) & 1));
+        assert.ok([...lane(-3, 7), ...lane(1, 11)].every(point => arrowDisplay.value(point) === 0), "pixel circuits stay isolated");
+    }
+    assert.deepEqual(arrowDisplay.logs.slice(0, 3), [["7177"], ["7277"], ["7077"]]);
+    assert.equal(arrowDisplay.tileWrites, 0, "frame presentation only pulses the physical flip-flops");
+    diagnostic("arrow-screen-scale", 'map "Wrong scale" { screen at (0, 0) size (1, 1) with { style = "arrows", scale = 2 } }', /requires scale = 4/);
+    diagnostic("arrow-screen-crossing", `map "Arrow screen crossing" {
+        screen at (0, 0) size (1, 1) with { style = "arrows" }
+        place arrow at (0, -1) facing down
+    }`, /intersects/);
+
+    const rgbScreen = simulator(build("rgb-screen", writeSource("rgb-screen", `
+map "Mixed RGB screen" {
+    screen at (-3, 4) size (3, 2) with { style = "rgb", slice = true, hold = true }
+    register saved string = ""
+    tick {
+        if currentTick() < 2 {
+            var palette [256]bits<24>
+            palette[9], palette[10] = 0x404046, 0xff0000
+            if currentTick() == 1 { palette[9] = 0x808080 }
+            screenPalette(palette)
+            pixel(0, 0, true, color.Green, 9)
+            pixel(1, 0, true, color.Green, 10)
+            pixel(2, 1, true, color.Yellow)
+            log(pixelIndexAt(0, 0))
+            if currentTick() == 0 { next saved = captureScreen(false) }
+        }
+        if currentTick() == 2 { revealScreen(saved, saved, [2]int{0, 0}, 2) }
+        if currentTick() == 3 { pixel(0, 0, true, color.Blue, 9) }
+        if currentTick() == 4 {
+            var palette [256]bits<24>
+            palette[9], palette[10] = 0x8a735e, 0x14286e
+            screenPalette(palette)
+            pixel(0, 0, true, color.White, 9)
+            pixel(1, 0, true, color.White, 10)
+        }
+    }
+}
+`)).data);
+    const quad = (left, top = 4) => [[left, top], [left + 1, top], [left, top + 1], [left + 1, top + 1]]
+        .map(([x, y]) => rgbScreen.tileAt({ x, y }).extra);
+    for (const [first, second, corner, writes] of [
+        [[0, 7, 7, 7], [1, 1, 1, 1], 3, 9],
+        [[0, 7, 7, 0], [1, 1, 1, 1], 3, 10],
+        [[0, 7, 7, 7], [1, 1, 1, 1], 3, 11],
+        [[2, 2, 2, 2], [7, 7, 7, 7], 7, 23],
+    ]) {
+        rgbScreen.step();
+        rgbScreen.roundTripScriptState();
+        assert.deepEqual(quad(-3), first);
+        assert.deepEqual(quad(-1), second);
+        assert.deepEqual(quad(1, 6), [corner, corner, corner, corner]);
+        assert.equal(rgbScreen.tileWrites, writes, "each changed physical tile repaints once");
+    }
+    assert.deepEqual(rgbScreen.logs, [[9], [9]], "palette changes retain the original pixel index");
+    rgbScreen.step();
+    const wallTints = [[255, 255, 255], [255, 0, 0], [128, 179, 255], [255, 255, 0],
+        [0, 230, 0], [255, 179, 26], [204, 153, 230], [0, 0, 0]];
+    const mixed = left => quad(left).reduce((sum, id) => sum.map((channel, i) => channel + wallTints[id][i]), [0, 0, 0]);
+    const brown = mixed(-3);
+    const blue = mixed(-1);
+    assert.ok(brown[0] > brown[1] && brown[1] > brown[2], "muted brown stays warm");
+    assert.ok(blue[2] > Math.max(blue[0], blue[1]), "deep blue stays blue");
+    diagnostic("rgb-screen-scale", 'map "Wrong scale" { screen at (0, 0) size (1, 1) with { style = "rgb", scale = 3 } }', /requires scale = 2/);
+    diagnostic("rgb-screen-palette-shape", `map "Invalid palette" {
+        screen at (0, 0) size (1, 1) with { style = "rgb" }
+        tick { screenPalette([1]bits<24>{0}) }
+    }`, /requires a \[256\]bits<24> palette/);
+
+    const lampScreen = simulator(build("rgb-lamp-screen", writeSource("rgb-lamp-screen", `
+map "Latched RGB screen" {
+    screen at (-3, 4) size (2, 1) with { style = "rgb-lamps", slice = true, hold = true }
+    tick {
+        if currentTick() == 0 || currentTick() == 2 {
+            var shades [256]bits<24>
+            shades[3] = 0x700000
+            if currentTick() == 2 { shades[3] = 0xff0000 }
+            screenPalette(shades)
+            pixel(0, 0, true, color.White, 3)
+        }
+        if currentTick() == 4 { pixel(0, 0, false) }
+    }
+}
+`)).data);
+    const redPair = [{ x: -3, y: 4 }, { x: -2, y: 4 }];
+    assert.deepEqual(redPair.map(point => lampScreen.tileAt(point).rotation), [1, 3]);
+    assert.equal(lampScreen.tileAt({ x: -2, y: 5 }).type, 25);
+    for (const [tick, level] of [1, 1, 1, 1, 0, 0].entries()) {
+        lampScreen.step();
+        lampScreen.roundTripScriptState();
+        assert.deepEqual(redPair.map(point => Number(lampScreen.value(point) !== 0)), [level, level]);
+        assert.equal(lampScreen.value({ x: 0, y: 4 }), 0, "adjacent RGB pixels retain separate signals");
+        assert.equal(lampScreen.tileWrites, tick < 2 ? 0 : tick < 4 ? 1 : 2, "only a brightness transition rewrites the lamp");
+    }
+
+    const nativeTap = build("buffered-native-tap", writeSource("buffered-native-tap", `
+map "Buffered native tap" {
+    screen at (0, 8) size (1, 1) with { style = "solid", slice = true, sliceWork = 5000 }
+    place key at (-1, 0) facing right with { key = 1 }
+    place key at (1, 0) facing left with { key = 4 }
+    place lamp at (0, 0)
+    input turn bit at (0, 0) with { tap = true, buffer = true }
+    tick {
+        if currentTick() == 0 {
+            for range 6000 { pixel(0, 0, false) }
+        }
+        log(turn)
+    }
+}
+`));
+    assert.ok(nativeTap.data.some(tile => tile.payload?.includes(Buffer.from("__budget = 5000;"))));
+    const tapSim = simulator(nativeTap.data);
+    tapSim.step();
+    tapSim.step([], new Map(), [4]);
+    tapSim.step();
+    tapSim.step([], new Map(), [1]);
+    tapSim.step();
+    assert.deepEqual(tapSim.logs, [[false], [true], [true], [false]], "sliced logic samples the physical OR without losing brief inputs");
+    diagnostic("missing-native-tap", 'map "Missing tap" { input value bit at (0, 0) with { tap = true } }', /requires a placed tile/);
+
+    const nativeTapBus = build("manual-tap-bus", writeSource("manual-tap-bus", `
+map "Manual bus to native outputs" {
+    place arrow at (0, 0) facing right
+    place arrow at (0, 2) facing right
+    input manual bits<2> at (0, 0) with { tap = true, tapPitch = 2 }
+    circuit { output parity bit = manual[0] != manual[1] }
+}
+`));
+    assert.ok(nativeTapBus.data.every(tile => tile.type !== 33 && tile.type !== 22), "the manual tap feeds a script-free circuit");
+    assert.match(nativeTapBus.report, /parity\s+circuit/);
+    const tapBusSim = simulator(nativeTapBus.data);
+    for (const [inputs, expected] of [[[0, 0], 0], [[0, 1], 1], [[1, 1], 0], [[1, 0], 1]]) {
+        const driven = new Map([["0,0", inputs[0]], ["0,2", inputs[1]]]);
+        for (let step = 0; step < 120; step++) tapBusSim.step([], driven);
+        assert.equal(tapBusSim.value(port(nativeTapBus.report, "parity")), expected);
+    }
+    diagnostic("missing-bus-tap-lane", `map "Missing lane" {
+        place arrow at (0, 0) facing right
+        input inputBus bits<2> at (0, 0) with { tap = true, tapPitch = 3 }
+    }`, /requires a placed tile at \(0, 3\)/);
+    diagnostic("buffered-bus-tap", 'map "Buffered bus" { input bus bits<2> at (0, 0) with { tap = true, buffer = true } }', /Buffered input taps require a bit port/);
+    diagnostic("tap-pitch-without-tap", 'map "Wrong pitch" { input bus bits<2> with { tapPitch = 2 } }', /requires a bits port with tap = true/);
+    const compactOutput = build("compact-output", writeSource("compact-output", `
+func pack(manual bits<2>) bits<3> {
+    packet := bits<3>(manual)
+    packet[2] = manual[0] && manual[1]
+    return packet
+}
+map "Compact output" {
+    place arrow at (0, 0) facing right
+    place arrow at (0, 2) facing right
+    input manual bits<2> at (0, 0) with { tap = true, tapPitch = 2 }
+    circuit {
+        output packet bits<3> at (24, 24) with { pitch = 2 } = pack(manual)
+    }
+    script { output marker bits<3> with { pitch = 3 } = 5 }
+}
+`));
+    const packet = [24, 26, 28].map(x => ({x, y: 24}));
+    const compactSim = simulator(compactOutput.data);
+    const route = routeTicks(compactOutput.report, "packet");
+    const values = [1, 3, 2, 0, 3];
+    for (let host = 0; host < values.length + route; host++) {
+        const sent = values[host] ?? 0;
+        compactSim.step([], new Map([["0,0", sent & 1], ["0,2", (sent >> 1) & 1]]));
+        if (host >= route) {
+            const expected = values[host - route];
+            assert.deepEqual(packet.map(lane => compactSim.value(lane)), [expected & 1, (expected >> 1) & 1, +(expected === 3)],
+                "dense output lanes retain a common route latency");
+        }
+    }
+    assert.ok(packet.every(lane => compactSim.tileAt(lane)?.type === 27), "fixed output uses the specified horizontal pitch");
+    const marker = port(compactOutput.report, "marker");
+    assert.deepEqual([0, 3, 6].map(offset => compactSim.value({x: marker.x + offset, y: marker.y})), [1, 0, 1],
+        "automatic scripted output uses its specified pitch");
+    diagnostic("zero-output-pitch", 'map "Zero pitch" { output bus bits<2> with { pitch = 0 } = 0 }', /must be a positive tile count/);
+    diagnostic("adjacent-forwarding-outputs", 'map "Adjacent outputs" { output bus bits<2> at (0, 0) with { pitch = 1, forward = "right" } = 0 }',
+        /need at least two tiles of pitch/);
+    diagnostic("scalar-output-pitch", 'map "Scalar pitch" { output lamp bit with { pitch = 2 } = true }', /requires a bits port/);
+    diagnostic("nonsliced-budget", 'map "No slicing" { screen at (0, 0) size (1, 1) with { style = "solid", sliceWork = 5000 } }', /sliceWork requires/);
+
+    const keyPairs = build("native-key-pairs", writeSource("native-key-pairs", `
+map "Native key pairs" {
+    screen at (0, 8) size (1, 1) with { style = "solid", slice = true, sliceWork = 5000 }
+    input held bit at (0, 0) with { keys = "AD", buffer = true }
+    input turning bit at (8, 0) with { keys = "AD", combine = "xor", buffer = true }
+    circuit { output heldLight bit at (2, 0) = held }
+    tick {
+        if currentTick() == 0 {
+            for range 6000 { pixel(0, 0, false) }
+        }
+        log(held, turning)
+    }
+}
+`));
+    const pairSim = simulator(keyPairs.data);
+    for (const [x, type] of [[0, 10], [8, 17]]) {
+        assert.equal(pairSim.tileAt({x, y: 0}).type, type);
+        assert.equal(pairSim.tileAt({x: x - 1, y: 0}).extra, 1);
+        assert.equal(pairSim.tileAt({x, y: -1}).extra, 4);
+    }
+    assert.equal(keyPairs.data.filter(tile => tile.type === 33).length, 1, "key logic emits no additional script block");
+    pairSim.step();
+    pairSim.step([], new Map(), [4]);
+    pairSim.step();
+    assert.equal(pairSim.value({x: 2, y: 0}), 1, "Blue Arrow's two-cell output reaches native consumers");
+    pairSim.step([], new Map(), [1, 4]);
+    pairSim.step([], new Map(), [1]);
+    pairSim.step();
+    assert.deepEqual(pairSim.logs, [[false, false], [true, true], [true, false], [true, true], [false, false]]);
+    diagnostic("key-group-repeated", 'map "Invalid group" { input value bit at (0, 0) with { keys = "AaD" } }', /distinct Logic Arrows keys/);
+    diagnostic("key-group-named-repeat", 'map "Repeated names" { input value bit at (0, 0) with { keys = "Ctrl ctrl" } }', /distinct Logic Arrows keys/);
+    diagnostic("key-group-xor-size", 'map "Invalid XOR" { input value bit at (0, 0) with { keys = "WASD", combine = "xor" } }', /XOR input keys must name two distinct/);
+    const namedKeys = build("named-key-inputs", writeSource("named-key-inputs", `
+map "Named key inputs" {
+    screen at (0, 8) size (1, 1) with { style = "solid", slice = true }
+    input action bit at (0, 0) with { keys = "R Ctrl", buffer = true }
+    input accept bit at (8, 0) with { key = "Enter", buffer = true }
+    tick { log(action, accept) }
+}
+`));
+    const namedSim = simulator(namedKeys.data);
+    assert.equal(namedSim.tileAt({x: 0, y: 0}).type, 10, "the named group is a native OR");
+    assert.deepEqual(namedKeys.data.filter(tile => tile.type === 21).map(tile => tile.extra).sort((a,b) => a - b), [18, 50, 53]);
+    for (const scan of [[18], [53], [50], [18, 53, 50], []]) namedSim.step([], new Map(), scan);
+    assert.deepEqual(namedSim.logs, [[true, false], [true, false], [false, true], [true, true], [false, false]]);
+    diagnostic("key-group-gate-reads-xor", 'map "Invalid gated XOR" { input value bit at (0, 0) with { keys = "WS", combine = "xor", gateReads = true, buffer = true } }', /requires a buffered OR/);
+    diagnostic("key-pair-unanchored", 'map "Unplaced pair" { input value bit with { keys = "AD" } }', /requires an anchored bit port/);
+    diagnostic("key-pair-option", 'map "Invalid key gate" { input value bit at (0, 0) with { keys = "AD", combine = "nand" } }', /must be 'or' or 'xor'/);
+    diagnostic("key-pair-crosses-other-input", `map "Pair exit" {
+        input pair bit at (0, 0) with { keys = "AD" }
+        input other bit at (1, 0) with { key = "Q" }
+    }`, /unintended output/);
+    diagnostic("other-input-crosses-key-pair", `map "Pair feed" {
+        input pair bit at (0, 0) with { keys = "AD" }
+        input other bit at (-2, 0) with { keys = "WS" }
+    }`, /unintended input/);
+
+    const keyGroup = build("native-key-group", writeSource("native-key-group", `
+map "Four-key hub" {
+    screen at (0, 8) size (1, 1) with { style = "solid", slice = true, sliceWork = 5000 }
+    input active bit at (0, 0) with { keys = "WASD", buffer = true, gateReads = true }
+    input forward bit at (8, 0) with { key = "W", buffer = true }
+    input left bit at (12, 0) with { key = "A", buffer = true }
+    input back bit at (16, 0) with { key = "S", buffer = true }
+    input right bit at (20, 0) with { key = "D", buffer = true }
+    tick {
+        if currentTick() == 0 { for range 6000 { pixel(0, 0, false) } }
+        log(active, forward, left, back, right)
+    }
+}
+`));
+    const groupSim = simulator(keyGroup.data);
+    assert.match(keyGroup.report, /1 native gates/);
+    assert.deepEqual(keyGroup.data.filter(tile => tile.type === 10).map(tile => [tile.x, tile.y]), [[0, 0]],
+        "explicit OR also filters its sliced raw-key samplers");
+    for (const [x, y, rotation, extra] of [[-1, 0, 1, 23], [0, -1, 2, 1], [1, 0, 3, 19], [0, 1, 0, 4]]) {
+        const key = groupSim.tileAt({x, y});
+        assert.deepEqual([key.type, key.rotation, key.extra], [21, rotation, extra]);
+    }
+    groupSim.step();
+    groupSim.step([], new Map(), [19, 4]);
+    groupSim.step();
+    groupSim.step([], new Map(), [23, 1]);
+    groupSim.step();
+    groupSim.step();
+    assert.deepEqual(groupSim.logs, [[false, false, false, false, false], [true, false, false, true, true],
+        [true, true, true, false, false], [false, false, false, false, false], [false, false, false, false, false]]);
+
+    const gatedMotion = build("gated-key-groups", writeSource("gated-key-groups", `
+map "Guarded direction groups" {
+    screen at (0, 8) size (1, 1) with { style = "solid", slice = true, sliceWork = 5000 }
+    input moving bit at (0, 0) with { keys = "W S ArrowUp ArrowDown", buffer = true, gateReads = true }
+    input forward bit at (8, 0) with { keys = "W ArrowUp", buffer = true }
+    input cursorAxis bit at (16, 0) with { keys = "ArrowUp ArrowDown", combine = "xor", buffer = true }
+    input other bit at (24, 0) with { keys = "WA", buffer = true }
+    tick {
+        if currentTick() == 0 { for range 6000 { pixel(0, 0, false) } }
+        log(moving, forward, cursorAxis, other)
+    }
+}
+`));
+    const readProbe = "function __read(x, y) {";
+    const observedMotion = gatedMotion.data.map(tile => {
+        const script = tile.payload?.toString();
+        return script?.includes(readProbe)
+            ? { ...tile, payload: Buffer.from(script.replace(readProbe, readProbe + ' log("key-read", x, y);')) }
+            : tile;
+    });
+    const motionSim = simulator(observedMotion);
+    function observeKeyReads(keys = []) {
+        const start = motionSim.logs.length;
+        motionSim.step([], new Map(), keys);
+        return motionSim.logs.slice(start).filter(row => row[0] === "key-read").map(row => row[1]);
+    }
+    assert.deepEqual(observeKeyReads(), [0, 24], "an idle guard skips its child OR and XOR reads");
+    assert.deepEqual(observeKeyReads([56]), [0, 8, 16, 24], "an ArrowUp pulse reads both children on the same host tick");
+    assert.deepEqual(observeKeyReads(), [0, 24], "an idle guard skips the child reads after the buffered pulse");
+    observeKeyReads([1]);
+    assert.deepEqual(motionSim.logs.filter(row => row[0] !== "key-read"), [
+        [false, false, false, false], [true, true, true, false], [false, false, false, true],
+    ], "child pulses survive a sliced tick and keys outside the parent are still sampled");
 
     const clip = build("clip", writeSource("clip", `
 map "Pixel clipping" {
@@ -903,6 +1611,42 @@ map "Distinct types" { tick { var r Row = 0; var c Column = r } }
             "half-adder carry for simultaneous one-tick pulses");
     }
 
+    const separated = build("separated-circuits", writeSource("separated-circuits", `
+func pair(left bit, right bit) bits<2> {
+    var result bits<2>
+    result[0] = left & right
+    result[1] = left ^ right
+    return result
+}
+map "Separated circuits" {
+    input west bit at (0, 0)
+    input westMask bit at (0, 4)
+    input east bit at (120, 0)
+    input eastMask bit at (120, 4)
+    input directInput bit at (240, 0)
+    circuit {
+        output westResult bits<2> at (36, 52) with { pitch = 2 } = pair(west, westMask)
+        output eastResult bit at (156, 52) = east & eastMask
+        output directResult bit at (242, 0) = directInput
+    }
+}
+`));
+    assert.ok(!separated.data.some(tile => tile.payload), "independent circuits remain physical");
+    const separatedOutputs = [
+        ...[36, 38].map(x => ({ position: { x, y: 52 }, latency: routeTicks(separated.report, "westResult") })),
+        { position: { x: 156, y: 52 }, latency: routeTicks(separated.report, "eastResult") },
+        { position: { x: 242, y: 0 }, latency: routeTicks(separated.report, "directResult") },
+    ];
+    for (const [pulses, active] of [[["1,0"], 1], [["1,0", "1,4"], 0], [["121,0", "121,4"], 2], [["241,0"], 3]]) {
+        const sim = simulator(separated.data);
+        sim.step([], new Map(pulses.map(position => [position, 1])));
+        for (let elapsed = 1; elapsed <= Math.max(...separatedOutputs.map(output => output.latency)) + 1; elapsed++) {
+            sim.step([], new Map(pulses.map(position => [position, 0])));
+            for (const [index, output] of separatedOutputs.entries())
+                assert.equal(sim.value(output.position), Number(index === active && elapsed === output.latency));
+        }
+    }
+
     const reduced = build("reduced", writeSource("reduced", `
 map "Redundant gates" {
     input a bit at (0, 0)
@@ -1022,6 +1766,20 @@ map "Automatic fallback" {
     autoSim.step([keyOf(port(auto.report, "input a"))]);
     for (let i = 0; i < 10; i++) autoSim.step();
     assert.equal(autoSim.value(port(auto.report, "lamp")), 1);
+
+    const isolatedFallback = build("isolated-fallback", writeSource("isolated-fallback", `
+map "Isolated output fallback" {
+    input a bit
+    input b bit
+    input c bit
+    output unreachable bit at (-8, 0) = a
+    output firstXor bit = a ^ b
+    output secondXor bit = b ^ c
+}
+`));
+    assert.match(isolatedFallback.report, /unreachable  script  \(placement:/);
+    assert.match(isolatedFallback.report, /firstXor  circuit/);
+    assert.match(isolatedFallback.report, /secondXor  circuit/);
 
     const counter = build("counter");
     assert.match(counter.report, /lamps  script/);
@@ -1206,6 +1964,32 @@ map "Switch and lookup" {
         assert.equal(selectSim.value(selectOutput), Number(value === 1 || value === 2));
         assert.deepEqual(JSON.parse(JSON.stringify(selectSim.logs.slice(0, 3))), [[11, -1, 11], [22, -1, 11], [-1]]);
     }
+
+    // The usual placement runs out of phase padding in this constant lookup.
+    const reciprocals = Array.from({ length: 16 }, (_, row) => Math.floor(0xa00000 / (2 * row + 1)));
+    const lookupOutputs = Array.from({ length: 24 }, (_, bit) =>
+        `output quotient${bit} bit = Reciprocals[int(address)][${bit}]`);
+    const lookup = build("lookup-depth-order", writeSource("lookup-depth-order", `
+const Reciprocals = [16]bits<24>{${reciprocals.join(", ")}}
+map "Routed reciprocal lookup" {
+    input address bits<4>
+    circuit {
+        ${lookupOutputs.join("\n        ")}
+    }
+}
+`));
+    assert.ok(lookup.data.every(tile => tile.payload === undefined), "the lookup uses physical logic only");
+    const lookupInput = port(lookup.report, "input address");
+    const lookupPins = lookupOutputs.map((_, bit) => port(lookup.report, `quotient${bit}`));
+    const lookupDelay = Math.max(...lookupOutputs.map((_, bit) => routeTicks(lookup.report, `quotient${bit}`)));
+    const lookupInputValue = 13;
+    const lookupLevels = new Map([0, 1, 2, 3].map(lane =>
+        [`${lookupInput.x + 1},${lookupInput.y + lane * 8}`, (lookupInputValue >> lane) & 1]));
+    const lookupSim = simulator(lookup.data);
+    for (let tick = 0; tick <= lookupDelay; tick++) lookupSim.step([], lookupLevels);
+    const lookupResult = lookupPins.reduce((value, pin, bit) => value | (lookupSim.value(pin) << bit), 0);
+    assert.equal(lookupResult, reciprocals[lookupInputValue]);
+
     diagnostic("duplicate-case", `map "Duplicate case" { tick { switch 1 { case 1: log(1); case 1 + 0: log(2) } } }`, /Duplicate case/);
     diagnostic("duplicate-default", `map "Duplicate default" { tick { switch 1 { default: log(1); default: log(2) } } }`, /only one default/);
     diagnostic("dynamic-case", `map "Dynamic case" { tick { switch 1 { case currentTick(): log(1) } } }`, /compile-time constant/);
@@ -1327,6 +2111,7 @@ map "Host clock" {
     screen at (0, 0) size (1, 1) with { style = "solid", slice = true }
     register frames int = 0
     register notes int = 0
+    register labels [2]string = [2]string{"one\\nline", "two"}
     publish scene bits<8> = bits<8>(frames)
     publish host packet [2]bits<8> = [2]bits<8>{bits<8>(notes), bits<8>(frames)}
     place scriptSource at (10, 1) with { code = ${JSON.stringify(publishedReader)} }
@@ -1334,7 +2119,7 @@ map "Host clock" {
         start := notes
         for range 8200 {}
         next frames = frames + 1
-        log("game", currentTick(), start, notes)
+        log("game", currentTick(), start, notes, labels[0])
     }
     host tick {
         for range 5000 {}
@@ -1346,15 +2131,34 @@ map "Host clock" {
     const hostLayout = build("host-clock", dualClock);
     for (const controllerLast of [false, true]) {
         const running = simulator(hostLayout.data, controllerLast, undefined, tick => 200 + tick * 10);
-        for (let tick = 0; tick < 6; tick++) running.step();
+        let checkpoint;
+        for (let tick = 0; tick < 6; tick++) {
+            running.step();
+            const snapshot = running.roundTripScriptState();
+            if (tick === 2) checkpoint = snapshot;
+        }
         assert.deepEqual(running.logs.filter(([tag]) => tag === "host"), [
             ["host", 0, 200, 0, 0], ["host", 1, 210, 1, 0], ["host", 2, 220, 2, 1],
             ["host", 3, 230, 3, 1], ["host", 4, 240, 4, 1], ["host", 5, 250, 5, 2],
         ], "the host handler sees each host tick and the latest logical commit");
-        assert.deepEqual(running.logs.filter(([tag]) => tag === "game"), [["game", 0, 0, 0], ["game", 1, 3, 3]],
+        assert.deepEqual(running.logs.filter(([tag]) => tag === "game"), [
+            ["game", 0, 0, 0, "one\nline"], ["game", 1, 3, 3, "one\nline"],
+        ],
             "a suspended logical tick retains its register snapshot and logical time");
         assert.deepEqual(running.logs.filter(([tag]) => typeof tag === "number"), [[-1, -1], [0, 0], [1, 0], [2, 1], [3, 1], [4, 1]],
             "the host publishes during renderer yields without callback-order dependence");
+        const legacy = JSON.parse(checkpoint);
+        const controllerState = legacy.find(state => typeof state.reg === "string");
+        controllerState.reg = controllerState.reg.split("\n").map(value => JSON.parse(value));
+        const expectedLogs = running.logs.filter(([tag]) => typeof tag === "string").slice(-4);
+        for (const snapshot of [checkpoint, JSON.stringify(legacy)]) {
+            running.logs.length = 0;
+            running.roundTripScriptState(snapshot);
+            running.setTick(3);
+            for (let tick = 3; tick < 6; tick++) running.step();
+            assert.deepEqual(running.logs.filter(([tag]) => typeof tag === "string"), expectedLogs,
+                "restored registers supersede the in-memory cache");
+        }
     }
     const hostIr = path.join(scratch, "host-clock.ir.json");
     assert.equal(run("check", dualClock, "--emit-ir", hostIr).status, 0);

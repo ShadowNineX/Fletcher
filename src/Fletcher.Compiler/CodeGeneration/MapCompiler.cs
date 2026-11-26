@@ -9,11 +9,13 @@ namespace Fletcher.Compiler.CodeGeneration;
 internal sealed class MapCompiler(IrProgram program)
 {
     private const byte Button = 24, Toggle = 19, Lamp = 27, ScriptSource = 22, ScriptBlock = 33, Power = 2;
-    private const byte Key = 21, Arrow = 1, BlueArrow = 10, ForwardingLamp = 28;
-    private const byte Right = 1;
+    private const byte Key = 21, Arrow = 1, BlueArrow = 10, Xor = 17, ForwardingLamp = 28;
+    private const byte Up = 0, Right = 1, Down = 2, Left = 3;
     private const int RailSpacing = 8;
     // Keep each batch well within the map format's per-tile JavaScript limit.
     private const int DriverBatchSize = 256;
+    private static readonly (Position Offset, byte Facing)[] KeyNeighbors =
+        [(new(-1, 0), Right), (new(0, -1), Down), (new(1, 0), Left), (new(0, 1), Up)];
 
     private readonly Dictionary<Variable, string> fallback = [];
     private readonly HashSet<Variable> scriptOnly = [];
@@ -34,8 +36,11 @@ internal sealed class MapCompiler(IrProgram program)
             }
             catch (Exception error) when (error is RoutingException or MapLayoutException { RetryBackend: true })
             {
-                var retry = live.LastOrDefault(binding => binding.Backend == Backend.Auto && selection.Native.ContainsKey(binding.Symbol) &&
-                    !RequiresCircuit(binding.Value));
+                bool CanRetry(Binding binding) => binding.Backend == Backend.Auto &&
+                    selection.Native.ContainsKey(binding.Symbol) && !RequiresCircuit(binding.Value);
+                var retry = error is MapLayoutException { NativeBinding: { } failed }
+                    ? live.FirstOrDefault(binding => binding.Symbol == failed && CanRetry(binding)) : null;
+                retry ??= live.LastOrDefault(CanRetry);
                 if (retry is null)
                 {
                     if (error is RoutingException)
@@ -155,6 +160,27 @@ internal sealed class MapCompiler(IrProgram program)
 
     private Placement PlaceSmallest(Selection selection, Binding[] live, HashSet<Variable> tickReads)
     {
+        try
+        {
+            return PlaceSmallest(selection, live, tickReads, orderGatesByDepth: false, separateComponents: false);
+        }
+        catch (Exception error) when (selection.Native.Count > 0 && error is RoutingException or MapLayoutException)
+        {
+            try
+            {
+                return PlaceSmallest(selection, live, tickReads, orderGatesByDepth: false, separateComponents: true);
+            }
+            catch (Exception retry) when (retry is RoutingException or MapLayoutException)
+            {
+                // The initial error retains the sink for automatic backend recovery.
+            }
+            throw;
+        }
+    }
+
+    private Placement PlaceSmallest(Selection selection, Binding[] live, HashSet<Variable> tickReads,
+        bool orderGatesByDepth, bool separateComponents)
+    {
         HashSet<Variable> reads = [with(tickReads)];
         foreach (var binding in selection.Script)
             reads.UnionWith(BoundTree.References(binding.Value));
@@ -165,13 +191,15 @@ internal sealed class MapCompiler(IrProgram program)
         // Treat the standard layout's script sample times as constraints for
         // every candidate. Shorter geometry can put the delay on a shared tap leg.
         var reference = reads.Any(selection.Native.ContainsKey)
-            ? Place(selection, live, reads, RoutingGeometry.Standard, null, allowAdjacentOutputs: false, out _)
+            ? Place(selection, live, reads, RoutingGeometry.Standard with { SeparateComponents = separateComponents },
+                null, allowAdjacentOutputs: false, out _)
             : null;
         var best = reference;
         Exception? failure = null;
         RoutingGeometry[] geometries = [RoutingGeometry.Tight, RoutingGeometry.Dense, RoutingGeometry.Compact, RoutingGeometry.Standard];
-        foreach (var geometry in geometries)
+        foreach (var preset in geometries)
         {
+            var geometry = preset with { OrderGatesByDepth = orderGatesByDepth, SeparateComponents = separateComponents };
             try
             {
                 Placement? candidate = PlaceWithAdjacentOutputs(selection, live, reads, geometry, null);
@@ -185,7 +213,13 @@ internal sealed class MapCompiler(IrProgram program)
                 failure = error;
             }
         }
-        return best ?? throw failure ?? new RoutingException("No valid native layout was found.");
+        if (best is not null)
+            return best;
+        // A different topological order can leave room to delay both inputs
+        // at a join. Preserve the original scheduling for script-sampled wires.
+        if (reference is null && !orderGatesByDepth)
+            return PlaceSmallest(selection, live, tickReads, orderGatesByDepth: true, separateComponents);
+        throw failure ?? new RoutingException("No valid native layout was found.");
     }
 
     private Placement? PlaceWithTapTiming(Selection selection, Binding[] live, HashSet<Variable> reads,
@@ -237,6 +271,8 @@ internal sealed class MapCompiler(IrProgram program)
         Variable[] taps = [.. reads.Where(native.ContainsKey).OrderBy(variable => variable.Id)];
         int[] roots = [.. nativeOutputs.Concat(taps).SelectMany(variable => native[variable])];
         var gates = graph.Keep(roots, out var sourceIds);
+        if (geometry.OrderGatesByDepth)
+            gates = NativeRouter.OrderByDepth(gates);
 
         var layout = new Layout();
         foreach (var tile in program.ManualTiles)
@@ -308,6 +344,7 @@ internal sealed class MapCompiler(IrProgram program)
         {
             var symbol = port.Symbol;
             var circuit = native.TryGetValue(symbol, out var signals);
+            var pitch = port.OutputPitch ?? RailSpacing;
             if (!positions.TryGetValue(symbol, out var lamps))
             {
                 var column = circuit ? railColumn : -16;
@@ -323,16 +360,16 @@ internal sealed class MapCompiler(IrProgram program)
                 {
                     anchor = Layout.Find(column, row, point =>
                     {
-                        var bus = Bus(point, symbol.Type.Width);
+                        var bus = Bus(point, symbol.Type.Width, pitch);
                         return Array.TrueForAll(bus, layout.IsFree) &&
                             (circuit || Array.TrueForAll(bus, lamp => !fixedReceivers.Contains(lamp) &&
                                 layout.IsFree(lamp + new Position(-1, 0)) && !fixedReceivers.Contains(lamp + new Position(-1, 0))));
                     },
                         pitch: circuit ? RailSpacing : 1);
                 }
-                lamps = PlaceOutput(layout, positions, symbol, anchor, style: port.LampStyle);
+                lamps = PlaceOutput(layout, positions, symbol, anchor, style: port.LampStyle, pitch: pitch);
                 if (circuit)
-                    railColumn += (lamps.Length - 1) * RailSpacing + geometry.OutputGap;
+                    railColumn += (lamps.Length - 1) * pitch + geometry.OutputGap;
             }
             for (var lane = 0; lane < lamps.Length; lane++)
             {
@@ -367,7 +404,20 @@ internal sealed class MapCompiler(IrProgram program)
             }
         }
 
-        var route = NativeRouter.Route(gates, driven, nativePins, layout.Tiles, geometry);
+        RouteResult route;
+        try
+        {
+            route = geometry.SeparateComponents
+                ? NativeRouter.RouteComponents(gates, driven, nativePins, layout.Tiles, geometry)
+                : NativeRouter.Route(gates, driven, nativePins, layout.Tiles, geometry);
+        }
+        catch (RoutingException error) when (error.OutputSink is { } sink)
+        {
+            var binding = nativeOutputs.Concat(taps).FirstOrDefault(symbol => positions[symbol].Contains(sink));
+            if (binding is null)
+                throw;
+            throw new MapLayoutException($"Cannot route native circuit. {error.Message}", retryBackend: true, nativeBinding: binding);
+        }
         foreach (var tile in route.Tiles)
             layout.Add(tile);
         var scalarTaps = nativePins.Where(pin => pin is { PreserveLatency: true, TimingGroup: null }).Select(pin => pin.Position);
@@ -384,13 +434,12 @@ internal sealed class MapCompiler(IrProgram program)
                 OutputLatency = route.OutputLatency.ToDictionary(port => packedTaps.GetValueOrDefault(port.Key, port.Key), port => port.Value)
             };
         }
-        layout.CheckManualInteractions(program.ManualTiles);
-        if (pixels.Length > 0)
-        {
-            var screenCells = pixels.Select(pixel => pixel.Position).ToHashSet();
-            if (layout.Tiles.Any(tile => TileCatalog.Destinations(tile).Any(screenCells.Contains)))
-                throw new RoutingException("Physical wiring intersects the screen.");
-        }
+        var screenCells = pixels.Select(pixel => pixel.Position).ToHashSet();
+        layout.CheckManualInteractions(program.ManualTiles, screenCells, [.. driven.Values.Select(tile => tile.Position)]);
+        CheckKeyboardGroupRouting(layout, inputs, positions, driven.Values);
+        if (screenCells.Count > 0 && layout.Tiles.Any(tile => !screenCells.Contains(tile.Position) &&
+            TileCatalog.Destinations(tile).Any(screenCells.Contains)))
+            throw new RoutingException("Physical wiring intersects the screen.");
 
         IReadOnlyList<ScriptEmitter.BufferedKeyGroup> groups = [];
         Tile[] tiles;
@@ -447,31 +496,49 @@ internal sealed class MapCompiler(IrProgram program)
     {
         var keys = program.Ports.Where(port => port.Buffer && port.Key.HasValue && samples.ContainsKey(port.Symbol))
             .OrderBy(port => port.Symbol.Id).ToArray();
+        var derivedKeys = program.Ports.Where(port => port.Buffer && port.Keys is { GateReads: false } &&
+            samples.ContainsKey(port.Symbol)).ToArray();
         List<ScriptEmitter.BufferedKeyGroup> groups = [];
-        if (keys.Length < 4)
-            return groups;
 
         // A source other than the physical key can drive the original sampler.
         // Leave that port on the direct path even when all four keys are idle.
         var receivers = layout.Tiles.SelectMany(TileCatalog.Destinations).CountBy(position => position).ToDictionary();
         keys = [.. keys.Where(port => receivers.GetValueOrDefault(samples[port.Symbol][0]) == 1 &&
             !receivers.ContainsKey(samples[port.Symbol][0] + new Position(-1, 0)))];
+        HashSet<Variable> assigned = [];
+        foreach (var port in program.Ports.Where(port => port.Keys is { GateReads: true } &&
+            samples.ContainsKey(port.Symbol)))
+        {
+            var keyIds = port.Keys!.KeyIds;
+            // Both kinds of fixed key group receive the same host key pulses.
+            // An OR over all of a group's keys is high whenever its OR or XOR
+            // can fire. Keep the guard groups themselves on the direct path.
+            Variable[] members = [.. keys.Where(key => keyIds.Contains(key.Key!.Value) && !assigned.Contains(key.Symbol))
+                .Select(key => key.Symbol),
+                .. derivedKeys.Where(key => !assigned.Contains(key.Symbol) && key.Keys!.KeyIds.All(keyIds.Contains))
+                    .Select(key => key.Symbol)];
+            if (members.Length == 0)
+                continue;
+            assigned.UnionWith(members);
+            groups.Add(new(samples[port.Symbol][0], members, port.Symbol));
+        }
+
+        keys = [.. keys.Where(key => !assigned.Contains(key.Symbol))];
         if (keys.Length < 4)
             return groups;
 
         var left = keys.Min(port => samples[port.Symbol][0].X);
         var bottom = keys.Max(port => samples[port.Symbol][0].Y);
-        (Position Offset, byte Facing)[] neighbors = [(new(-1, 0), 1), (new(0, -1), 2), (new(1, 0), 3), (new(0, 1), 0)];
         var nextKey = 0;
         // Five-cell pitch leaves each cross and the blue arrow's exit isolated.
         for (var candidate = 0; candidate < 1024 && nextKey + 4 <= keys.Length; candidate++)
         {
             var hub = new Position(left + candidate % 8 * 5, bottom + 3 + candidate / 8 * 5);
             var exit = hub + new Position(2, 0);
-            if (!Clear(hub) || !Clear(exit) || neighbors.Any(neighbor => !Clear(hub + neighbor.Offset)))
+            if (!Clear(hub) || !Clear(exit) || KeyNeighbors.Any(neighbor => !Clear(hub + neighbor.Offset)))
                 continue;
             layout.Add(new Tile(hub, BlueArrow, Right));
-            foreach (var (offset, facing) in neighbors)
+            foreach (var (offset, facing) in KeyNeighbors)
                 layout.Add(new Tile(hub + offset, Key, facing, Extra: keys[nextKey++].Key!.Value));
             groups.Add(new(hub, [.. keys[(nextKey - 4)..nextKey].Select(port => port.Symbol)]));
         }
@@ -508,26 +575,130 @@ internal sealed class MapCompiler(IrProgram program)
     {
         if (screen is null)
             return [];
-        var pixels = new Tile[screen.PixelCount];
-        for (var y = 0; y < screen.Height; y++)
+        if (screen.ArrowDisplay)
+            return CreateArrowDisplay(screen);
+        if (screen.RgbLamps)
+            return CreateRgbLampDisplay(screen);
+        var pixels = new Tile[screen.TileWidth * screen.TileHeight];
+        for (var y = 0; y < screen.TileHeight; y++)
         {
-            for (var x = 0; x < screen.Width; x++)
+            for (var x = 0; x < screen.TileWidth; x++)
             {
                 var position = screen.Background.Position + new Position(x, y);
-                pixels[y * screen.Width + x] = screen.Background with { Position = position };
+                pixels[y * screen.TileWidth + x] = screen.Background with { Position = position };
             }
         }
         return pixels;
     }
 
-    private static Dictionary<Variable, Position[]> PlaceFixedPorts(Layout layout, Port[] inputs, Port[] outputs)
+    private static Tile[] CreateRgbLampDisplay(Screen screen)
+    {
+        var pixels = new Tile[screen.TileWidth * screen.TileHeight];
+        var origin = screen.Background.Position;
+        for (var row = 0; row < screen.Height; row++)
+        {
+            for (var column = 0; column < screen.Width; column++)
+            {
+                var left = column * screen.Scale;
+                var top = row * screen.Scale;
+                var cell = origin + new Position(left, top);
+                var center = new Position(1, 1);
+                pixels[(top + 1) * screen.TileWidth + left + 1] = screen.Background with { Position = cell + center };
+                foreach (var pair in Screen.LampPairs)
+                {
+                    PlaceLamp(pair.First, pair.Facing, pair.Signal);
+                    PlaceLamp(pair.Second, pair.Opposite, pair.Signal);
+                }
+
+                void PlaceLamp(Position offset, byte facing, ushort signal)
+                {
+                    var index = (top + offset.Y) * screen.TileWidth + left + offset.X;
+                    pixels[index] = new Tile(cell + offset, Screen.ForwardingLampType, facing, Extra: signal);
+                }
+            }
+        }
+        return pixels;
+    }
+
+    private static Tile[] CreateArrowDisplay(Screen screen)
+    {
+        var origin = screen.Background.Position;
+        TileColor[] colors = [TileColor.Red, TileColor.Blue, TileColor.Green, TileColor.Yellow];
+        var pixels = new Tile[screen.TileWidth * screen.TileHeight];
+        for (var y = 0; y < screen.TileHeight; y++)
+        {
+            for (var x = 0; x < screen.TileWidth; x++)
+            {
+                var position = origin + new Position(x, y);
+                var color = (ushort)colors[x % screen.Scale];
+                pixels[y * screen.TileWidth + x] = (y % screen.Scale) switch
+                {
+                    0 => new Tile(position, Arrow, Down),
+                    1 => new Tile(position, Toggle, Down),
+                    2 => new Tile(position, ForwardingLamp, Down, Extra: color),
+                    _ => new Tile(position, Lamp, Extra: color)
+                };
+            }
+        }
+        return pixels;
+    }
+
+    private Dictionary<Variable, Position[]> PlaceFixedPorts(Layout layout, Port[] inputs, Port[] outputs)
     {
         Dictionary<Variable, Position[]> positions = [];
         foreach (var port in inputs.Where(port => port.Anchor.HasValue))
-            PlaceInput(layout, positions, port, port.Anchor!.Value);
+        {
+            var anchor = port.Anchor!.Value;
+            if (port.Tap)
+            {
+                var lanes = new Position[port.Symbol.Type.Width];
+                for (var lane = 0; lane < lanes.Length; lane++)
+                {
+                    var position = anchor + new Position(0, lane * (port.TapPitch ?? RailSpacing));
+                    if (!manualPositions.Contains(position))
+                        throw new MapLayoutException($"Input tap '{port.Symbol.Name}' requires a placed tile at ({position.X}, {position.Y}).");
+                    lanes[lane] = position;
+                }
+                positions.Add(port.Symbol, lanes);
+            }
+            else if (port.Keys is { } keys)
+            {
+                // Same key-to-gate depth as an ordinary key sampler.
+                for (var i = 0; i < keys.KeyIds.Length; i++)
+                {
+                    var (offset, facing) = KeyNeighbors[i];
+                    layout.Add(new Tile(anchor + offset, Key, facing, Extra: keys.KeyIds[i]));
+                }
+                layout.Add(new Tile(anchor, keys.Exclusive ? Xor : BlueArrow, Right));
+                positions.Add(port.Symbol, [anchor]);
+            }
+            else
+                PlaceInput(layout, positions, port, anchor);
+        }
         foreach (var port in outputs.Where(port => port.Anchor.HasValue))
-            PlaceOutput(layout, positions, port.Symbol, port.Anchor!.Value, port.Forward, port.LampStyle);
+            PlaceOutput(layout, positions, port.Symbol, port.Anchor!.Value, port.Forward, port.LampStyle,
+                port.OutputPitch ?? RailSpacing);
         return positions;
+    }
+
+    private static void CheckKeyboardGroupRouting(Layout layout, Port[] inputs, Dictionary<Variable, Position[]> positions,
+        IEnumerable<Tile> routedSources)
+    {
+        var groups = inputs.Where(port => port.Keys is not null).ToArray();
+        if (groups.Length == 0)
+            return;
+
+        var arrivals = layout.Tiles.SelectMany(TileCatalog.Destinations).CountBy(position => position).ToDictionary();
+        var routed = routedSources.Select(tile => tile.Position).ToHashSet();
+        foreach (var port in groups)
+        {
+            var hub = positions[port.Symbol][0];
+            if (arrivals.GetValueOrDefault(hub) != port.Keys!.KeyIds.Length)
+                throw new RoutingException($"Keyboard group '{port.Symbol.Name}' has an unintended input at ({hub.X}, {hub.Y}).");
+            var exit = TileCatalog.Destinations(layout[hub]).Single();
+            if (!routed.Contains(hub) && exit.FitsMap && !layout.IsFree(exit))
+                throw new RoutingException($"Keyboard group '{port.Symbol.Name}' has an unintended output at ({exit.X}, {exit.Y}).");
+        }
     }
 
     private static bool CanPlaceInput(Layout layout, HashSet<int> rails, Position anchor, int width) =>
@@ -549,13 +720,13 @@ internal sealed class MapCompiler(IrProgram program)
         positions.Add(symbol, lanes);
     }
 
-    private static Position[] Bus(Position anchor, int width) =>
-        [.. Enumerable.Range(0, width).Select(lane => anchor + new Position(lane * RailSpacing, 0))];
+    private static Position[] Bus(Position anchor, int width, int pitch = RailSpacing) =>
+        [.. Enumerable.Range(0, width).Select(lane => anchor + new Position(lane * pitch, 0))];
 
     private static Position[] PlaceOutput(Layout layout, Dictionary<Variable, Position[]> positions, Variable symbol, Position anchor,
-        byte? forward = null, ushort? style = null)
+        byte? forward = null, ushort? style = null, int pitch = RailSpacing)
     {
-        var lanes = Bus(anchor, symbol.Type.Width);
+        var lanes = Bus(anchor, symbol.Type.Width, pitch);
         foreach (var position in lanes)
             layout.Add(new Tile(position, forward.HasValue ? ForwardingLamp : Lamp, forward.GetValueOrDefault(), Extra: style ?? 0x14));
         positions.Add(symbol, lanes);
@@ -589,7 +760,8 @@ internal sealed class MapCompiler(IrProgram program)
     private string Explain(Binding[] bindings, Selection selection, Dictionary<Variable, Position[]> positions, RouteResult route,
         Variable[] taps, Variable[] exports, int gates, int tiles)
     {
-        var report = new StringBuilder().AppendLine($"{program.Name} ({gates} native gates, {tiles} tiles)");
+        var inputGates = program.Ports.Count(port => port.Keys is not null);
+        var report = new StringBuilder().AppendLine($"{program.Name} ({gates + inputGates} native gates, {tiles} tiles)");
         foreach (var binding in bindings)
         {
             var symbol = binding.Symbol;
@@ -608,7 +780,19 @@ internal sealed class MapCompiler(IrProgram program)
         foreach (var port in program.Ports.Where(port => port.Symbol.Kind == SymbolKind.Input))
         {
             var pin = positions[port.Symbol][0];
-            var input = port.Key is ushort key ? $"key {TileCatalog.KeyboardKeys[key]}" : "button";
+            if (port.Keys is { } keys)
+            {
+                var gate = keys.Exclusive ? "XOR" : "OR";
+                var names = string.Join(", ", keys.KeyIds.Select(TileCatalog.KeyboardKeyName));
+                report.AppendLine($"input {port.Symbol.Name}  native {gate} of keys {names} at ({pin.X}, {pin.Y})");
+                continue;
+            }
+            if (port.Tap)
+            {
+                report.AppendLine($"input {port.Symbol.Name}  physical tap at ({pin.X}, {pin.Y})");
+                continue;
+            }
+            var input = port.Key is ushort key ? $"key {TileCatalog.KeyboardKeyName(key)}" : "button";
             report.AppendLine($"input {port.Symbol.Name}  {input} at ({pin.X - 1}, {pin.Y})");
         }
         if (taps.Length > 0)
@@ -721,16 +905,19 @@ internal sealed class MapCompiler(IrProgram program)
             }
         }
 
-        public void CheckManualInteractions(IReadOnlyList<Tile> manual)
+        public void CheckManualInteractions(IReadOnlyList<Tile> manual, HashSet<Position> screenCells, HashSet<Position> routedInputs)
         {
             var fixedPositions = manual.Select(tile => tile.Position).ToHashSet();
             foreach (var tile in tiles)
             {
                 var isManual = fixedPositions.Contains(tile.Position);
                 // A forwarding port is the explicit outbound connection to a manual circuit.
-                var isForwardingOutput = tile.Type == ForwardingLamp && !isManual;
+                var isForwardingOutput = tile.Type == ForwardingLamp && !isManual && !screenCells.Contains(tile.Position);
+                // The native router already checked every path from a declared tap.
+                var isRoutedTap = isManual && routedInputs.Contains(tile.Position);
                 var crossing = TileCatalog.Destinations(tile)
-                    .Where(destination => occupied.ContainsKey(destination) && (isManual || isForwardingOutput) != fixedPositions.Contains(destination))
+                    .Where(destination => occupied.ContainsKey(destination) && (isManual || isForwardingOutput) != fixedPositions.Contains(destination) &&
+                        !(isRoutedTap && !screenCells.Contains(destination)))
                     .Select(destination => (Position?)destination).FirstOrDefault();
                 if (crossing is { } target)
                 {
@@ -745,7 +932,8 @@ internal sealed class MapCompiler(IrProgram program)
 }
 
 [SuppressMessage("Design", "S3871", Justification = "The public compiler entry points convert this exception to a diagnostic.")]
-internal sealed class MapLayoutException(string message, bool retryBackend = false) : Exception(message)
+internal sealed class MapLayoutException(string message, bool retryBackend = false, Variable? nativeBinding = null) : Exception(message)
 {
     public bool RetryBackend { get; } = retryBackend;
+    public Variable? NativeBinding { get; } = nativeBinding;
 }

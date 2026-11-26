@@ -164,9 +164,12 @@ internal sealed partial class Binder(string path, IReadOnlyList<SourceUnit> unit
             {
                 if (!symbol.Type.IsSignal && symbol.Type != DataType.Error)
                     Error(type, "Ports require a bit or fixed-width signal type.");
-                var keyboard = member is InputDeclarationSyntax input ? BindInputKey(input, symbol.Type) : (Key: (ushort?)null, Buffer: false);
-                var (forward, lampStyle) = member is OutputDeclarationSyntax output ? BindOutputOptions(output) : (null, null);
-                ports.Add(new Port(symbol, position is null ? null : BindPosition(position), keyboard.Key, keyboard.Buffer, forward, lampStyle));
+                var (key, buffer, tap, keys, tapPitch) = member is InputDeclarationSyntax input
+                    ? BindInputOptions(input, symbol.Type) : (null, false, false, null, null);
+                var (forward, lampStyle, outputPitch) = member is OutputDeclarationSyntax output
+                    ? BindOutputOptions(output, symbol.Type) : (null, null, null);
+                ports.Add(new Port(symbol, position is null ? null : BindPosition(position), key, buffer, forward, lampStyle,
+                    tap, keys, tapPitch, outputPitch));
             }
             else if (kind == SymbolKind.Register && !IsRegisterType(symbol.Type))
             {
@@ -264,7 +267,7 @@ internal sealed partial class Binder(string path, IReadOnlyList<SourceUnit> unit
 
         bool DeclareTopLevel(string name, SyntaxNode location)
         {
-            if (!BuiltinTypes.ContainsKey(name) && name is not ("_" or "bits" or "log" or "currentTick" or "hostTimeMillis" or "pixel" or "pixelIndexAt" or "preserveScreen" or "captureScreen" or "revealScreen" or "sameFile" or "mouseX" or "mouseY") &&
+            if (!BuiltinTypes.ContainsKey(name) && name is not ("_" or "bits" or "log" or "currentTick" or "hostTimeMillis" or "pixel" or "pixelIndexAt" or "screenPalette" or "preserveScreen" or "captureScreen" or "revealScreen" or "sameFile" or "mouseX" or "mouseY") &&
                 topLevelNames.Add(LocalKey(name, location)))
                 return true;
             Error(location, $"Cannot declare '{name}' in the top-level scope.");
@@ -463,11 +466,21 @@ internal sealed partial class Binder(string path, IReadOnlyList<SourceUnit> unit
         return values;
     }
 
-    private (ushort? Key, bool Buffer) BindInputKey(InputDeclarationSyntax input, DataType type)
+    private (ushort? Key, bool Buffer, bool Tap, KeyboardGroup? Keys, int? TapPitch) BindInputOptions(InputDeclarationSyntax input, DataType type)
     {
         var options = BindOptions(input.Options);
-        foreach (var option in input.Options.Where(option => option.Name is not ("key" or "buffer")))
+        foreach (var option in input.Options.Where(option => option.Name is not ("key" or "buffer" or "tap" or "keys" or "combine" or "gateReads" or "tapPitch")))
             Error(option, $"Unknown input option '{option.Name}'.");
+        int? tapPitch = null;
+        if (options.TryGetValue("tapPitch", out var pitch))
+        {
+            if (options.GetValueOrDefault("tap") is not true || type.Shape.Kind != TypeKind.Bits)
+                Error(input, "Input tapPitch requires a bits port with tap = true.");
+            else if (pitch is int spacing && spacing > 0 && spacing <= Position.MaximumCoordinate)
+                tapPitch = spacing;
+            else
+                Error(input, "Input tapPitch must be a positive tile count within the map coordinate range.");
+        }
         var buffer = false;
         if (options.TryGetValue("buffer", out var buffered))
         {
@@ -476,28 +489,73 @@ internal sealed partial class Binder(string path, IReadOnlyList<SourceUnit> unit
             else
                 Error(input, "Input buffer must be true or false.");
         }
+        if (options.TryGetValue("keys", out var keys))
+        {
+            if (input.Position is null || type.Shape.Kind != TypeKind.Bit || options.ContainsKey("key") || options.ContainsKey("tap"))
+                Error(input, "A keyboard group requires an anchored bit port without a key or tap option.");
+            var combine = options.GetValueOrDefault("combine", "or");
+            if (combine is not ("or" or "xor"))
+                Error(input, "Input combine must be 'or' or 'xor'.");
+            var exclusive = combine is "xor";
+            var gateReads = options.GetValueOrDefault("gateReads", false);
+            if (gateReads is not bool)
+                Error(input, "Input gateReads must be true or false.");
+            else if (gateReads is true && (exclusive || !buffer))
+                Error(input, "Input gateReads requires a buffered OR key group.");
+            if (keys is string names)
+            {
+                string[] keyNames = names.Contains(' ')
+                    ? names.Split(' ', StringSplitOptions.RemoveEmptyEntries)
+                    : [.. names.Select(name => name.ToString())];
+                var ids = keyNames.Select(TileCatalog.KeyboardKeyId).ToArray();
+                if (ids.Length >= 2 && ids.Length <= (exclusive ? 2 : 4) &&
+                    ids.All(id => id > 0) && ids.Distinct().Count() == ids.Length)
+                    return (null, buffer, false, new([.. ids.Select(id => (ushort)id)], exclusive, gateReads is true), null);
+            }
+            Error(input, exclusive
+                ? "XOR input keys must name two distinct Logic Arrows keys."
+                : "OR input keys must name two to four distinct Logic Arrows keys.");
+            return (null, false, false, null, null);
+        }
+        if (options.ContainsKey("combine"))
+            Error(input, "Input combine requires a keyboard group.");
+        if (options.ContainsKey("gateReads"))
+            Error(input, "Input gateReads requires a buffered OR key group.");
+        if (options.TryGetValue("tap", out var tap))
+        {
+            if (tap is not bool)
+                Error(input, "Input tap must be true or false.");
+            if (tap is true)
+            {
+                if (input.Position is null || type.Shape.Kind is not (TypeKind.Bit or TypeKind.Bits) || options.ContainsKey("key"))
+                    Error(input, "An input tap requires an anchored bit or bits port without a keyboard key option.");
+                if (buffer && type.Shape.Kind != TypeKind.Bit)
+                    Error(input, "Buffered input taps require a bit port.");
+                return (null, buffer, true, null, tapPitch);
+            }
+        }
         if (!options.TryGetValue("key", out var value))
         {
             if (buffer)
-                Error(input, "Input buffering requires a keyboard key.");
-            return (null, false);
+                Error(input, "Input buffering requires a keyboard key, keyboard group, or tap.");
+            return (null, false, false, null, null);
         }
         if (type.Shape.Kind != TypeKind.Bit)
         {
             Error(input.Type, "A keyboard input requires a bit port.");
-            return (null, false);
+            return (null, false, false, null, null);
         }
-        if (value is string { Length: 1 } name)
+        if (value is string name)
         {
-            var key = TileCatalog.KeyboardKeys.IndexOf(char.ToUpperInvariant(name[0]));
+            var key = TileCatalog.KeyboardKeyId(name);
             if (key > 0)
-                return ((ushort)key, buffer);
+                return ((ushort)key, buffer, false, null, null);
         }
-        Error(input, "Input key must be a letter from A to Z or a digit from 0 to 9.");
-        return (null, false);
+        Error(input, "Input key must name a supported Logic Arrows key.");
+        return (null, false, false, null, null);
     }
 
-    private (byte? Forward, ushort? LampStyle) BindOutputOptions(OutputDeclarationSyntax output)
+    private (byte? Forward, ushort? LampStyle, int? Pitch) BindOutputOptions(OutputDeclarationSyntax output, DataType type)
     {
         var options = BindOptions(output.Options);
         byte? forward = null;
@@ -510,18 +568,32 @@ internal sealed partial class Binder(string path, IReadOnlyList<SourceUnit> unit
                 Error(output, "Output forward must be 'up', 'right', 'down', or 'left'.");
         }
 
+        int? pitch = null;
+        if (options.Remove("pitch", out var pitchOption))
+        {
+            if (type.Shape.Kind != TypeKind.Bits)
+                Error(output, "Output pitch requires a bits port.");
+            else if (pitchOption is not int spacing || spacing <= 0 ||
+                (long)spacing * Math.Max(1, type.Width - 1) > Position.MaximumCoordinate - Position.MinimumCoordinate)
+                Error(output, "Output pitch must be a positive tile count that fits the bus within the map range.");
+            else if (spacing == 1 && type.Width > 1 && forward is 1 or 3)
+                Error(output, "Horizontally forwarding output lanes need at least two tiles of pitch.");
+            else
+                pitch = spacing;
+        }
+
         if (options.Count == 0)
-            return (forward, null);
+            return (forward, null, pitch);
         options.TryAdd("color", "green");
         options.TryAdd("bright", true);
         try
         {
-            return (forward, TileCatalog.Create("lamp", default, 0, false, options).Extra);
+            return (forward, TileCatalog.Create("lamp", default, 0, false, options).Extra, pitch);
         }
         catch (ArgumentException error)
         {
             Error(output, error.Message);
-            return (forward, null);
+            return (forward, null, pitch);
         }
     }
 
@@ -531,9 +603,9 @@ internal sealed partial class Binder(string path, IReadOnlyList<SourceUnit> unit
         var size = BindPosition(syntax.Size);
         var options = BindOptions(syntax.Options);
         var style = options.Remove("style", out var value) ? value : "lamp";
-        if (style is not ("lamp" or "solid"))
+        if (style is not ("lamp" or "solid" or "arrows" or "rgb" or "rgb-lamps"))
         {
-            Error(syntax, "Screen style must be 'lamp' or 'solid'.");
+            Error(syntax, "Screen style must be 'lamp', 'solid', 'arrows', 'rgb', or 'rgb-lamps'.");
             return null;
         }
         if (size.X <= 0 || size.Y <= 0)
@@ -541,8 +613,42 @@ internal sealed partial class Binder(string path, IReadOnlyList<SourceUnit> unit
             Error(syntax.Size, "A screen requires positive dimensions.");
             return null;
         }
-        var endX = (long)origin.X + size.X - 1;
-        var endY = (long)origin.Y + size.Y - 1;
+        var arrowDisplay = style is "arrows";
+        var rgbDisplay = style is "rgb";
+        var rgbLamps = style is "rgb-lamps";
+        var scale = style switch
+        {
+            "arrows" => Screen.ArrowDisplayScale,
+            "rgb" => Screen.RgbDisplayScale,
+            "rgb-lamps" => Screen.RgbLampScale,
+            _ => 1
+        };
+        if (options.Remove("scale", out var scaleOption))
+        {
+            if (style is "lamp" || scaleOption is not int multiplier || multiplier <= 0)
+            {
+                Error(syntax, "A screen scale requires a positive integer and a palette screen style.");
+                return null;
+            }
+            scale = multiplier;
+        }
+        if (arrowDisplay && scale != Screen.ArrowDisplayScale)
+        {
+            Error(syntax, $"An arrows screen requires scale = {Screen.ArrowDisplayScale}.");
+            return null;
+        }
+        if (rgbDisplay && scale != Screen.RgbDisplayScale)
+        {
+            Error(syntax, $"An rgb screen requires scale = {Screen.RgbDisplayScale}.");
+            return null;
+        }
+        if (rgbLamps && scale != Screen.RgbLampScale)
+        {
+            Error(syntax, $"An rgb-lamps screen requires scale = {Screen.RgbLampScale}.");
+            return null;
+        }
+        var endX = origin.X + (long)size.X * scale - 1;
+        var endY = origin.Y + (long)size.Y * scale - 1;
         if (!origin.FitsMap || !Position.CoordinateFitsMap(endX) || !Position.CoordinateFitsMap(endY))
         {
             Error(syntax, "The screen extends outside the v5 map coordinate range.");
@@ -559,7 +665,7 @@ internal sealed partial class Binder(string path, IReadOnlyList<SourceUnit> unit
         options.TryAdd("color", "green");
         try
         {
-            if (style is "solid")
+            if (style is not "lamp")
             {
                 var hold = false;
                 var slice = false;
@@ -581,19 +687,30 @@ internal sealed partial class Binder(string path, IReadOnlyList<SourceUnit> unit
                     }
                     slice = enabled;
                 }
+                var sliceWork = 0;
+                if (options.Remove("sliceWork", out var workOption))
+                {
+                    if (!slice || workOption is not int work || work < 0)
+                    {
+                        Error(syntax, "Screen sliceWork requires slice = true and a nonnegative integer.");
+                        return null;
+                    }
+                    sliceWork = work;
+                }
                 if (options.Keys.Any(name => name != "color"))
                 {
-                    Error(syntax, "Solid screens accept color, hold, and slice options.");
+                    Error(syntax, "Palette screens accept color, hold, slice, sliceWork, and scale options.");
                     return null;
                 }
                 var pixel = TileCatalog.Create("wall", origin, 0, false, options);
                 const ushort Black = (ushort)TileColor.Black;
                 if (pixel.Extra == Black)
                 {
-                    Error(syntax, "A solid screen requires a visible foreground color against its black background.");
+                    Error(syntax, "A palette screen requires a visible foreground color against its black background.");
                     return null;
                 }
-                return FitScreen(new Screen(pixel with { Extra = Black }, size.X, size.Y, pixel.Extra, hold, slice));
+                return FitScreen(new Screen(pixel with { Extra = Black }, size.X, size.Y, pixel.Extra, hold, slice, scale,
+                    arrowDisplay, sliceWork, rgbDisplay, rgbLamps));
             }
             options.TryAdd("bright", true);
             var lamp = TileCatalog.Create("lamp", origin, 0, false, options);
@@ -613,9 +730,10 @@ internal sealed partial class Binder(string path, IReadOnlyList<SourceUnit> unit
 
         Screen? FitScreen(Screen screen)
         {
-            // Each screen chunk has one tile-type group. Check its exact body
-            // size before allocating the pixel grid in the target layout.
-            var bytes = 2 + 7 * chunkColumns * chunkRows + screen.PixelCount * MapCodec.TileBodyBytes(screen.Background);
+            // The arrows layout uses four tile types and the RGB lamps use two.
+            var chunkBytes = screen.ArrowDisplay ? 13 : screen.RgbLamps ? 9 : 7;
+            var bytes = 2 + chunkBytes * chunkColumns * chunkRows +
+                (long)screen.TileWidth * screen.TileHeight * MapCodec.TileBodyBytes(screen.Background);
             if (bytes <= MapCodec.MaximumLevelBytes)
                 return screen;
             Error(syntax, $"The screen alone uses {bytes:N0} expanded Level bytes. The game allows at most 16 MiB.");

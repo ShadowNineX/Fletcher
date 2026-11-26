@@ -151,6 +151,21 @@ internal sealed partial class Binder
                     };
                     return new BoundEffect(EffectKind.Pixel, CoerceArguments(arguments, parameters, pixel));
                 }
+                if (expression.Expression is CallExpressionSyntax { Target: NameExpressionSyntax { Name: "screenPalette", TypeArguments.IsEmpty: true } } palette &&
+                    scope.Find("screenPalette") is null)
+                {
+                    if (screen is null && !testing || screen is { IsSolid: false })
+                        Error(palette, "screenPalette requires a palette screen declaration in the map.");
+                    if (palette.Arguments.Length != 1)
+                    {
+                        Error(palette, "screenPalette requires a [256]bits<24> palette.");
+                        return new BoundBlock([]);
+                    }
+                    var colors = BindExpression(palette.Arguments[0], scope, args);
+                    if (colors.Type.Shape is not { Kind: TypeKind.Array, Size: 256, Element.Shape: { Kind: TypeKind.Bits, Size: 24 } })
+                        Error(palette.Arguments[0], "screenPalette requires a [256]bits<24> palette.");
+                    return new BoundEffect(EffectKind.ScreenPalette, [colors]);
+                }
                 if (expression.Expression is CallExpressionSyntax { Target: NameExpressionSyntax { Name: "preserveScreen", TypeArguments.Length: 0 } } preserve &&
                     scope.Find("preserveScreen") is null)
                 {
@@ -158,9 +173,15 @@ internal sealed partial class Binder
                         Error(expression, "preserveScreen requires a solid screen declaration in the map.");
                     else if (screen is { IsSolid: false })
                         Error(expression, "preserveScreen requires a solid screen declaration in the map.");
-                    if (!preserve.Arguments.IsEmpty)
-                        Error(preserve, "preserveScreen takes no arguments.");
-                    return new BoundEffect(EffectKind.PreserveScreen, []);
+                    if (preserve.Arguments.IsEmpty)
+                        return new BoundEffect(EffectKind.PreserveScreen, []);
+                    if (preserve.Arguments.Length != 2)
+                    {
+                        Error(preserve, "preserveScreen takes no arguments, or a first row and row count.");
+                        return new BoundBlock([]);
+                    }
+                    var rows = preserve.Arguments.Select(argument => BindExpression(argument, scope, args)).ToArray();
+                    return new BoundEffect(EffectKind.PreserveScreen, CoerceArguments(rows, [DataType.Int, DataType.Int], preserve));
                 }
                 if (expression.Expression is CallExpressionSyntax { Target: NameExpressionSyntax { Name: "revealScreen", TypeArguments.Length: 0 } } reveal &&
                     scope.Find("revealScreen") is null)

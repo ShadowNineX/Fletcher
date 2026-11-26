@@ -9,7 +9,7 @@ internal enum BinaryOperator
     Equal, NotEqual, LessThan, LessThanOrEqual, GreaterThan, GreaterThanOrEqual
 }
 
-internal enum EffectKind { Log, Pixel, PreserveScreen, RevealScreen, Discard }
+internal enum EffectKind { Log, Pixel, ScreenPalette, PreserveScreen, RevealScreen, Discard }
 
 internal static class OperatorText
 {

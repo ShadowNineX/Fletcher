@@ -23,6 +23,8 @@ internal sealed record RoutingGeometry(
     int InputPitch, int InputMarginX, int InputMarginY, int GateStepX, int GateStepY,
     int OutputMarginX, int OutputMarginY, int OutputGap)
 {
+    public bool OrderGatesByDepth { get; init; }
+    public bool SeparateComponents { get; init; }
     public static RoutingGeometry Tight { get; } = new(4, 4, 6, 5, 6, 4, 3, 4);
     public static RoutingGeometry Dense { get; } = new(4, 6, 8, 6, 8, 4, 3, 4);
     public static RoutingGeometry Compact { get; } = new(6, 8, 14, 8, 12, 8, 6, 6);
@@ -50,6 +52,14 @@ internal static partial class NativeRouter
     private const byte Right = 1;
     private const byte Down = 2;
     private static readonly HashSet<int> NoShortcuts = [];
+
+    internal static Gate[] OrderByDepth(IReadOnlyList<Gate> gates)
+    {
+        Dictionary<int, int> depths = [];
+        foreach (var gate in gates)
+            depths[gate.Id] = 1 + gate.Inputs.Max(input => depths.GetValueOrDefault(input));
+        return [.. gates.OrderBy(gate => depths[gate.Id])];
+    }
 
     internal static Position RecommendedOutputOrigin(IReadOnlyList<Gate> gates, IEnumerable<Tile> drivenTiles, RoutingGeometry geometry)
     {
@@ -149,6 +159,102 @@ internal static partial class NativeRouter
         return CompactRoutes(occupied, fixedPositions, sources, drivenSignals.Keys, buses, consumers, outputs, outputLatencies);
     }
 
+    public static RouteResult RouteComponents(IReadOnlyList<Gate> gates, IReadOnlyDictionary<int, Tile> drivenSignals,
+        IReadOnlyList<OutputPin> outputs, IReadOnlyList<Tile> fixedTiles, RoutingGeometry geometry)
+    {
+        var parent = gates.Select(gate => gate.Id).Concat(drivenSignals.Keys).ToDictionary(id => id);
+        foreach (var gate in gates)
+            foreach (int input in gate.Inputs)
+                if (parent.ContainsKey(input))
+                    Join(gate.Id, input);
+
+        var livePins = outputs.Where(pin => pin.Signal != -1).ToArray();
+        if (livePins.Any(pin => !parent.ContainsKey(pin.Signal)))
+            throw new RoutingException("An independent circuit output has no source.");
+        foreach (var bus in livePins.Where(pin => pin.TimingGroup.HasValue).GroupBy(pin => pin.TimingGroup))
+            foreach (var pin in bus.Skip(1))
+                Join(bus.First().Signal, pin.Signal);
+
+        var components = livePins.GroupBy(pin => Root(pin.Signal)).ToArray();
+        if (components.Length < 2)
+            throw new RoutingException("There are no independent circuit components to route.");
+
+        var occupied = BuildOccupied(fixedTiles);
+        Dictionary<Position, int> owners = [];
+        Dictionary<Position, int> latencies = [];
+        List<Tile> routed = [];
+        foreach (var component in components)
+        {
+            var componentGates = gates.Where(gate => Root(gate.Id) == component.Key).ToArray();
+            var componentInputs = drivenSignals.Where(pair => Root(pair.Key) == component.Key).ToDictionary();
+            var result = RouteComponent(componentGates, componentInputs, component.ToArray(), occupied.Values.ToArray(), geometry);
+
+            foreach (var tile in result.Tiles)
+            {
+                occupied.Add(tile.Position, tile);
+                owners.Add(tile.Position, component.Key);
+                routed.Add(tile);
+            }
+            foreach (var input in componentInputs.Values)
+                owners.Add(input.Position, component.Key);
+            foreach (var pin in component)
+                owners.Add(pin.Position, component.Key);
+            foreach (var (position, latency) in result.OutputLatency)
+                latencies.Add(position, latency);
+        }
+
+        // Validate the final layout in both directions. A later component may
+        // occupy a previously empty destination, including a two-cell jump.
+        foreach (var (position, owner) in owners)
+            foreach (var destination in TileCatalog.Destinations(occupied[position]))
+                if (owners.TryGetValue(destination, out int other) && other != owner)
+                    throw new RoutingException($"Independent routes connect at {destination}.");
+
+        return new RouteResult(routed, latencies);
+
+        int Root(int signal)
+        {
+            while (parent[signal] != signal)
+            {
+                parent[signal] = parent[parent[signal]];
+                signal = parent[signal];
+            }
+            return signal;
+        }
+
+        void Join(int first, int second)
+        {
+            parent[Root(second)] = Root(first);
+        }
+    }
+
+    private static RouteResult RouteComponent(IReadOnlyList<Gate> gates, IReadOnlyDictionary<int, Tile> drivenSignals,
+        IReadOnlyList<OutputPin> outputs, IReadOnlyList<Tile> fixedTiles, RoutingGeometry preferred)
+    {
+        // The anchors of one board may require a tighter layout than those
+        // of the next board. Keep the preferred layout first for each board.
+        RoutingGeometry[] geometries = [preferred with { OrderGatesByDepth = false, SeparateComponents = false },
+            RoutingGeometry.Tight, RoutingGeometry.Dense,
+            RoutingGeometry.Compact, RoutingGeometry.Standard];
+        IReadOnlyList<Gate>[] orders = [gates, OrderByDepth(gates)];
+        RoutingException? failure = null;
+        foreach (var geometry in geometries.Distinct())
+        {
+            foreach (var order in orders)
+            {
+                try
+                {
+                    return Route(order, drivenSignals, outputs, fixedTiles, geometry);
+                }
+                catch (RoutingException error)
+                {
+                    failure = error;
+                }
+            }
+        }
+        throw failure ?? new RoutingException("No valid layout for an independent circuit.");
+    }
+
     private static Dictionary<Position, Tile> BuildOccupied(IReadOnlyList<Tile> fixedTiles)
     {
         Dictionary<Position, Tile> occupied = [];
@@ -240,7 +346,7 @@ internal static partial class NativeRouter
             throw new RoutingException($"Signal source at {tile.Position} must face right for native routing.");
         }
 
-        return new Position(tile.Position.X + 1, tile.Position.Y);
+        return new Position(tile.Position.X + (tile.Type == BlueArrow ? 2 : 1), tile.Position.Y);
     }
 
     private static List<Consumer> CreateConsumers(
@@ -297,9 +403,13 @@ internal static partial class NativeRouter
         {
             SignalSource source = sources[group.Key];
             List<Consumer> leaves = [.. group.OrderBy(consumer => consumer.Target.X)];
-            if (leaves.Exists(consumer => consumer.Target.X < source.Start.X || consumer.Target.Y <= source.Start.Y))
+            var unreachable = leaves.Find(consumer => consumer.Target.X < source.Start.X || consumer.Target.Y <= source.Start.Y);
+            if (unreachable is not null)
             {
-                throw new RoutingException($"Signal {source.Signal} cannot reach one of its consumers with the downward bus layout.");
+                throw new RoutingException($"Signal {source.Signal} cannot reach one of its consumers with the downward bus layout.")
+                {
+                    OutputSink = unreachable.GateId is null ? unreachable.Sink : null
+                };
             }
 
             if (leaves.Select(consumer => consumer.Target).Distinct().Count() != leaves.Count)
@@ -503,4 +613,7 @@ internal static partial class NativeRouter
     private readonly record struct PathResult(int Hops);
 }
 
-public sealed class RoutingException(string message) : Exception(message);
+public sealed class RoutingException(string message) : Exception(message)
+{
+    internal Position? OutputSink { get; init; }
+}

@@ -14,8 +14,10 @@ internal sealed partial class ScriptEmitter(IrProgram program, bool splitTables 
     private readonly StringBuilder text = new();
     private readonly Dictionary<DataType, string> copiers = [];
     private readonly List<string> copierDeclarations = [];
+    private readonly HashSet<DataType> structsWithCustomFieldOrder = [];
     private readonly HashSet<Function> directSlicedFunctions = [];
     private readonly HashSet<Function> ownedResults = [];
+    private readonly HashSet<(Function Function, string Field)> ownedResultFields = [];
     private int indent;
     private int nextTemporary;
     private bool sliced;
@@ -28,13 +30,14 @@ internal sealed partial class ScriptEmitter(IrProgram program, bool splitTables 
         if (sliced)
             Line("let __budget;");
         Line("""
+            const { imul: __imul, floor: __floor, min: __min, max: __max } = Math;
             function __index(i, size) {
                 if (i < 0 || i >= size) throw new Error("Fletcher index out of bounds: " + i);
                 return i;
             }
             function __div(a, b) {
                 if (b === 0) throw new Error("Fletcher division by zero");
-                return Math.trunc(a / b);
+                return a / b;
             }
             function __rem(a, b) {
                 if (b === 0) throw new Error("Fletcher division by zero");
@@ -62,12 +65,18 @@ internal sealed partial class ScriptEmitter(IrProgram program, bool splitTables 
         EmitRuntimeCore();
         Line("function __read(x, y) { return world.getSignal(x, y) > 0; }");
         Function[] reachable = [.. ReachableFunctions(bindings)];
+        AnalyzeIndexBounds(reachable.Select(function => function.Body).Append(program.Tick).Append(program.HostTick));
+        TrackStructFieldOrder(reachable.SelectMany(function => BoundTree.StructLiterals(function.Body))
+            .Concat(BoundTree.StructLiterals(program.Tick))
+            .Concat(BoundTree.StructLiterals(program.HostTick))
+            .Concat(bindings.SelectMany(binding => BoundTree.StructLiterals(binding.Value)))
+            .Concat(program.Registers.SelectMany(register => BoundTree.StructLiterals(register.Initial))));
         AnalyzeOwnedResults(reachable);
         if (sliced)
         {
-            var dispatched = DispatchedMethods().ToHashSet();
+            AnalyzeOwnedArguments(reachable);
             foreach (var function in reachable)
-                if (!dispatched.Contains(function) && !BoundTree.HasLoopOrCall(function.Body) && CachedFileReadValue(function) is null)
+                if (!BoundTree.HasLoopOrCall(function.Body) && CachedFileReadValue(function) is null)
                     directSlicedFunctions.Add(function);
         }
         UsesMouse = BoundTree.UsesMouse(program.Tick) || bindings.Any(binding => BoundTree.UsesMouse(binding.Value)) ||
@@ -79,8 +88,8 @@ internal sealed partial class ScriptEmitter(IrProgram program, bool splitTables 
             Line("""
                 let __mouseX = -1, __mouseY = -1;
                 onPlayerMouseMove((x, y) => {
-                    __mouseX = Math.min(1024, Math.max(0, (x * 1024) | 0));
-                    __mouseY = Math.min(1024, Math.max(0, (y * 1024) | 0));
+                    __mouseX = __min(1024, __max(0, (x * 1024) | 0));
+                    __mouseY = __min(1024, __max(0, (y * 1024) | 0));
                 });
                 """);
         }
@@ -103,6 +112,8 @@ internal sealed partial class ScriptEmitter(IrProgram program, bool splitTables 
         if (program.Screen is { IsSolid: true })
         {
             Line("__pixels.fill(__background);");
+            if (program.Screen.UsesRgbPalette)
+                Line("__hasRgbPalette = false;");
             if (UsesPixelIndices)
                 Line("__pixelIndices.fill(0);");
         }
@@ -153,23 +164,44 @@ internal sealed partial class ScriptEmitter(IrProgram program, bool splitTables 
 
     private void EmitMethodDispatch()
     {
+        var hasDirectMethods = sliced && DispatchedMethods().Any(directSlicedFunctions.Contains);
         Line("const __methods = {");
         indent++;
         foreach (var (type, tag) in program.TypeTags.OrderBy(pair => pair.Value))
         {
             var implementations = program.Methods.TryGetValue(type, out var methods)
-                ? string.Join(", ", methods.Select(pair => $"[{Quote(pair.Key)}]: __f{pair.Value.Id}"))
+                ? string.Join(", ", methods.Select(pair => $"[{Quote(pair.Key)}]: {MethodTarget(pair.Value)}"))
                 : "";
             Line($"{tag}: {{ {implementations} }},");
         }
         indent--;
         Line("};");
+        if (hasDirectMethods)
+        {
+            // The receiver and arguments are already evaluated when this slot is checked.
+            Line("""
+                function* __dispatch(receiver, method, ...args) {
+                    if (receiver === null) throw new Error("Fletcher call on an uninitialized interface");
+                    const target = __methods[receiver.t][method];
+                    if (typeof target === "function") {
+                        if (__budget === 0) yield;
+                        return target(receiver.v, ...args);
+                    }
+                    return yield* target.generator(receiver.v, ...args);
+                }
+                """);
+            return;
+        }
         Line($$"""
             {{(sliced ? "function*" : "function")}} __dispatch(receiver, method, ...args) {
                 if (receiver === null) throw new Error("Fletcher call on an uninitialized interface");
                 {{(sliced ? "return yield*" : "return")}} __methods[receiver.t][method](receiver.v, ...args);
             }
             """);
+
+        string MethodTarget(Function target) => hasDirectMethods && !directSlicedFunctions.Contains(target)
+            ? $"{{ generator: __f{target.Id} }}"
+            : $"__f{target.Id}";
     }
 
     private IEnumerable<Function> DispatchedMethods() =>
@@ -237,8 +269,12 @@ internal sealed partial class ScriptEmitter(IrProgram program, bool splitTables 
     private void EmitFunction(Function function)
     {
         Variable[] parameters = function.Receiver is { } receiver ? [receiver, .. function.Parameters] : function.Parameters;
+        var names = parameters.Select(Name);
+        var movable = movableParameters.GetValueOrDefault(function);
+        if (movable != 0)
+            names = names.Append("__ownedArguments");
         var direct = directSlicedFunctions.Contains(function);
-        Line($"function{(sliced && !direct ? "*" : "")} __f{function.Id}({string.Join(", ", parameters.Select(Name))}) {{");
+        Line($"function{(sliced && !direct ? "*" : "")} __f{function.Id}({string.Join(", ", names)}) {{");
         indent++;
         if (!sliced || !TryEmitCachedFileRead(function))
         {
@@ -247,7 +283,12 @@ internal sealed partial class ScriptEmitter(IrProgram program, bool splitTables 
             else
                 EmitWorkStep();
             foreach (var parameter in CopiedParameters(function))
-                Line($"{Name(parameter)} = {Copy(parameter.Type, Name(parameter))};");
+            {
+                var copy = $"{Name(parameter)} = {Copy(parameter.Type, Name(parameter))};";
+                var index = Array.IndexOf(parameters, parameter);
+                var flag = index < 31 ? 1 << index : 0;
+                Line((movable & flag) != 0 ? $"if (!(__ownedArguments & {flag})) {copy}" : copy);
+            }
             if (function.Body is { } body)
                 EmitStatements(body);
         }
@@ -272,10 +313,13 @@ internal sealed partial class ScriptEmitter(IrProgram program, bool splitTables 
                 indent--;
                 Line("}");
                 break;
+            case BoundLocals { ResultSource: null, Symbols: [{ } local] } single:
+                Line($"{(single.IsNew[0] ? "let " : "")}{Name(local)} = {Copy(single.Values[0])};");
+                break;
             case BoundLocals locals:
             {
                 EmitResultSource(locals.ResultSource);
-                var names = locals.Values.Select(value => Temporary(Copy(value))).ToArray();
+                var names = locals.Values.Select(value => Temporary(CopyResultValue(value, locals.ResultSource))).ToArray();
                 for (var i = 0; i < names.Length; i++)
                 {
                     if (locals.Symbols[i] is { } local)
@@ -283,11 +327,17 @@ internal sealed partial class ScriptEmitter(IrProgram program, bool splitTables 
                 }
                 break;
             }
+            case BoundAssignment { ResultSource: null, Targets: [{ } target] } single
+                when target is BoundVariable or BoundMember or BoundIndex { Receiver.Type.Shape.Kind: TypeKind.Array }:
+                // JavaScript resolves the destination before evaluating the
+                // RHS and retains that reference if the RHS suspends.
+                Line($"{Expr(target)} = {Copy(single.Values[0])};");
+                break;
             case BoundAssignment assignment:
             {
                 var targets = assignment.Targets.Select(target => target is null ? null : Capture(target)).ToArray();
                 EmitResultSource(assignment.ResultSource);
-                var values = assignment.Values.Select(value => Temporary(Copy(value))).ToArray();
+                var values = assignment.Values.Select(value => Temporary(CopyResultValue(value, assignment.ResultSource))).ToArray();
                 for (var i = 0; i < values.Length; i++)
                     targets[i]?.Assign(values[i]);
                 break;
@@ -333,12 +383,14 @@ internal sealed partial class ScriptEmitter(IrProgram program, bool splitTables 
                     TypeKind.Bytes => FileSize(collection),
                     _ => $"{collection}.length"
                 };
-                var index = $"__t{nextTemporary++}";
+                var sourceIndex = loop.Index is { } indexVariable ? Name(indexVariable) : null;
+                var index = loop.Index is { } induction && !indexWrites.ContainsKey(induction)
+                    ? Name(induction) : $"__t{nextTemporary++}";
                 Line($"for (let {index} = 0; {index} < {length}; {index}++) {{");
                 indent++;
                 EmitWorkStep();
-                if (loop.Index is { } indexVariable)
-                    Line($"let {Name(indexVariable)} = {index};");
+                if (sourceIndex is not null && sourceIndex != index)
+                    Line($"let {sourceIndex} = {index};");
                 if (loop.Value is { } value)
                 {
                     var element = kind == TypeKind.Bytes ? FileByte(collection, index) : Copy(value.Type, $"{collection}[{index}]");
@@ -377,8 +429,12 @@ internal sealed partial class ScriptEmitter(IrProgram program, bool splitTables 
             case BoundEffect { Kind: EffectKind.Pixel } effect:
                 Line($"__pixel({string.Join(", ", effect.Arguments.Select(Expr))});");
                 break;
-            case BoundEffect { Kind: EffectKind.PreserveScreen }:
-                Line("__preserveScreen();");
+            case BoundEffect { Kind: EffectKind.ScreenPalette } effect:
+                var colors = Expr(effect.Arguments[0]);
+                Line(program.Screen is { UsesRgbPalette: false } ? $"{colors};" : $"__screenPalette({colors});");
+                break;
+            case BoundEffect { Kind: EffectKind.PreserveScreen } effect:
+                Line($"__preserveScreen({string.Join(", ", effect.Arguments.Select(Expr))});");
                 break;
             case BoundEffect { Kind: EffectKind.RevealScreen } effect:
                 Line($"__revealScreen({string.Join(", ", effect.Arguments.Select(Expr))});");
@@ -462,23 +518,32 @@ internal sealed partial class ScriptEmitter(IrProgram program, bool splitTables 
         BoundIndex index => $"({Expr(index.Receiver)})[{IndexOffset(index.Index, index.Receiver.Type.Shape.Size)}]",
         BoundByteLength length => FileSize(Expr(length.Receiver)),
         BoundStruct structure => StructLiteral(structure, snapshot: false),
-        BoundArray array => $"[{string.Join(", ", array.Elements.Select(Expr))}]"
+        BoundArray array => ArrayLiteral(array, snapshot: false)
     };
 
-    // The binder has checked literal offsets into fixed-size arrays and bits.
-    private string IndexOffset(BoundExpression offset, int size) =>
-        offset is BoundLiteral { Value: int } ? Expr(offset) : $"__index({Expr(offset)}, {size})";
+    private string IndexOffset(BoundExpression offset, int size)
+    {
+        var index = Expr(offset);
+        // Fixed arrays and vectors can use a direct read whenever the entire
+        // index range fits. Imported bytes still have their own size checks.
+        return IndexBounds(offset) is { Min: >= 0 } bounds && bounds.Max < size
+            ? index : $"__index({index}, {size})";
+    }
 
     private string CallFunction(BoundCall call)
     {
         var callee = $"__f{call.Function.Id}";
         var arguments = WithReceiver(call.Receiver, call.Arguments).Select(Expr);
+        var owned = ownedCallArguments.GetValueOrDefault(call);
         if (!directSlicedFunctions.Contains(call.Function))
-            return Call(callee, arguments);
+            return Call(callee, owned == 0 ? arguments : arguments.Append(owned.ToString(CultureInfo.InvariantCulture)));
 
         // The unused final argument puts the entry checkpoint after the real
         // arguments, even if a nested call consumes the last slot in the slice.
-        return $"{callee}({string.Join(", ", arguments.Append("(__budget === 0 ? (yield) : 0)"))})";
+        var checkpoint = movableParameters.ContainsKey(call.Function)
+            ? $"((__budget === 0 ? (yield) : 0), {owned})"
+            : "(__budget === 0 ? (yield) : 0)";
+        return $"{callee}({string.Join(", ", arguments.Append(checkpoint))})";
     }
 
     private string Call(string callee, IEnumerable<string> arguments)
@@ -515,7 +580,9 @@ internal sealed partial class ScriptEmitter(IrProgram program, bool splitTables 
         {
             BinaryOperator.Equal => $"(({left}) === ({right}))",
             BinaryOperator.NotEqual => $"(({left}) !== ({right}))",
-            BinaryOperator.Multiply => $"Math.imul({left}, {right})",
+            BinaryOperator.Multiply => $"__imul({left}, {right})",
+            BinaryOperator.Divide or BinaryOperator.Remainder when binary.Right is BoundLiteral { Value: int and not 0 or uint and not 0u }
+                => $"(({left}) {OperatorText.Symbol(binary.Operator)} ({right}))",
             BinaryOperator.Divide => $"__div({left}, {right})",
             BinaryOperator.Remainder => $"__rem({left}, {right})",
             BinaryOperator.ShiftRight when binary.Left.Type.Shape.Kind == TypeKind.Bits => $"(({left}) >>> ({right}))",
@@ -526,7 +593,8 @@ internal sealed partial class ScriptEmitter(IrProgram program, bool splitTables 
             _ => throw new InvalidOperationException($"Unexpected script operator '{binary.Operator}'.")
         };
         // JavaScript bitwise operators and imul already return signed
-        // 32-bit results. Unsigned right shifts and narrow bitwise
+        // 32-bit results. The normalization on division truncates the
+        // quotient toward zero. Unsigned right shifts and narrow bitwise
         // operations already stay within their Fletcher operand width.
         return (binary.Type.Shape.Kind, binary.Operator) switch
         {
@@ -558,25 +626,62 @@ internal sealed partial class ScriptEmitter(IrProgram program, bool splitTables 
 
     private void AnalyzeOwnedResults(IEnumerable<Function> functions)
     {
-        foreach (var function in functions.Where(function => NeedsCopy(function.Result)))
+        foreach (var function in functions.Where(function => NeedsCopy(function.Result) && !function.Result.IsResultList))
         {
             var statements = BoundTree.Statements(function.Body).ToArray();
-            // Declarations and range elements take snapshots. A parameter
-            // has independent storage only if the callee copies it on entry.
-            var owned = CopiedParameters(function).ToHashSet();
-            foreach (var declaration in statements.OfType<BoundLocals>())
-                for (var i = 0; i < declaration.Symbols.Length; i++)
-                    if (declaration.IsNew[i] && declaration.Symbols[i] is { } local)
-                        owned.Add(local);
-            foreach (var loop in statements.OfType<BoundRange>())
-                if (loop.Value is { } element)
-                    owned.Add(element);
-
+            var owned = OwnedStorage(function, statements);
             var returns = statements.OfType<BoundReturn>().ToArray();
             if (returns.Length > 0 && Array.TrueForAll(returns, result => result.Value is { } value &&
                 (OwnsLiteral(value) || BoundTree.StorageRoot(value) is { } root && owned.Contains(root))))
                 ownedResults.Add(function);
         }
+
+        foreach (var function in functions.Where(function => function.Result.IsResultList))
+        {
+            var statements = BoundTree.Statements(function.Body).ToArray();
+            var returns = statements.OfType<BoundReturn>().Select(result => result.Value).ToArray();
+            var explicitReturns = returns.OfType<BoundStruct>().ToArray();
+            if (explicitReturns.Length == 0 || explicitReturns.Length != returns.Length)
+                continue;
+            var owned = OwnedStorage(function, statements);
+            foreach (var (field, type) in function.Result.Fields)
+                if (NeedsCopy(type) && Array.TrueForAll(explicitReturns, result => OwnsResultField(result, field, owned)))
+                    ownedResultFields.Add((function, field));
+        }
+    }
+
+    // Declarations and range elements take snapshots. A parameter has
+    // independent storage only if the callee copies it on entry.
+    private static HashSet<Variable> OwnedStorage(Function? function, BoundStatement[] statements)
+    {
+        HashSet<Variable> owned = function is null ? [] : [.. CopiedParameters(function)];
+        foreach (var declaration in statements.OfType<BoundLocals>())
+            for (var i = 0; i < declaration.Symbols.Length; i++)
+                if (declaration.IsNew[i] && declaration.Symbols[i] is { } local)
+                    owned.Add(local);
+        foreach (var loop in statements.OfType<BoundRange>())
+            if (loop.Value is { } element)
+                owned.Add(element);
+        return owned;
+    }
+
+    private bool OwnsResultField(BoundStruct result, string field, HashSet<Variable> owned)
+    {
+        var value = result.Fields[field];
+        if (OwnsLiteral(value) || value is BoundCall call && ownedResults.Contains(call.Function))
+            return true;
+
+        // Returning one local twice must still produce two independent values.
+        return BoundTree.StorageRoot(value) is { } root && owned.Contains(root) &&
+            result.Fields.All(other => other.Key == field || BoundTree.StorageRoot(other.Value) != root);
+    }
+
+    private string CopyResultValue(BoundExpression value, BoundResultSource? source)
+    {
+        if (source is { Call: BoundCall call } && value is BoundMember { Receiver: BoundVariable receiver } member &&
+            receiver.Symbol == source.Temporary && ownedResultFields.Contains((call.Function, member.Name)))
+            return Expr(value);
+        return Copy(value);
     }
 
     // A returned literal can embed the same array or struct more than once.
@@ -593,20 +698,44 @@ internal sealed partial class ScriptEmitter(IrProgram program, bool splitTables 
     private string Copy(BoundExpression expression) => expression switch
     {
         BoundStruct structure => StructLiteral(structure, snapshot: true),
-        BoundArray array => $"[{string.Join(", ", array.Elements.Select(Copy))}]",
+        BoundArray array => ArrayLiteral(array, snapshot: true),
         BoundCall call when ownedResults.Contains(call.Function) => Expr(call),
         _ => Copy(expression.Type, Expr(expression))
     };
 
+    private string ArrayLiteral(BoundArray array, bool snapshot)
+    {
+        // Only repeat scalar literals. Composite elements still need independent
+        // storage, and nonliteral expressions must run once for each element.
+        if (array.Elements.Length >= 16 && array.Elements[0] is BoundLiteral first && !NeedsCopy(first.Type) &&
+            array.Elements.All(element => element is BoundLiteral literal && Equals(literal.Value, first.Value)))
+            return $"new Array({array.Elements.Length}).fill({Expr(first)})";
+        var elements = snapshot ? array.Elements.Select(Copy) : array.Elements.Select(Expr);
+        return $"[{string.Join(", ", elements)}]";
+    }
+
     private string StructLiteral(BoundStruct structure, bool snapshot)
     {
-        var fields = structure.Fields.Select(field => $"[{Quote(field.Key)}]: {(snapshot ? Copy(field.Value) : Expr(field.Value))}");
-        return $"({{ {(snapshot ? "__proto__: null, " : "")}{string.Join(", ", fields)} }})";
+        var fields = structure.Fields.Select(field => $"{StructKey(field.Key)}: {(snapshot ? Copy(field.Value) : Expr(field.Value))}");
+        return $"({{ {string.Join(", ", fields)} }})";
     }
+
+    // A computed __proto__ key defines a field instead of setting the object's prototype.
+    private static string StructKey(string name) => name == "__proto__" ? "[\"__proto__\"]" : Quote(name);
     // Boxed interfaces already hold a snapshot and can be shared. Only arrays
     // and structs contain mutable storage that belongs to the new value.
     private static bool NeedsCopy(DataType type) => type.Shape.Kind is TypeKind.Array or TypeKind.Struct;
     private string Copy(DataType type, string expression) => NeedsCopy(type) ? $"{Copier(type.Shape)}({expression})" : expression;
+
+    private void TrackStructFieldOrder(IEnumerable<BoundStruct> literals)
+    {
+        foreach (var literal in literals)
+        {
+            var shape = literal.Type.Shape;
+            if (!literal.Fields.Keys.SequenceEqual(shape.Fields.Keys))
+                structsWithCustomFieldOrder.Add(shape);
+        }
+    }
 
     private string Copier(DataType shape)
     {
@@ -621,16 +750,24 @@ internal sealed partial class ScriptEmitter(IrProgram program, bool splitTables 
             var element = shape.Element!;
             result = NeedsCopy(element) ? $"v.map({Copier(element.Shape)})" : "v.slice()";
         }
-        else
+        else if (structsWithCustomFieldOrder.Contains(shape))
         {
-            // Spread retains field order, including for a keyed literal. Both
-            // the spread and the computed keys preserve fields such as __proto__.
+            // Spread retains field order, including for a keyed literal.
             var fields = shape.Fields.Where(field => NeedsCopy(field.Value)).Select(field =>
             {
                 var key = Quote(field.Key);
-                return $", [{key}]: {Copy(field.Value, $"v[{key}]")}";
+                return $", {StructKey(field.Key)}: {Copy(field.Value, $"v[{key}]")}";
             });
-            result = $"{{ __proto__: null, ...v{string.Concat(fields)} }}";
+            result = $"{{ ...v{string.Concat(fields)} }}";
+        }
+        else
+        {
+            var fields = shape.Fields.Select(field =>
+            {
+                var key = Quote(field.Key);
+                return $"{StructKey(field.Key)}: {Copy(field.Value, $"v[{key}]")}";
+            });
+            result = $"{{ {string.Join(", ", fields)} }}";
         }
         copierDeclarations.Add($"function {name}(v) {{ return {result}; }}");
         return name;

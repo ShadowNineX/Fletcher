@@ -4,7 +4,7 @@ Fletcher emits a Steam Logic Arrows Level JSON wrapper with v5 binary payloads. 
 
 ## Layout
 
-`input a bit at (0, 0)` fixes the button at that coordinate. Its holding tile occupies the cell immediately to the right. Vector input buttons run down the same column in least-significant-bit order, eight cells apart. Vector output lamps run to the right, also eight cells apart. Omitting `at` lets the compiler choose the coordinates.
+`input a bit at (0, 0)` fixes the button at that coordinate. Its holding tile occupies the cell immediately to the right. Vector input buttons run down the same column in least-significant-bit order, eight cells apart. Vector output lamps run to the right, eight cells apart by default. Use `with { pitch = 2 }` on a `bits<N>` output to place its lamps two cells apart. Native output lanes still share one arrival time. Omitting `at` lets the compiler choose the coordinates.
 
 ```fletcher
 place wall at (-4, 0) with { color = "blue", glyph = "A" }
@@ -14,6 +14,8 @@ place logger at (11, 10)
 ```
 
 Standalone tiles use the game's physical rules. Fixed tiles reserve their coordinates during routing. An overlap or unintended connection between manual and generated circuitry produces a diagnostic. The automatic router uses eastbound signal rails and downward branches. For a forced circuit, an anchor outside routable geometry produces an error with the routing reason. Automatic bindings can use a scripted driver at a free neighbor of the lamp.
+
+When the router identifies an unreachable automatic output, Fletcher tries a scripted driver for that output first. Independent outputs can still use physical circuits.
 
 Use `output enabled bit at (4, 8) with { forward = "down" } = value` to continue that output into a manually placed circuit. Each lane uses a forwarding lamp facing the given direction. The tile at the destination must be empty or part of the manual layout so the connection is explicit. Output lamps default to bright green. Use `with { color = "red", bright = false }` to set their fixed color and brightness. A native signal turns the lamp on and off.
 
@@ -25,13 +27,47 @@ Use `circuit { output carry bit = a & b }` to require a physical circuit. Fletch
 
 Native logic carries sustained levels and one-tick events through physical hops. A blue arrow skips a cell in one tick. Fletcher synchronizes physical arrivals at native joins and aligns live lanes of a vector where they are sampled together. Use `--explain` to see each binding's backend, the reason for automatic fallback, and output hop counts.
 
+If the shared layout cannot route several independent circuits, Fletcher also tries routing them separately. Each circuit can use its own routing geometry and still share the map with manual tiles. Circuits that share a signal or feed lanes of the same output bus stay together. The compiler checks the combined layout for unintended connections, including two-cell jumps.
+
+When the usual placements cannot route a circuit, Fletcher can retry with gates ordered by dependency depth. This retry applies to circuits without script-sampled native wires, where placement can change freely without shifting a script's sampling time.
+
 Fletcher folds redundant logic, shares identical gates, and compares factored and unfactored layouts when factoring could affect gate sharing. The router tries several spacing profiles and favors the smallest rectangular footprint for the generated circuitry. It uses tile count to break ties. Single-use scalar lamps can sit beside their drivers, and automatic scripted outputs use the first available row. The router shortens straight runs with blue arrows, turns with diagonal arrows, and branches with blue L-splitters.
 
 In hybrid maps, the standard layout establishes the script tap's sample tick. Smaller layouts must match that tick on every live lane. The router can move delay onto a shared wire after a join to shorten both incoming branches. It can fold a long scalar tap wire into nearby free cells without changing its hop count. Other visible outputs can arrive sooner. Use `--explain` for the generated coordinates and hop counts.
 
 The map controller samples current native inputs and circuit taps in its game tick callback. Then it evaluates scripted bindings and commits register updates. A scripted Source drives the value published in the preceding tick, independently of the callback order within the current tick. The path from that Source to a lamp or native gate adds its own physical latency. For a hybrid path, allow both the bridge and route times before sampling a stable output.
 
-On a sliced screen, the compiler groups buffered keyboard ports in sets of four when there is room. Four Key tiles feed a blue Arrow that serves as a native OR gate. The controller skips the four individual reads when the gate is idle. The gate and individual key signals arrive on the same host tick, so presses still reach the same logical tic. Ports outside a group use individual reads.
+On a sliced screen, an anchored buffered input with `keys = "WASD"` places four Key tiles around a Blue Arrow. The native OR can feed a routed `circuit` or a scripted decision. Use `combine = "xor"` for two keys that should cancel when pressed together. With `gateReads = true`, a buffered OR also lets the controller skip reads of matching, isolated individual key ports while the hub is idle. The gate and key signals arrive on the same host tick. The compiler can also place hubs for groups of four individual key ports. Use a manually placed tile with an input tap for signals driven by a hand-written script.
+
+```fletcher
+map "Hybrid trigger" {
+    screen at (0, 0) size (4, 1) with { style = "solid", hold = true, slice = true }
+    input activity bit at (0, 6) with { keys = "WASD", buffer = true }
+    place arrow at (24, 9) facing down
+    input feedback bit at (24, 9) with { tap = true, buffer = true }
+
+    circuit { output lamp bit at (8, 11) = activity }
+    script { output manualFeed bit at (24, 8) with { forward = "down" } = activity }
+    tick { pixel(1, 0, feedback, color.Green) }
+}
+```
+
+`screen with { style = "rgb" }` uses a 2×2 square of wall tiles per logical pixel. Call
+`screenPalette(palette)` with 256 packed `bits<24>` RGB values before drawing with
+`pixel(x, y, on, fallback, index)`. Fletcher matches each RGB entry by mixing native
+wall tints, penalizing clashing hues and using black and white for neutral shades.
+Indexless draws use the regular wall color across all
+four cells. The palette applies to subsequent draws in the current logical tick.
+Captured frames store the resulting colors for replay and wipes. Zoom out until
+the individual cells visually blend.
+
+`screen with { style = "rgb-lamps" }` uses a 3×3 cell with four pairs of
+forwarding lamps in red, green, blue, and green, plus a black center wall.
+Each pair feeds itself and stays lit between frame changes. The display script
+writes both ends together when changing a pair between lit and unlit. It changes
+one lamp's brightness for stronger colors without interrupting the signal.
+`screenPalette` uses sampled colors from the game at a two-screen-pixel tile
+pitch to match the palette. Use the Dark theme with Arrows in Bloom off.
 
 ### Published script bindings
 

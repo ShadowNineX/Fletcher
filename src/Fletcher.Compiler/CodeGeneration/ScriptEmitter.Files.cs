@@ -160,13 +160,13 @@ internal sealed partial class ScriptEmitter
                 }
                 """ : "")}}
                 __index(index, __fileSize(id));
-                const chunk = Math.floor(index / {{FileChunkBytes}});
+                const chunk = __floor(index / {{FileChunkBytes}});
                 const chunks = __fileChunks[id];
                 let block = chunks[chunk];
                 if (block === undefined) {
                     const encoded = globalState["{{FileKeyPrefix}}" + id + "_" + chunk];
                     if (typeof encoded !== "string") throw new Error("Missing Fletcher file data tile " + id + ":" + chunk);
-                    block = {{(usesPackedFileBlocks ? $"__decodeFileBlock(encoded, Math.min({FileChunkBytes}, __fileSizes[id] - chunk * {FileChunkBytes}))" : "encoded")}};
+                    block = {{(usesPackedFileBlocks ? $"__decodeFileBlock(encoded, __min({FileChunkBytes}, __fileSizes[id] - chunk * {FileChunkBytes}))" : "encoded")}};
                     chunks[chunk] = block;
                 }
                 {{(usesPackedFileBlocks ? $$"""
@@ -188,7 +188,7 @@ internal sealed partial class ScriptEmitter
     private void EmitBase64Reader() => Line("""
         const __base64Digits = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         function __base64Byte(encoded, index) {
-            const group = Math.floor(index / 3) * 4;
+            const group = __floor(index / 3) * 4;
             const offset = index % 3;
             const high = __base64Digits.indexOf(encoded.charAt(group + offset));
             const low = __base64Digits.indexOf(encoded.charAt(group + offset + 1));
