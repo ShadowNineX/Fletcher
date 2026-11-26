@@ -5,8 +5,9 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { decode, destinations, keyOf, simulator } from "./logic-arrows-simulator.mjs";
+import { attachWallTexelRom } from "./doom-native-wall-texel-rom.mjs";
 
-const { values } = parseArgs({ options: { packets: { type: "string" } } });
+const { values } = parseArgs({ options: { packets: { type: "string" }, column: { type: "string" } } });
 const root = resolve(import.meta.dirname, "..");
 const output = join(root, "artifacts/doom-native-wall-stream");
 const cli = join(root, "src/Fletcher.Cli/bin/Debug/net11.0/fletcher.dll");
@@ -221,10 +222,72 @@ for (let tick = 0; tick < steadyStart + 120; tick++) {
 assert.equal(alignedRows, 120);
 console.log(`Eight physical lanes matched ${alignedRows} consecutive rows at one row per host tick after the launch bus filled. ${parallelTiles.length} tiles and zero Script Blocks.`);
 
+const sampleColumn = values.column === undefined
+    ? { texels: Array.from({ length: 128 }, (_, row) => row < 109 ? ((row * 157) ^ (row >> 1)) & 255 : null),
+        phase: 0, step: 0x10000, indices: null }
+    : JSON.parse(readFileSync(values.column, "utf8"));
+const { texels, indices } = sampleColumn;
+const isInt32 = value => typeof value === "number" && (value | 0) === value;
+const isTexel = value => value === null || (isInt32(value) && value >= 0 && value <= 255);
+assert.ok(Array.isArray(texels) && texels.length === 128 && texels.every(isTexel), "128 palette indices or null holes");
+assert.ok(isInt32(sampleColumn.phase) && isInt32(sampleColumn.step), "signed int32 phase and step");
+assert.ok(values.column === undefined || (Array.isArray(indices) && indices.length > 0 && indices.every(isTexel)),
+    "--column requires palette indices recorded in the original renderer");
+
+const columnBoard = new Map(layout);
+const romY = -40, tapY = -35;
+assert.ok(columnBoard.delete(keyOf({ x: valid.x, y: tapY })), "replace the clock relay with a tap");
+for (const { x, y } of rowPins) columnBoard.delete(keyOf({ x, y: y - 1 }));
+const rom = attachWallTexelRom((type, x, y, facing) => place(type, x, y, facing, columnBoard),
+    rowPins, valid, tapY, romY, texels);
+const columnFile = indices ? "textured-column-e1m1" : "textured-column";
+const columnLevel = join(output, columnFile + ".json");
+const columnTiles = compile("Doom native lit texture column", columnBoard, join(output, columnFile + ".flt"), columnLevel);
+function readTexel(scene) {
+    if (!scene.value(rom.covered)) return null;
+    return rom.data.reduce((value, pin, bit) => value | scene.value(pin) << bit, 0);
+}
+
+const burst = simulator(columnTiles);
+const order = ordinal => ordinal * 85 & 127;
+const burstDelay = rom.tapLead + rom.delay;
+const validTapKey = keyOf(rom.tap);
+const rowKeys = rowPins.map(keyOf);
+for (let tick = 0; tick <= burstDelay + texels.length; tick++) {
+    const forced = new Map([[validTapKey, Number(tick < texels.length)]]);
+    const addr = order(tick - rom.tapLead);
+    for (const [bit, key] of rowKeys.entries()) forced.set(key, addr >>> bit & 1);
+    burst.step([], forced);
+    const ordinal = tick - burstDelay;
+    const ready = ordinal >= 0 && ordinal < texels.length;
+    assert.equal(burst.value(rom.ready), Number(ready), "one strobe for each address in the test burst");
+    if (ready) assert.equal(readTexel(burst), texels[order(ordinal)], "pipelined texel at address " + order(ordinal));
+}
+
+const column = simulator(columnTiles);
+pulseWord(column, phasePads, sampleColumn.phase);
+pulseWord(column, stepPads, sampleColumn.step);
+for (let tick = 0; tick < settle; tick++) column.step();
+column.step([keyOf(startButton)]);
+const firstTexel = firstSampleTick + 1 + rom.delay;
+const length = indices?.length ?? 144;
+for (let tick = 0; tick < firstTexel + period * length; tick++) {
+    column.step();
+    const offset = tick - firstTexel;
+    const ready = offset >= 0 && offset % period === 0;
+    assert.equal(column.value(rom.ready), Number(ready), "phase and ROM strobes agree");
+    if (!ready) continue;
+    const sample = offset / period;
+    const expected = indices ? indices[sample] : texels[((sampleColumn.phase + sample * sampleColumn.step) >> 16) & 127];
+    assert.equal(readTexel(column), expected, "autonomous texel " + sample);
+}
+console.log(`The physical ROM matched all 128 permuted row addresses at one per tick after filling. The integrated column matched ${length} ${indices ? "recorded E1M1" : "fixture"} pixels at one per ${period} ticks after a ${rom.delay}-tick ROM delay. ${columnTiles.length} tiles and zero Script Blocks.`);
+console.log(`Textured column map ${columnLevel}.`);
+
 if (values.packets !== undefined) {
     const captured = JSON.parse(readFileSync(values.packets, "utf8"));
     assert.ok(Array.isArray(captured) && captured.length > 0 && captured.every(packet =>
-        Array.isArray(packet) && packet.length === 2 && packet.every(value => (value | 0) === value && typeof value === "number")),
+        Array.isArray(packet) && packet.length === 2 && packet.every(isInt32)),
     "--packets requires signed int32 phase/step pairs");
     let streams = 0;
     for (let start = 0; start < captured.length;) {
