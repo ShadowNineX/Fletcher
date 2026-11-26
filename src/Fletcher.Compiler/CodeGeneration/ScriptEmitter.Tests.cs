@@ -70,7 +70,8 @@ internal sealed partial class ScriptEmitter
         AnalyzeOwnedResults(reachable);
         foreach (var function in reachable)
             EmitFunction(function);
-        EmitMethodDispatch();
+        EmitMethodDispatch(reachable.SelectMany(function => BoundTree.Dispatches(function.Body))
+            .Concat(program.Tests.SelectMany(test => BoundTree.Dispatches(test.Body))));
 
         for (var i = 0; i < program.Tests.Length; i++)
         {

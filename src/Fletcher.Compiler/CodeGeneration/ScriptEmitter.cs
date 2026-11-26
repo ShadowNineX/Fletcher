@@ -98,7 +98,10 @@ internal sealed partial class ScriptEmitter(IrProgram program, bool splitTables 
         foreach (var function in reachable)
             EmitFunction(function);
 
-        EmitMethodDispatch();
+        EmitMethodDispatch(reachable.SelectMany(function => BoundTree.Dispatches(function.Body))
+            .Concat(BoundTree.Dispatches(program.Tick))
+            .Concat(BoundTree.Dispatches(program.HostTick))
+            .Concat(bindings.SelectMany(binding => BoundTree.Dispatches(binding.Value))));
         if (sliced)
         {
             EmitSlicedController(bindings, samples, exports, keyGroups);
@@ -162,7 +165,7 @@ internal sealed partial class ScriptEmitter(IrProgram program, bool splitTables 
         Line($"else globalState.{OddFrame} = __frame;");
     }
 
-    private void EmitMethodDispatch()
+    private void EmitMethodDispatch(IEnumerable<BoundDispatch> calls)
     {
         var hasDirectMethods = sliced && DispatchedMethods().Any(directSlicedFunctions.Contains);
         Line("const __methods = {");
@@ -176,28 +179,31 @@ internal sealed partial class ScriptEmitter(IrProgram program, bool splitTables 
         }
         indent--;
         Line("};");
-        if (hasDirectMethods)
+        // Each call site knows its argument count. The positional wrappers
+        // avoid building and spreading an argument array for every dispatch.
+        foreach (var arity in calls.Select(call => call.Arguments.Length).Distinct().Order())
         {
-            // The receiver and arguments are already evaluated when this slot is checked.
-            Line("""
-                function* __dispatch(receiver, method, ...args) {
-                    if (receiver === null) throw new Error("Fletcher call on an uninitialized interface");
-                    const target = __methods[receiver.t][method];
-                    if (typeof target === "function") {
-                        if (__budget === 0) yield;
-                        return target(receiver.v, ...args);
-                    }
-                    return yield* target.generator(receiver.v, ...args);
-                }
-                """);
-            return;
-        }
-        Line($$"""
-            {{(sliced ? "function*" : "function")}} __dispatch(receiver, method, ...args) {
-                if (receiver === null) throw new Error("Fletcher call on an uninitialized interface");
-                {{(sliced ? "return yield*" : "return")}} __methods[receiver.t][method](receiver.v, ...args);
+            var arguments = string.Concat(Enumerable.Range(0, arity).Select(index => $", arg{index}"));
+            Line($"{(sliced ? "function*" : "function")} __dispatch{arity}(receiver, method{arguments}) {{");
+            indent++;
+            Line("""if (receiver === null) throw new Error("Fletcher call on an uninitialized interface");""");
+            if (hasDirectMethods)
+            {
+                Line("const target = __methods[receiver.t][method];");
+                // The receiver and arguments are already evaluated when this slot is checked.
+                Line("""if (typeof target === "function") {""");
+                indent++;
+                Line("if (__budget === 0) yield;");
+                Line($"return target(receiver.v{arguments});");
+                indent--;
+                Line("}");
+                Line($"return yield* target.generator(receiver.v{arguments});");
             }
-            """);
+            else
+                Line($"{(sliced ? "return yield*" : "return")} __methods[receiver.t][method](receiver.v{arguments});");
+            indent--;
+            Line("}");
+        }
 
         string MethodTarget(Function target) => hasDirectMethods && !directSlicedFunctions.Contains(target)
             ? $"{{ generator: __f{target.Id} }}"
@@ -510,7 +516,8 @@ internal sealed partial class ScriptEmitter(IrProgram program, bool splitTables 
             $"Object.freeze({{ t: {tag}, v: {Copy(conversion.Operand)} }})",
         BoundConversion conversion => Normalize(conversion.Type, Expr(conversion.Operand)),
         BoundCall call => CallFunction(call),
-        BoundDispatch call => Call("__dispatch", call.Arguments.Select(Expr).Prepend(Quote(call.Method)).Prepend(Expr(call.Receiver))),
+        BoundDispatch call => Call($"__dispatch{call.Arguments.Length}",
+            call.Arguments.Select(Expr).Prepend(Quote(call.Method)).Prepend(Expr(call.Receiver))),
         BoundMember member => $"({Expr(member.Receiver)})[{Quote(member.Name)}]",
         BoundIndex index when index.Receiver.Type.Shape.Kind == TypeKind.Bits =>
             $"((({Expr(index.Receiver)} >>> {IndexOffset(index.Index, index.Receiver.Type.Width)}) & 1) !== 0)",

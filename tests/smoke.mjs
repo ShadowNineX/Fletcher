@@ -851,6 +851,8 @@ map "Sliced call entry" {
         "a straight-line function uses the direct sliced path");
     assert.match(callScript, /\["Value"\]: __f\d+/, "a leaf interface implementation uses direct dispatch");
     assert.match(callScript, /\["Value"\]: \{ generator: __f\d+ \}/, "a looping implementation of the same interface stays resumable");
+    assert.match(callScript, /function\* __dispatch1\(receiver, method, arg0\)/,
+        "an interface call passes its argument directly through the wrapper");
     const calls = simulator(slicedCalls.data, false, undefined, tick => 1000 + tick * 100);
     calls.step();
     assert.deepEqual(calls.logs, [["host", 1000]], "the nested argument spends the last slot before the outer body runs");
