@@ -72,12 +72,17 @@ internal sealed partial class ScriptEmitter(IrProgram program, bool splitTables 
             .Concat(bindings.SelectMany(binding => BoundTree.StructLiterals(binding.Value)))
             .Concat(program.Registers.SelectMany(register => BoundTree.StructLiterals(register.Initial))));
         AnalyzeOwnedResults(reachable);
+        var dispatches = reachable.SelectMany(function => BoundTree.Dispatches(function.Body))
+            .Concat(BoundTree.Dispatches(program.Tick))
+            .Concat(BoundTree.Dispatches(program.HostTick))
+            .Concat(bindings.SelectMany(binding => BoundTree.Dispatches(binding.Value))).ToArray();
         if (sliced)
         {
             AnalyzeOwnedArguments(reachable);
             foreach (var function in reachable)
                 if (!BoundTree.HasLoopOrCall(function.Body) && CachedFileReadValue(function) is null)
                     directSlicedFunctions.Add(function);
+            AnalyzeDirectDispatch(dispatches);
         }
         UsesMouse = BoundTree.UsesMouse(program.Tick) || bindings.Any(binding => BoundTree.UsesMouse(binding.Value)) ||
             Array.Exists(reachable, function => BoundTree.UsesMouse(function.Body));
@@ -98,10 +103,7 @@ internal sealed partial class ScriptEmitter(IrProgram program, bool splitTables 
         foreach (var function in reachable)
             EmitFunction(function);
 
-        EmitMethodDispatch(reachable.SelectMany(function => BoundTree.Dispatches(function.Body))
-            .Concat(BoundTree.Dispatches(program.Tick))
-            .Concat(BoundTree.Dispatches(program.HostTick))
-            .Concat(bindings.SelectMany(binding => BoundTree.Dispatches(binding.Value))));
+        EmitMethodDispatch(dispatches);
         if (sliced)
         {
             EmitSlicedController(bindings, samples, exports, keyGroups);
@@ -181,7 +183,8 @@ internal sealed partial class ScriptEmitter(IrProgram program, bool splitTables 
         Line("};");
         // Each call site knows its argument count. The positional wrappers
         // avoid building and spreading an argument array for every dispatch.
-        foreach (var arity in calls.Select(call => call.Arguments.Length).Distinct().Order())
+        foreach (var arity in calls.Where(call => !directDispatchLocals.ContainsKey(call))
+            .Select(call => call.Arguments.Length).Distinct().Order())
         {
             var arguments = string.Concat(Enumerable.Range(0, arity).Select(index => $", arg{index}"));
             Line($"{(sliced ? "function*" : "function")} __dispatch{arity}(receiver, method{arguments}) {{");
@@ -204,6 +207,8 @@ internal sealed partial class ScriptEmitter(IrProgram program, bool splitTables 
             indent--;
             Line("}");
         }
+        if (directDispatchLocals.Count > 0)
+            Line("""function __uninitializedInterface() { throw new Error("Fletcher call on an uninitialized interface"); }""");
 
         string MethodTarget(Function target) => hasDirectMethods && !directSlicedFunctions.Contains(target)
             ? $"{{ generator: __f{target.Id} }}"
@@ -282,6 +287,7 @@ internal sealed partial class ScriptEmitter(IrProgram program, bool splitTables 
         var direct = directSlicedFunctions.Contains(function);
         Line($"function{(sliced && !direct ? "*" : "")} __f{function.Id}({string.Join(", ", names)}) {{");
         indent++;
+        EmitDirectDispatchLocals(BoundTree.Dispatches(function.Body));
         if (!sliced || !TryEmitCachedFileRead(function))
         {
             if (direct)
@@ -516,8 +522,7 @@ internal sealed partial class ScriptEmitter(IrProgram program, bool splitTables 
             $"Object.freeze({{ t: {tag}, v: {Copy(conversion.Operand)} }})",
         BoundConversion conversion => Normalize(conversion.Type, Expr(conversion.Operand)),
         BoundCall call => CallFunction(call),
-        BoundDispatch call => Call($"__dispatch{call.Arguments.Length}",
-            call.Arguments.Select(Expr).Prepend(Quote(call.Method)).Prepend(Expr(call.Receiver))),
+        BoundDispatch call => CallDispatch(call),
         BoundMember member => $"({Expr(member.Receiver)})[{Quote(member.Name)}]",
         BoundIndex index when index.Receiver.Type.Shape.Kind == TypeKind.Bits =>
             $"((({Expr(index.Receiver)} >>> {IndexOffset(index.Index, index.Receiver.Type.Width)}) & 1) !== 0)",

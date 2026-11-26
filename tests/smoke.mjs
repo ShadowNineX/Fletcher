@@ -817,6 +817,8 @@ map "Direct sliced writes" {
 type Source interface { Value(stamp int) int }
 type Reading struct { Number int }
 type DelayedReading struct { Number int; Steps int }
+type QuickSource interface { Quick(stamp int) int }
+func (reading Reading) Quick(stamp int) int { return reading.Number + stamp + hostTimeMillis() }
 func (reading Reading) Value(stamp int) int { return reading.Number + stamp + hostTimeMillis() }
 func (reading DelayedReading) Value(stamp int) int {
     for range reading.Steps {}
@@ -837,9 +839,13 @@ map "Sliced call entry" {
         } else if currentTick() == 1 {
             for range 4095 {}
             log(source.Value(readClock()))
-        } else {
+        } else if currentTick() == 2 {
             source = DelayedReading{Number: 10, Steps: 4096}
             log(source.Value(hostTimeMillis()))
+        } else {
+            var quick QuickSource = Reading{Number: 8}
+            for range 4095 {}
+            log(quick.Quick(readClock()))
         }
     }
     host tick { log("host", readClock()) }
@@ -853,6 +859,8 @@ map "Sliced call entry" {
     assert.match(callScript, /\["Value"\]: \{ generator: __f\d+ \}/, "a looping implementation of the same interface stays resumable");
     assert.match(callScript, /function\* __dispatch1\(receiver, method, arg0\)/,
         "an interface call passes its argument directly through the wrapper");
+    assert.match(callScript, /__methods\[__dispatchValue\d+_0\.t\]\["Quick"\]\(/,
+        "an all-leaf interface call skips the generator wrapper");
     const calls = simulator(slicedCalls.data, false, undefined, tick => 1000 + tick * 100);
     calls.step();
     assert.deepEqual(calls.logs, [["host", 1000]], "the nested argument spends the last slot before the outer body runs");
@@ -868,6 +876,10 @@ map "Sliced call entry" {
     assert.deepEqual(calls.logs.slice(-2), [["host", 1300], ["host", 1400]], "the looping implementation can still suspend mid-body");
     calls.step();
     assert.deepEqual(calls.logs.slice(-2), [[2910], ["host", 1500]], "mixed interface dispatch resumes the looping implementation");
+    calls.step();
+    assert.deepEqual(calls.logs.at(-1), ["host", 1600], "the leaf-only call still respects the entry checkpoint");
+    calls.step();
+    assert.deepEqual(calls.logs.slice(-2), [[3308], ["host", 1700]], "direct dispatch preserves evaluated arguments");
 
     const bufferedMap = build("buffered-sliced-work", writeSource("buffered-sliced-work",
         slicedProgram.replace('key = "F" }', 'key = "F", buffer = true }')));

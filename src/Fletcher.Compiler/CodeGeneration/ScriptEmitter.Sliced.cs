@@ -87,6 +87,8 @@ internal sealed partial class ScriptEmitter
         }
         Line("function* __tick() {");
         indent++;
+        EmitDirectDispatchLocals(BoundTree.Dispatches(program.Tick)
+            .Concat(logicalBindings.SelectMany(binding => BoundTree.Dispatches(binding.Value))));
         Line("__logicalTick = state.fletcherLogicalTick ?? 0;");
         if (usesFileReadCache)
             Line("__fileReads.fill(undefined);");
@@ -231,6 +233,8 @@ internal sealed partial class ScriptEmitter
         var reads = BoundTree.References(program.HostTick).Concat(bindings.SelectMany(binding => BoundTree.References(binding.Value))).ToHashSet();
         Line("function* __hostStep() {");
         indent++;
+        EmitDirectDispatchLocals(BoundTree.Dispatches(program.HostTick)
+            .Concat(bindings.SelectMany(binding => BoundTree.Dispatches(binding.Value))));
         Line("const __p = [];");
         Line("const __logs = [];");
         Line($"const __registers = {registerSnapshot};");
