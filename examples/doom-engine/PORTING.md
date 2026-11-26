@@ -419,6 +419,30 @@ The target is the single-player campaign engine in id Software’s GPL Linux Doo
   - The packed BSP and texture preparation build retained the same E1M1 opening, reduced its startup from 61 to 58 host ticks, and passed movement and the automap reveal cycle. It used 7,023,074 compressed bytes, 13,120,121 expanded bytes, and 12,995 tiles.
   - The compiler checkpoint build matched the same E1M1 opening, startup, movement, and automap trace. It used 7,024,399 compressed bytes, 13,159,265 expanded bytes, and 12,995 tiles.
 
+## Full E1M1 frame budget
+
+The full-detail 160×120 RGB profile drew 120 frames in 8,378 ms and 120 host ticks at Unlimited speed in windowed Logic Arrows. Each row below covers a disjoint part of the same measurement.
+
+| Work | Total ms | ms per frame |
+| --- | ---: | ---: |
+| BSP traversal and walls | 2,460 | 20.50 |
+| Plane drawing | 935 | 7.79 |
+| Masked drawing | 280 | 2.33 |
+| Remaining camera work | 194 | 1.62 |
+| Logical tick outside the camera and presentation | 1,680 | 14.00 |
+| Screen presentation inside the controller | 553 | 4.61 |
+| Register persistence | 667 | 5.56 |
+| Host-step script and other controller work | 39 | 0.33 |
+| Elapsed time outside the controller callback | 1,570 | 13.08 |
+| Total | 8,378 | 69.82 |
+
+The world actor pass took 1,013 ms (8.44 ms per frame) within the logical tick. Weapon logic and sector work took 152 and 117 ms. Within screen presentation, comparing pixels and issuing tile writes took 426 ms, forming the frame string took 112 ms, and saving that string took 15 ms.
+
+- Suppressing RGB tile writes during the timed section cut the run to 7,627 ms over 120 host ticks. The simulator generated the same 117 sampled framebuffers and skipped all 943,992 timed tile writes. The windowed run saved 124 ms inside the controller and 627 ms outside it. The remaining 943 ms outside the controller includes work from the game host and other tile callbacks.
+- Running generated helpers and loops without cooperative checkpoints cut the run to 7,441 ms over 120 host ticks. The simulator matched 117 sampled physical frames and all 943,992 tile writes. The windowed run saved 919 ms inside the controller and 18 ms outside it. The largest reductions were in camera rendering (688 ms) and the world actor pass (157 ms). This diagnostic bypasses work-slice limits.
+- Keeping campaign registers in the JavaScript controller while still encoding them as normal took 8,289 ms over 120 host ticks. Its register persistence phase fell from 667 to 571 ms, and elapsed time outside the callback stayed near 1,570 ms. The simulator matched 117 sampled physical frames and 943,992 tile writes. In this trial most of the persistence phase remained even after bypassing register transfers to the game host.
+- The automatic E1M1 benchmark took 8,415 ms at 160×120 (14.3 FPS) and 7,319 ms at 128×96 (16.4 FPS) in the same windowed session. Both used full detail, four RGB wall tiles per pixel, and 120 host ticks for 120 frames. The smaller display reduced the pixel count by 36% and frame time by 13%.
+
 ## Arrow and script performance review
 
 Rerunning both XOR benches in windowed Logic Arrows at Unlimited speed confirmed the physical gate advantage on these workloads. `node tests/logic-arrows-active-backend-bench.mjs` used 512 lanes and verified 4,096 samples per backend with zero mismatches. The physical gate board took 152 ms and the batched Script Block board took 282 ms for the same 480 host ticks. `node tests/logic-arrows-backend-bench.mjs` used 1,024 settled outputs and found no mismatches. Its physical board took 1 ms for 240 ticks, at the timer's resolution, and its board with 1,024 Script Sources took 1,894 ms. Both tests measure logic ticks on dedicated maps. The E1M1 benchmark separately measures gameplay images and completes one frame per host tick at this resolution.
