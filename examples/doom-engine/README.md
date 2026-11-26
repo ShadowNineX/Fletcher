@@ -100,6 +100,8 @@ Open **Doom Campaign** using the [Logic Arrows map instructions](../../docs/logi
 
 Use `--resolution 320x200` to build **Doom Campaign 320x200** at Doom's original framebuffer resolution with the same RGB wall display. With `--output` omitted, it saves to `artifacts/doom-engine/doom-campaign-320x200.json`.
 
+Add `--arrow-colormap` to build a separate campaign with the supplied WAD's lighting translation table stored in physical arrows. Find the board labeled **COLORMAP** to the left of the screen. The renderer uses the WAD directly during startup, then switches to the table read from the arrows. This option adds about 168,000 tiles for the supplied Doom WAD. It has no established desktop frame-rate gain.
+
 ## Preview an original level
 
 The wireframe sample reads the first classic Doom-format level in an original `LEVEL.WAD` PWAD. It uses `LINEDEFS` and `VERTEXES` to draw a top-down view. White lines are one-sided and blue lines are two-sided. The archive stays at `--asset-root` and the generated Level file embeds it in the zlib-compressed map data. The preview has a 256-linedef limit and checks the raster work before drawing a frame.

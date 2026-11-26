@@ -4,10 +4,11 @@ import { cpSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, sta
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
+import { nativeColormap } from "./native-colormap.mjs";
 
 const { values } = parseArgs({ options: {
     wad: { type: "string" }, output: { type: "string" }, cli: { type: "string" }, muted: { type: "boolean" },
-    resolution: { type: "string", default: "160x120" },
+    resolution: { type: "string", default: "160x120" }, "arrow-colormap": { type: "boolean" },
 } });
 assert.ok(values.wad, "Pass --wad PATH to the supplied Doom IWAD");
 assert.ok(["160x120", "320x200"].includes(values.resolution), "--resolution must be 160x120 or 320x200");
@@ -19,8 +20,8 @@ const engine = import.meta.dirname;
 const repo = resolve(engine, "../..");
 const cli = resolve(values.cli ?? join(repo, "src/Fletcher.Cli/bin/Debug/net11.0/fletcher.dll"));
 const highResolution = width === 320;
-const mapName = highResolution ? "Doom Campaign 320x200" : "Doom Campaign";
-const filename = highResolution ? "doom-campaign-320x200.json" : "doom-campaign.json";
+const mapName = `Doom Campaign${highResolution ? " 320x200" : ""}${values["arrow-colormap"] ? " Arrow COLORMAP" : ""}`;
+const filename = mapName.toLowerCase().replaceAll(" ", "-") + ".json";
 const output = resolve(values.output ?? join(repo, "artifacts/doom-engine", filename));
 const scratch = mkdtempSync(join(tmpdir(), "fletcher-doom-campaign-"));
 
@@ -49,6 +50,19 @@ try {
         [/^map "Original WAD BSP View" \{\r?$/gm, `map ${JSON.stringify(mapName)} {`],
         [/^    register soundMuted bit = false\r?$/gm, `    register soundMuted bit = ${Boolean(values.muted)}`],
     ]);
+    if (values["arrow-colormap"]) {
+        const { layout, offset, size } = nativeColormap(readFileSync(wad));
+        edit(main, [
+            [/^    expand DoomMapSigns\(\)\r?$/gm, `    expand DoomMapSigns()\n${layout}`],
+            [/^    materials\.Shade = display\.Shade\.WithFixedColormap\(display\.Inventory\.FixedColormap\)\r?$/gm,
+                `    materials.Shade = display.Shade.WithFixedColormap(display.Inventory.FixedColormap)
+    if sameFile(materials.Shade.ColorMaps.File, Archive) && materials.Shade.ColorMaps.Offset == ${offset} &&
+        materials.Shade.ColorMaps.Size == ${size} {
+        maps := sharedBytes("doomNativeColorMaps")
+        if len(maps) == ${size} { materials.Shade.ColorMaps.File, materials.Shade.ColorMaps.Offset = maps, 0 }
+    }`],
+        ]);
+    }
     mkdirSync(dirname(output), { recursive: true });
     const built = spawnSync("dotnet", [cli, "build", main, "--package-root", engine, "--asset-root", dirname(wad), "-o", output],
         { stdio: "inherit" });
