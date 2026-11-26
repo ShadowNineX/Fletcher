@@ -20,7 +20,9 @@ dotnet run --project src/Fletcher.Cli --no-build -- build examples/hybrid.flt -o
 dotnet run --project src/Fletcher.Cli --no-build -- inspect artifacts/hybrid.json
 ```
 
-`check` and `build` accept `--explain` for backend choices and route timing, `--package-root` for shared [packages](packages.md), and `--asset-root` for [binary imports](data.md). Pass `--template level.json` to `build` to use a Level wrapper's metadata. Choose an output path distinct from both the input source and the template.
+`check` and `build` accept `--explain` for backend choices and route timing, `--package-root` for shared [packages](packages.md), and `--asset-root` for [binary imports](data.md).
+
+Pass `--template level.json` to `build` to reuse an editor-created Level wrapper and generate a new name and preview. Pass `--update-from level.json` to replace only the tile payload and keep the existing name, preview, tags, and Workshop metadata. Use a new output file for an update. See [updating a Workshop map](../logic-arrows.md#update-a-workshop-map).
 
 ## Inspect the intermediate representation
 

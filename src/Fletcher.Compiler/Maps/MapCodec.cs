@@ -221,14 +221,7 @@ public static class MapCodec
             else
             {
                 using JsonDocument template = JsonDocument.Parse(templateJson);
-                if (template.RootElement.ValueKind != JsonValueKind.Object) throw new FormatException("Map template must be a JSON object.");
-                if (!template.RootElement.TryGetProperty("map_type", out var mapType) ||
-                    mapType.ValueKind != JsonValueKind.String || mapType.GetString() != "Level" ||
-                    !Array.TrueForAll(["name", "preview_data", "data"], field =>
-                        template.RootElement.TryGetProperty(field, out var value) && value.ValueKind == JsonValueKind.String))
-                {
-                    throw new FormatException("Use an editor-created Level template with name, preview_data, and data fields.");
-                }
+                ValidateLevelWrapper(template.RootElement);
                 foreach (JsonProperty property in template.RootElement.EnumerateObject())
                 {
                     if (property.NameEquals("name")) writer.WriteString("name", name);
@@ -240,6 +233,43 @@ public static class MapCodec
             writer.WriteEndObject();
         }
         return Encoding.UTF8.GetString(buffer.WrittenSpan);
+    }
+
+    /// <summary>Replaces a Level's tile payload while keeping its existing wrapper metadata.</summary>
+    public static string WriteUpdate(string existingMapJson, IReadOnlyList<Tile> tiles)
+    {
+        ArgumentNullException.ThrowIfNull(existingMapJson);
+        ArgumentNullException.ThrowIfNull(tiles);
+        byte[] wrapper = Encoding.UTF8.GetBytes(existingMapJson);
+        using JsonDocument existing = JsonDocument.Parse(wrapper);
+        ValidateLevelWrapper(existing.RootElement);
+
+        // Keep the wrapper text so every field survives, including 64-bit Steam
+        // IDs and any editor fields the compiler doesn't know about.
+        var reader = new Utf8JsonReader(wrapper);
+        int start = -1, end = 0;
+        while (reader.Read())
+        {
+            if (reader.TokenType != JsonTokenType.PropertyName || reader.CurrentDepth != 1 ||
+                !reader.ValueTextEquals("data"u8))
+                continue;
+            if (start >= 0 || !reader.Read() || reader.TokenType != JsonTokenType.String)
+                throw new FormatException("A map update requires exactly one top-level string data field.");
+            start = (int)reader.TokenStartIndex;
+            end = (int)reader.BytesConsumed;
+        }
+
+        return $"{Encoding.UTF8.GetString(wrapper.AsSpan(0, start))}\"{Encode(tiles)}\"{Encoding.UTF8.GetString(wrapper.AsSpan(end))}";
+    }
+
+    private static void ValidateLevelWrapper(JsonElement wrapper)
+    {
+        if (wrapper.ValueKind != JsonValueKind.Object) throw new FormatException("Map template must be a JSON object.");
+        if (!wrapper.TryGetProperty("map_type", out var mapType) ||
+            mapType.ValueKind != JsonValueKind.String || mapType.GetString() != "Level" ||
+            !Array.TrueForAll(["name", "preview_data", "data"], field =>
+                wrapper.TryGetProperty(field, out var value) && value.ValueKind == JsonValueKind.String))
+            throw new FormatException("Use an editor-created Level template with name, preview_data, and data fields.");
     }
 
     private static string EncodePreview(IReadOnlyList<Tile> tiles)

@@ -95,6 +95,17 @@ REA verified these limits in the 20261112 Windows executable. Its Level and prev
 
 When a Fletcher controller exceeds the per-tile limit, the compiler first moves packed lookup tables to nearby Script Blocks. If the controller still exceeds the limit, it places the code in additional blocks and assembles it once when the map runs. Function calls and register updates share the same controller across those blocks. Solid screens with `slice = true` can also spread a logical tick across several game ticks. The extra blocks are part of the Level payload.
 
+## Update a Workshop map
+
+To rebuild a map linked to a Workshop item, use its current editor-saved Level as the input to `--update-from`.
+
+```powershell
+$map = Join-Path $env:APPDATA 'logic-arrows/save/maps/My Map.json'
+dotnet run --project src/Fletcher.Cli --no-build -- build my-map.flt --update-from $map -o artifacts/my-map-update.json
+```
+
+This replaces the tiles while keeping the existing title, map-card preview, settings, tags, and Workshop item identity, including the full Steam numeric IDs. The compiler writes a new file. Back up the original, copy the rebuilt file over it while the map is closed, then reopen it in Logic Arrows to update the linked Workshop item.
+
 ## Game parity checks
 
 After a Release build, run `node tests/game-parity.mjs` to generate five disposable maps in `artifacts/game-parity/`. Copy them into the local Maps folder and open each **Fletcher Parity** map at the fastest tick rate. The fixtures cover native half-adder pulses, vector alignment, a scripted counter, both directions of the hybrid bridge, and a controller split across multiple Script Blocks. In **Fletcher Parity Split**, enable Key mode, press **B**, and move the pointer over the map until the probe reports PASS. Reopen the Level to repeat the reset check.

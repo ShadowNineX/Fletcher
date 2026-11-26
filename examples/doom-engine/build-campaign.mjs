@@ -10,7 +10,7 @@ import { nativeColormap } from "./native-colormap.mjs";
 const { values } = parseArgs({ options: {
     wad: { type: "string" }, output: { type: "string" }, cli: { type: "string" }, muted: { type: "boolean" },
     resolution: { type: "string", default: "160x120" }, "arrow-colormap": { type: "boolean" },
-    benchmark: { type: "boolean" },
+    benchmark: { type: "boolean" }, "update-from": { type: "string" },
 } });
 assert.ok(values.wad, "Pass --wad PATH to the supplied Doom IWAD");
 assert.ok(["160x120", "320x200"].includes(values.resolution), "--resolution must be 160x120 or 320x200");
@@ -24,7 +24,8 @@ const cli = resolve(values.cli ?? join(repo, "src/Fletcher.Cli/bin/Debug/net11.0
 const highResolution = width === 320;
 const mapName = "Doom Campaign" + (highResolution ? " 320x200" : "") +
     (values["arrow-colormap"] ? " Arrow COLORMAP" : "") + (values.benchmark ? " FPS Benchmark" : "");
-const filename = mapName.toLowerCase().replaceAll(" ", "-") + ".json";
+const updateFrom = values["update-from"];
+const filename = mapName.toLowerCase().replaceAll(" ", "-") + (updateFrom ? "-workshop-update.json" : ".json");
 const output = resolve(values.output ?? join(repo, "artifacts/doom-engine", filename));
 const scratch = mkdtempSync(join(tmpdir(), "fletcher-doom-campaign-"));
 
@@ -69,7 +70,8 @@ try {
         ]);
     }
     mkdirSync(dirname(output), { recursive: true });
-    const built = spawnSync("dotnet", [cli, "build", main, "--package-root", engine, "--asset-root", dirname(wad), "-o", output],
+    const updateArgs = updateFrom ? ["--update-from", resolve(updateFrom)] : [];
+    const built = spawnSync("dotnet", [cli, "build", main, "--package-root", engine, "--asset-root", dirname(wad), "-o", output, ...updateArgs],
         { stdio: "inherit" });
     if (built.error) throw built.error;
     process.exitCode = built.status ?? 1;

@@ -102,6 +102,17 @@ Use `--resolution 320x200` to build **Doom Campaign 320x200** at Doom's original
 
 Add `--arrow-colormap` to build a separate campaign with the supplied WAD's lighting translation table stored in physical arrows. Find the board labeled **COLORMAP** to the left of the screen. The renderer uses the WAD directly during startup, then switches to the table read from the arrows. This option adds about 168,000 tiles for the supplied Doom WAD. It has no established desktop frame-rate gain.
 
+### Rebuild a linked Workshop map
+
+Pass the installed map to `--update-from` after Logic Arrows has linked it to a Workshop item. The builder replaces the Level payload and retains the existing title, preview, tags, settings, and Workshop identity.
+
+```powershell
+$map = Join-Path $env:APPDATA 'logic-arrows/save/maps/Doom Campaign.json'
+node examples/doom-engine/build-campaign.mjs --wad 'C:\path\to\DOOM.WAD' --update-from $map --output artifacts/doom-engine/doom-workshop-update.json
+```
+
+The command writes a new file. Back up the installed map, then copy the rebuilt file over it while the map is closed. Reopen the map in Logic Arrows and use its Workshop controls to update the existing item. Use game data you have permission to redistribute when publishing.
+
 ### Measure E1M1 gameplay
 
 ```powershell

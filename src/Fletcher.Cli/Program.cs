@@ -37,7 +37,11 @@ var output = new Option<FileInfo>("--output", "-o")
 };
 var template = new Option<FileInfo?>("--template")
 {
-    Description = "Level JSON file whose wrapper metadata should be preserved."
+    Description = "Level JSON whose metadata should be reused with a new name and preview."
+};
+var updateFrom = new Option<FileInfo?>("--update-from")
+{
+    Description = "Existing Level JSON whose title, preview, and metadata should be kept while replacing its tiles."
 };
 Command build =
 [
@@ -45,15 +49,22 @@ Command build =
     buildSource,
     output,
     template,
+    updateFrom,
     buildExplain,
     buildPackages,
     buildAssets,
     buildIr
 ];
 build.SetAction((result, cancellationToken) =>
-    Compile(result.GetRequiredValue(buildSource), result.GetRequiredValue(output), result.GetValue(template),
+{
+    var update = result.GetValue(updateFrom);
+    var mapTemplate = result.GetValue(template);
+    if (update is not null && mapTemplate is not null)
+        return Task.FromResult(Error("Use either --update-from or --template.", 2));
+    return Compile(result.GetRequiredValue(buildSource), result.GetRequiredValue(output), update ?? mapTemplate,
         result.GetValue(buildPackages), result.GetValue(buildAssets), result.GetValue(buildExplain),
-        IrOutputPath(result, buildIr, buildSource), cancellationToken));
+        IrOutputPath(result, buildIr, buildSource), cancellationToken, updatingMap: update is not null);
+});
 
 var map = new Argument<FileInfo>("map.json") { Description = "Logic Arrows map to decode." };
 var preview = new Option<bool>("--preview") { Description = "Decode the map-card preview." };
@@ -132,12 +143,14 @@ static async Task<int> Transpile(FileInfo input, FileInfo output, CancellationTo
 }
 
 static async Task<int> Compile(FileInfo input, FileInfo? output, FileInfo? template, DirectoryInfo? packageRoot,
-    DirectoryInfo? assetRoot, bool explain, string? irPath, CancellationToken cancellationToken)
+    DirectoryInfo? assetRoot, bool explain, string? irPath, CancellationToken cancellationToken, bool updatingMap = false)
 {
     if (!input.Extension.Equals(".flt", StringComparison.OrdinalIgnoreCase))
         return Error("Fletcher source files use the .flt extension.", 2);
     if (output is not null && (SamePath(output.FullName, input.FullName) || SamePath(output.FullName, template?.FullName)))
         return Error("Choose an output path distinct from the source and template.", 2);
+    if (updatingMap && output is { Exists: true })
+        return Error("Choose a new output file when using --update-from.", 2);
     if (irPath is not null && (SamePath(irPath, input.FullName) || SamePath(irPath, template?.FullName) || SamePath(irPath, output?.FullName)))
         return Error("Choose an IR output path distinct from the source, template, and map output.", 2);
 
@@ -170,7 +183,10 @@ static async Task<int> Compile(FileInfo input, FileInfo? output, FileInfo? templ
         if (output is not null && result.Name is { } name)
         {
             var nativeTemplate = template is null ? null : await File.ReadAllTextAsync(template.FullName, cancellationToken);
-            await WriteOutput(output.FullName, MapCodec.Write(name, result.Tiles, nativeTemplate), cancellationToken);
+            var mapJson = updatingMap && nativeTemplate is not null
+                ? MapCodec.WriteUpdate(nativeTemplate, result.Tiles)
+                : MapCodec.Write(name, result.Tiles, nativeTemplate);
+            await WriteOutput(output.FullName, mapJson, cancellationToken, overwrite: !updatingMap);
         }
         if (explain)
             Console.Write(result.Explanation);
@@ -210,7 +226,7 @@ static async Task<int> Inspect(FileInfo input, bool preview, CancellationToken c
     }
 }
 
-static async Task WriteOutput(string path, string contents, CancellationToken cancellationToken)
+static async Task WriteOutput(string path, string contents, CancellationToken cancellationToken, bool overwrite = true)
 {
     var folder = Path.GetDirectoryName(path)!;
     Directory.CreateDirectory(folder);
@@ -218,7 +234,7 @@ static async Task WriteOutput(string path, string contents, CancellationToken ca
     try
     {
         await File.WriteAllTextAsync(pending, contents, cancellationToken);
-        File.Move(pending, path, overwrite: true);
+        File.Move(pending, path, overwrite);
     }
     finally
     {

@@ -2328,6 +2328,33 @@ map "Packed file" {
     packedSim.step();
     assert.deepEqual(packedSim.logs, [[largeImport.length, 71], [largeImport.length, 37]], "the limit applies to packed output bytes");
 
+    const workshopSource = path.join(scratch, "published-map.json");
+    const workshopOutput = path.join(scratch, "workshop-update.json");
+    const workshopWrapper = data => `{
+  "name": "Published map",
+  "version": 8,
+  "map_type": "Level",
+  "preview_data": ${JSON.stringify(hello.wrapper.data)},
+  "tags": ["game", "level"],
+  "steam_workshop": {"id": 1234567890, "owner": 76561199000000001, "public": true},
+  "editor": {"name": "Écran", "data": ${JSON.stringify(hello.wrapper.data)}},
+  "data": ${JSON.stringify(data)}
+}
+`;
+    const published = workshopWrapper(hello.wrapper.data);
+    writeFileSync(workshopSource, published);
+    const counterSource = path.join(root, "examples", "counter.flt");
+    const updated = run("build", counterSource, "--update-from", workshopSource, "-o", workshopOutput);
+    assert.equal(updated.status, 0, updated.stderr);
+    const updateText = readFileSync(workshopOutput, "utf8");
+    assert.equal(updateText, workshopWrapper(counter.wrapper.data), "only the top-level tile payload is replaced");
+    for (const destination of [workshopSource, workshopOutput]) {
+        const overwrite = run("build", counterSource, "--update-from", workshopSource, "-o", destination);
+        assert.equal(overwrite.status, 2, overwrite.stderr);
+    }
+    assert.equal(readFileSync(workshopSource, "utf8"), published, "the linked map stays intact");
+    assert.equal(readFileSync(workshopOutput, "utf8"), updateText, "an existing output stays intact");
+
     const lab = process.env.APPDATA && path.join(process.env.APPDATA, "logic-arrows", "save", "maps", "Logic_Arrows_Component_Lab.json");
     if (lab && process.argv.includes("--lab")) {
         const nativeWrapper = JSON.parse(readFileSync(lab, "utf8"));
