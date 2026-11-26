@@ -85,6 +85,45 @@ func drawIntermissionPatch(patch IntermissionPatch, shade walls.WadShading, x in
     drawPatchFrame(patch, shade, x, y, false)
 }
 
+// Overlay the original patch colors. Give the ordinary sample first choice,
+// while allowing opaque pixels from the rest of its footprint to fill holes
+// where that sample was transparent.
+func drawClassicUiColumn(post wad.PostSource, shade walls.WadShading, x int, top int) {
+    if !post.Valid { return }
+    cursor, file := post.Offset, post.Patch.File
+    for range post.Patch.Size / 4 + 1 {
+        start := int(file[cursor])
+        if start == 255 { return }
+        length := int(file[cursor + 1])
+        for row := range length {
+            sourceY := length - 1 - row
+            nativeY := top + start + sourceY
+            if nativeY >= 0 && nativeY < intermissionHeight {
+                py := ((nativeY + 1) * Height - 1) / intermissionHeight
+                index := int(file[cursor + 3 + sourceY])
+                pixel(x, py, true, shade.Palette[index], index)
+            }
+        }
+        cursor = cursor + length + 4
+    }
+}
+
+func drawClassicUiPatch(patch IntermissionPatch, shade walls.WadShading, x int, y int) {
+    if !DisplayUsesRgb || Width != 160 || Height != 120 {
+        drawIntermissionPatch(patch, shade, x, y)
+        return
+    }
+    left, top := x - patch.Left, y - patch.Top
+    start, end := 0, patch.Width
+    if left < 0 { start = -left }
+    if left + end > intermissionWidth { end = intermissionWidth - left }
+    for column := range end - start {
+        sourceX := end - 1 - column
+        px := ((left + sourceX + 1) * Width - 1) / intermissionWidth
+        drawClassicUiColumn(wad.PatchPostSource(patch.Lump, sourceX), shade, px, top)
+    }
+}
+
 // D_Display overlays M_PAUSE on the frozen view, including the automap.
 func drawPause(mounts wad.Archives, shade walls.WadShading) {
     if !shade.Valid { return }

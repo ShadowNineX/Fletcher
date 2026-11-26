@@ -364,7 +364,7 @@ func drawWadCampaignMenu(mounts wad.Archives, shade walls.WadShading, menu play.
         drawMenuThermometer(mounts, shade, x, y + 48, 2, music)
     }
     for row := range rows {
-        if labels[row].Width > 0 { drawIntermissionPatch(labels[row], shade, x, y + row * 16) }
+        if labels[row].Width > 0 { drawClassicUiPatch(labels[row], shade, x, y + row * 16) }
     }
     drawIntermissionPatch(skull, shade, x - 32, y - 5 + menu.Cursor * 16)
     return true

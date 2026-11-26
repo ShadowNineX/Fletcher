@@ -69,6 +69,10 @@ func statusDigit(mounts wad.Archives, digit int, tall bit) IntermissionPatch {
 }
 
 func drawStatusReadout(patch IntermissionPatch, shade walls.WadShading, x int, y int, tall bit) {
+    if !CleanStatusBar && tall {
+        drawClassicUiPatch(patch, shade, x, y)
+        return
+    }
     ink := color.Yellow
     if tall { ink = color.White }
     drawPatchWithInk(patch, shade, x, y, false, CleanStatusBar, ink)

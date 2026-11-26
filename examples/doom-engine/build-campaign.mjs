@@ -42,7 +42,8 @@ try {
     cpSync(join(engine, "wad-bsp"), project, { recursive: true });
     const main = join(project, "main.flt");
     const profile = {
-        Width: width, Height: height, DisplayScale: 2, DisplayStyle: "rgb", DisplayZoom: "2", DisplayGamma: 4,
+        Width: width, Height: height, DisplayScale: 2, DisplayStyle: "rgb",
+        DisplayZoom: highResolution ? "2" : "4", DisplayGamma: 4,
         DisplaySliceWork: highResolution ? 131072 : 65536,
         ClassicMenu: true, LowDetail: false, DitherColors: false, CleanStatusBar: false, ViewBlocks: 10,
     };

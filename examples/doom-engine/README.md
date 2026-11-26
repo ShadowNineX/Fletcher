@@ -96,7 +96,7 @@ dotnet build src/Fletcher.Cli
 node examples/doom-engine/build-campaign.mjs --wad 'C:\path\to\DOOM.WAD' --output artifacts/doom-engine/doom-campaign.json
 ```
 
-Open **Doom Campaign** using the [Logic Arrows map instructions](../../docs/logic-arrows.md). This profile uses the WAD's title, demos, menus, and HUD with a 160×120 RGB display and full 3D detail. It starts at gamma 4 for the wall display. **F11** cycles gamma in play. Add `--muted` to start the campaign silently.
+Open **Doom Campaign** using the [Logic Arrows map instructions](../../docs/logic-arrows.md). This profile uses the WAD's title, demos, menus, and HUD with a 160×120 RGB display and full 3D detail. Menu labels and large HUD digits sample nearby source pixels to retain thin strokes in their WAD colors. The campaign starts with camera scale 4 and gamma 4 for the wall display. **F11** cycles gamma in play. Add `--muted` to start the campaign silently.
 
 Use `--resolution 320x200` to build **Doom Campaign 320x200** at Doom's original framebuffer resolution with the same RGB wall display. With `--output` omitted, it saves to `artifacts/doom-engine/doom-campaign-320x200.json`.
 
